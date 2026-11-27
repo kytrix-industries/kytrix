@@ -328,8 +328,6 @@ pub(crate) fn choice_select(
     let select = Select::new(
         app,
         host.theme_handle(),
-        host.layer(),
-        host.animation(),
         key,
         SelectOptions::default()
             .width(CONTROL_WIDTH)

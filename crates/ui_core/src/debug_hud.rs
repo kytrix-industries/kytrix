@@ -164,6 +164,7 @@ pub(crate) fn install(window: &mut Window, now: Instant) -> Result<DebugHudState
             }
         }
     }
+    tree.pin_tail_child(panel);
 
     Ok(DebugHudState {
         root: panel,

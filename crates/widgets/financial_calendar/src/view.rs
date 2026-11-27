@@ -936,23 +936,15 @@ impl FinancialCalendarWidget {
             .variant(InteractiveVariant::Ghost)
             .label(name)
             .placeholder(trigger);
-        let layer = cx.layer().clone();
-        let animation = cx.animation().clone();
         let select_key = cx.unique_key(key);
-        let select = Select::new(
-            cx.app_mut(),
-            self.theme.clone(),
-            layer,
-            animation,
-            select_key,
-            options,
-        )
-        .on_change(move |app, chosen| {
-            let chosen = chosen.last().cloned();
-            let request = request(chosen);
-            app.write(&requests, Some(request));
-            let _ = app.request_repaint(window);
-        });
+        let select = Select::new(cx.app_mut(), self.theme.clone(), select_key, options).on_change(
+            move |app, chosen| {
+                let chosen = chosen.last().cloned();
+                let request = request(chosen);
+                app.write(&requests, Some(request));
+                let _ = app.request_repaint(window);
+            },
+        );
         select.mount(cx.app_mut(), window, wrapper)?;
         select.set_items(cx.app_mut(), items)?;
         select.set_disabled(cx.app_mut(), disabled);

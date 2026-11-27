@@ -2140,3 +2140,51 @@ fn traffic_light_api_is_unsupported_off_macos() {
         assert_eq!(app.traffic_light_inset(window), None);
     }
 }
+
+#[test]
+fn ime_cursor_area_includes_ancestor_popup_transform_offsets() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+    let (host, node) = {
+        let w = app.window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        let host = NodeBuilder::boxed()
+            .build(w.tree_mut(), root)
+            .expect("host");
+        let node = NodeBuilder::text("abc", crate::text::TextStyle::new(px(16.0)))
+            .style(text_style(None))
+            .build(w.tree_mut(), host)
+            .expect("text");
+        (host, node)
+    };
+    let _ = refresh(&mut app, window);
+    let _ = layout(&mut app, window);
+    let _ = text_layout(&mut app, window);
+    assert!(app.set_ime_cursor_area(window, node, 1).is_ok());
+    let base = app
+        .ime_cursor_area(window)
+        .expect("窗口存在")
+        .expect("已 shape 后有 hint");
+    app.window_mut(window)
+        .expect("窗口存在")
+        .tree_mut()
+        .set_popup_transform(
+            host,
+            Some(crate::node::tree::PopupTransform {
+                offset: crate::math::LogicalPoint::new(px(0.0), px(4.0)),
+                opacity: 1.0,
+                blocked: false,
+            }),
+        );
+    let shifted = app
+        .ime_cursor_area(window)
+        .expect("窗口存在")
+        .expect("已 shape 后有 hint");
+    assert_eq!(
+        shifted.origin.y,
+        base.origin.y + px(4.0),
+        "IME caret 必须包含祖先 popup paint_offset（E-11）"
+    );
+    assert_eq!(shifted.origin.x, base.origin.x);
+    assert_eq!(shifted.size, base.size);
+}

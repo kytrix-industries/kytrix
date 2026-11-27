@@ -12,8 +12,10 @@ pub(crate) fn accepts_action(tree: &NodeTree, node: NodeId) -> bool {
 
 #[must_use]
 pub(crate) fn focusable(tree: &NodeTree, node: NodeId) -> bool {
-    if !tree.is_effectively_visible(node)
+    if tree.hit_focus_skip(node) == crate::node::tree::HitFocusSkip::Container
+        || !tree.is_effectively_visible(node)
         || !tree.is_effectively_interactive(node)
+        || tree.popup_input_blocked(node)
         || !tree.get(node).is_ok_and(|target| target.tab_stop())
     {
         return false;
@@ -22,23 +24,13 @@ pub(crate) fn focusable(tree: &NodeTree, node: NodeId) -> bool {
 }
 
 #[must_use]
-pub(crate) fn in_scope(tree: &NodeTree, node: NodeId, scope: Option<NodeId>) -> bool {
-    crate::interaction::overlay::in_modal_scope(tree, node, scope)
-}
-
-#[must_use]
-pub(crate) fn focusable_in_scope(tree: &NodeTree, node: NodeId, scope: Option<NodeId>) -> bool {
-    in_scope(tree, node, scope) && focusable(tree, node)
-}
-
 pub(crate) fn next_focusable(
     tree: &NodeTree,
     from: Option<NodeId>,
     backwards: bool,
-    scope: Option<NodeId>,
 ) -> Option<NodeId> {
     let order = tree.dfs_ids();
-    let candidate = |node: &NodeId| focusable_in_scope(tree, *node, scope);
+    let candidate = |node: &NodeId| focusable(tree, *node);
     let Some(from) = from.filter(|node| candidate(node)) else {
         return if backwards {
             order.iter().rev().copied().find(candidate)
@@ -149,13 +141,9 @@ pub(crate) fn drag_target(tree: &NodeTree, from: NodeId) -> Option<(NodeId, Acti
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        action_target, drag_target, focusable, focusable_in_scope, in_scope, nearest_focusable,
-        next_focusable,
-    };
+    use super::{action_target, drag_target, focusable, nearest_focusable, next_focusable};
     use crate::{
         event::Action,
-        interaction::overlay::focus_scope_root,
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::style::StylePatch,
     };
@@ -191,7 +179,7 @@ mod tests {
             "不可见容器的子节点不得可聚焦"
         );
         assert_eq!(
-            next_focusable(&tree, Some(visible), false, None),
+            next_focusable(&tree, Some(visible), false),
             Some(visible),
             "Tab 序只含可见节点（单节点时回绕到自己）"
         );
@@ -216,7 +204,7 @@ mod tests {
         assert!(!focusable(&tree, middle), "普通节点不可聚焦");
 
         let sequence: Vec<NodeId> = std::iter::successors(Some(first), |node| {
-            next_focusable(&tree, Some(*node), false, None)
+            next_focusable(&tree, Some(*node), false)
         })
         .take(3)
         .collect();
@@ -236,18 +224,10 @@ mod tests {
             .build(&mut tree, root)
             .expect("mount");
 
-        assert_eq!(
-            next_focusable(&tree, Some(a), true, None),
-            Some(b),
-            "反向回绕"
-        );
-        assert_eq!(
-            next_focusable(&tree, Some(b), false, None),
-            Some(a),
-            "正向回绕"
-        );
-        assert_eq!(next_focusable(&tree, None, false, None), Some(a));
-        assert_eq!(next_focusable(&tree, None, true, None), Some(b));
+        assert_eq!(next_focusable(&tree, Some(a), true), Some(b), "反向回绕");
+        assert_eq!(next_focusable(&tree, Some(b), false), Some(a), "正向回绕");
+        assert_eq!(next_focusable(&tree, None, false), Some(a));
+        assert_eq!(next_focusable(&tree, None, true), Some(b));
     }
 
     #[test]
@@ -256,8 +236,8 @@ mod tests {
         let root = tree.root();
         let _ = plain(&mut tree, root);
 
-        assert_eq!(next_focusable(&tree, None, false, None), None);
-        assert_eq!(next_focusable(&tree, None, true, None), None);
+        assert_eq!(next_focusable(&tree, None, false), None);
+        assert_eq!(next_focusable(&tree, None, true), None);
     }
 
     #[test]
@@ -274,7 +254,7 @@ mod tests {
         );
 
         assert!(focusable(&tree, node));
-        assert_eq!(next_focusable(&tree, None, false, None), Some(node));
+        assert_eq!(next_focusable(&tree, None, false), Some(node));
     }
 
     #[test]
@@ -298,7 +278,7 @@ mod tests {
             Some(Action::custom("chrome")),
             "点击 / AT 的动作仍然保留"
         );
-        assert_eq!(next_focusable(&tree, Some(first), false, None), Some(first));
+        assert_eq!(next_focusable(&tree, Some(first), false), Some(first));
     }
 
     #[test]
@@ -404,12 +384,9 @@ mod tests {
             None,
             "外壳之外的点按仍按默认语义清空焦点"
         );
+        assert_eq!(next_focusable(&tree, Some(editable), false), Some(outside));
         assert_eq!(
-            next_focusable(&tree, Some(editable), false, None),
-            Some(outside)
-        );
-        assert_eq!(
-            next_focusable(&tree, Some(outside), false, None),
+            next_focusable(&tree, Some(outside), false),
             Some(editable),
             "Tab 序只有 editable 一个输入停靠点"
         );
@@ -552,67 +529,5 @@ mod tests {
             drag_target(&tree, thumb).map(|(_, action)| action),
             action_target(&tree, thumb).map(|(_, action)| action),
         );
-    }
-
-    #[test]
-    fn a_modal_scope_traps_the_tab_order_inside_the_overlay() {
-        let mut tree = NodeTree::new();
-        let root = tree.root();
-        let background = NodeBuilder::boxed()
-            .on_click(Action::custom("background"))
-            .build(&mut tree, root)
-            .expect("mount");
-        let panel = NodeBuilder::boxed().build(&mut tree, root).expect("mount");
-        tree.ensure_interaction(panel).expect("exists").overlay =
-            Some(crate::interaction::OverlaySlot {
-                dismiss: crate::interaction::OverlayDismiss::Explicit,
-                placement: crate::interaction::OverlayPlacement::Point(
-                    crate::math::LogicalPoint::ZERO,
-                ),
-                trap_focus: true,
-                opener: None,
-                restore_focus: false,
-            });
-        let first = NodeBuilder::boxed()
-            .on_click(Action::custom("first"))
-            .build(&mut tree, panel)
-            .expect("mount");
-        let second = NodeBuilder::boxed()
-            .on_click(Action::custom("second"))
-            .build(&mut tree, panel)
-            .expect("mount");
-
-        let scope = focus_scope_root(&tree, root);
-        assert_eq!(scope, Some(panel));
-
-        assert_eq!(
-            next_focusable(&tree, Some(first), false, scope),
-            Some(second)
-        );
-        assert_eq!(
-            next_focusable(&tree, Some(second), false, scope),
-            Some(first)
-        );
-        assert!(!focusable_in_scope(&tree, background, scope));
-        assert!(focusable_in_scope(&tree, first, scope));
-        assert!(!in_scope(&tree, background, scope));
-    }
-
-    #[test]
-    fn no_modal_means_no_restriction() {
-        let mut tree = NodeTree::new();
-        let root = tree.root();
-        let a = NodeBuilder::boxed()
-            .on_click(Action::custom("a"))
-            .build(&mut tree, root)
-            .expect("mount");
-        let b = NodeBuilder::boxed()
-            .on_click(Action::custom("b"))
-            .build(&mut tree, root)
-            .expect("mount");
-
-        let scope = focus_scope_root(&tree, root);
-        assert_eq!(scope, None);
-        assert_eq!(next_focusable(&tree, Some(a), false, scope), Some(b));
     }
 }

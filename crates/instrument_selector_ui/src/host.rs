@@ -5,10 +5,7 @@ use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_connector::catalog::store::Catalog;
 use time::UtcOffset;
 use ui_core::app::App;
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
+use ui_kit::theme::handle::ThemeHandle;
 use widget::{frame::FrameRouter, services::WidgetServices};
 
 use crate::prediction_translation::LocalTranslator;
@@ -75,18 +72,8 @@ impl SelectorHost {
     }
 
     #[must_use]
-    pub fn layer(&self) -> &Layer {
-        &self.services.layer
-    }
-
-    #[must_use]
     pub fn router(&self) -> &FrameRouter {
         &self.services.frame_router
-    }
-
-    #[must_use]
-    pub fn animation(&self) -> AnimationRouter {
-        (*self.services.animation_router).clone()
     }
 
     pub fn config_ref<R>(&self, app: &App, read: impl FnOnce(&Config) -> R) -> R {

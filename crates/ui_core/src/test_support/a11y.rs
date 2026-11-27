@@ -129,7 +129,7 @@ impl ShadowTree {
             {
                 let removed_tree = collect_shadow_subtree(&self.nodes, *removed);
                 for gone in removed_tree {
-                    if update.nodes.iter().any(|(candidate, _)| *candidate == gone) {
+                    if batch.contains(&gone) && !parents.contains_key(&gone) {
                         return Err(format!(
                             "node {gone:?} was removed from {id:?}'s children but is still \
                              present in this batch"
@@ -160,6 +160,9 @@ impl ShadowTree {
             };
             let next: ahash::HashSet<AkNodeId> = updated.children.iter().copied().collect();
             for removed in old_children.iter().filter(|child| !next.contains(child)) {
+                if parents.contains_key(removed) {
+                    continue;
+                }
                 remove_shadow_subtree(&mut self.nodes, *removed);
             }
         }
@@ -168,6 +171,21 @@ impl ShadowTree {
             return Err(format!(
                 "focus {:?} does not exist in the resulting tree",
                 update.focus
+            ));
+        }
+        let mut reachable: ahash::HashSet<AkNodeId> = ahash::HashSet::default();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(&id) {
+                stack.extend(node.children.iter().copied());
+            }
+        }
+        if let Some(unreachable) = self.nodes.keys().find(|id| !reachable.contains(id)) {
+            return Err(format!(
+                "node {unreachable:?} is not reachable from the root after this update"
             ));
         }
         self.focus = Some(update.focus);
@@ -219,7 +237,7 @@ fn remove_shadow_subtree(nodes: &mut ahash::HashMap<AkNodeId, ShadowNode>, root:
     }
 }
 
-const INTERESTING_ACTIONS: [accesskit::Action; 16] = [
+const INTERESTING_ACTIONS: [accesskit::Action; 18] = [
     accesskit::Action::Click,
     accesskit::Action::Focus,
     accesskit::Action::Blur,
@@ -236,6 +254,8 @@ const INTERESTING_ACTIONS: [accesskit::Action; 16] = [
     accesskit::Action::Expand,
     accesskit::Action::Collapse,
     accesskit::Action::CustomAction,
+    accesskit::Action::HideTooltip,
+    accesskit::Action::ShowTooltip,
 ];
 
 fn has_any_action(node: &accesskit::Node) -> bool {
@@ -271,6 +291,24 @@ fn node_summary(id: AkNodeId, node: &accesskit::Node) -> String {
     }
     if let Some(expanded) = node.is_expanded() {
         let _ = write!(out, " expanded={expanded}");
+    }
+    if let Some(has_popup) = node.has_popup() {
+        let _ = write!(out, " has_popup={has_popup:?}");
+    }
+    if !node.controls().is_empty() {
+        let _ = write!(out, " controls={:?}", node.controls());
+    }
+    if !node.owns().is_empty() {
+        let _ = write!(out, " owns={:?}", node.owns());
+    }
+    if !node.described_by().is_empty() {
+        let _ = write!(out, " described_by={:?}", node.described_by());
+    }
+    if let Some(active) = node.active_descendant() {
+        let _ = write!(out, " active_descendant={active:?}");
+    }
+    if node.is_modal() {
+        let _ = write!(out, " modal");
     }
     if has_any_action(node) {
         let mut actions: Vec<String> = INTERESTING_ACTIONS
@@ -405,6 +443,52 @@ pub fn assert_incremental_within(update: &TreeUpdate, max: usize) {
     );
 }
 
+pub fn assert_relations_resolve(snapshot: &crate::a11y::A11yTreeSnapshot) {
+    let ids: ahash::HashSet<crate::a11y::A11yNodeId> =
+        snapshot.nodes().iter().map(|node| node.id).collect();
+    for node in snapshot.nodes() {
+        for relation in node
+            .controls
+            .iter()
+            .chain(&node.owns)
+            .chain(&node.described_by)
+            .chain(node.active_descendant.iter())
+        {
+            assert!(
+                ids.contains(relation),
+                "node {:?} references {:?} via a relation but that node is not delivered",
+                node.id,
+                relation
+            );
+        }
+    }
+}
+
+pub fn assert_no_hidden_ancestors(snapshot: &crate::a11y::A11yTreeSnapshot) {
+    let by_id: ahash::HashMap<crate::a11y::A11yNodeId, &crate::a11y::A11yNode> = snapshot
+        .nodes()
+        .iter()
+        .map(|node| (node.id, node))
+        .collect();
+    for node in snapshot.nodes() {
+        if node.hidden {
+            continue;
+        }
+        let mut cursor = node.parent;
+        while let Some(parent) = cursor {
+            let Some(record) = by_id.get(&parent) else {
+                break;
+            };
+            assert!(
+                !record.hidden,
+                "visible node {:?} has hidden ancestor {:?}",
+                node.id, record.id
+            );
+            cursor = record.parent;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use accesskit::{Node, NodeId as AkNodeId, Role, TreeId, TreeInfo, TreeUpdate};
@@ -506,6 +590,39 @@ mod tests {
         );
         let error = shadow.apply(&update).expect_err("双父必须被拒绝");
         assert!(error.contains("multiple parents"), "{error}");
+    }
+
+    #[test]
+    fn a_node_reparented_in_the_same_update_is_accepted() {
+        let mut shadow = ShadowTree::new();
+        shadow
+            .apply(&full(
+                vec![
+                    (AkNodeId(1), node(Role::Window, &[AkNodeId(2), AkNodeId(3)])),
+                    (AkNodeId(2), node(Role::Button, &[])),
+                    (AkNodeId(3), node(Role::Group, &[])),
+                ],
+                AkNodeId(1),
+            ))
+            .expect("first");
+        shadow
+            .apply(&incremental(
+                vec![
+                    (AkNodeId(1), node(Role::Window, &[AkNodeId(3)])),
+                    (AkNodeId(2), node(Role::Button, &[])),
+                    (AkNodeId(3), node(Role::Group, &[AkNodeId(2)])),
+                ],
+                AkNodeId(1),
+            ))
+            .expect("a11y 树重挂（popup 链嵌套）必须合法");
+        assert_eq!(
+            shadow.structure(),
+            vec![
+                (AkNodeId(1), vec![AkNodeId(3)]),
+                (AkNodeId(2), vec![]),
+                (AkNodeId(3), vec![AkNodeId(2)]),
+            ]
+        );
     }
 
     #[test]
@@ -639,9 +756,12 @@ mod tests {
     fn a_modal_scope_change_is_delivered_as_a_legal_incremental_update() {
         use crate::{
             a11y::{A11yOverride, A11yRole},
-            interaction::{OverlayDismiss, OverlayOptions, OverlayPlacement},
-            math::{LogicalPoint, LogicalRect, px},
+            math::{LogicalRect, px},
             node::builder::NodeBuilder,
+            popup::{
+                Anchor, DismissPolicy, DismissReason, FocusPolicy, InitialFocus, PlacementSpec,
+                PopupA11y, PopupAnimation, PopupSpec, PopupTier, RestoreFocus,
+            },
             test_support::app::TestApp,
         };
 
@@ -668,31 +788,49 @@ mod tests {
             "首笔必须带 TreeInfo"
         );
 
+        let mut spec = PopupSpec::new(
+            Anchor::WindowRect(LogicalRect::new(px(150.0), px(50.0), px(0.0), px(0.0))),
+            PlacementSpec::default(),
+        );
+        spec.tier = PopupTier::Modal;
+        spec.focus = FocusPolicy::Trap {
+            restore: RestoreFocus::Opener,
+            initial: InitialFocus::Container,
+        };
+        spec.dismiss = DismissPolicy::Explicit {
+            outside: false,
+            escape: true,
+        };
+        spec.animation = PopupAnimation::None;
+        spec.a11y = PopupA11y {
+            role: Some(A11yRole::Dialog),
+            label: Some(smol_str::SmolStr::new_static("确认下单")),
+            ..PopupA11y::default()
+        };
         let modal = app
             .app_mut()
-            .create_overlay(
+            .open_popup(
                 window,
-                OverlayOptions {
-                    placement: OverlayPlacement::Point(LogicalPoint::new(px(150.0), px(50.0))),
-                    dismiss: OverlayDismiss::Explicit,
-                    trap_focus: true,
-                    a11y: A11yOverride {
-                        role: Some(A11yRole::Dialog),
-                        label: Some(smol_str::SmolStr::new_static("确认下单")),
-                        ..A11yOverride::default()
-                    },
-                    ..OverlayOptions::default()
+                spec,
+                |app, window, content| {
+                    NodeBuilder::boxed()
+                        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
+                        .on_click(crate::event::Action::custom("modal.ok"))
+                        .build(app.window_mut(window).expect("窗口").tree_mut(), content)?;
+                    Ok(())
                 },
+                None,
             )
             .expect("modal");
-        NodeBuilder::boxed()
-            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
-            .on_click(crate::event::Action::custom("modal.ok"))
-            .build(
-                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
-                modal.node(),
-            )
-            .expect("confirm");
+        let modal_node = app
+            .app()
+            .popup_stack(window)
+            .expect("弹层栈")
+            .entries
+            .iter()
+            .find(|entry| entry.id == modal)
+            .expect("模态条目")
+            .node;
         let _ = app.drain().expect("模态帧");
         app.assert_a11y_contract();
 
@@ -707,9 +845,9 @@ mod tests {
             .map(|(_, node)| node)
             .expect("背景的 hidden 变化必须在本笔增量里（模态作用域变化要标全树 A11Y）");
         assert!(background_node.is_hidden(), "模态外背景必须 hidden");
-        let wrapper = snapshot.node_for(modal.node()).expect("模态包装记录");
+        let wrapper = snapshot.node_for(modal_node).expect("模态包装记录");
         assert_eq!(wrapper.role, A11yRole::Dialog);
-        assert!(wrapper.modal, "a11y modal 必须跟 trap_focus 走");
+        assert!(wrapper.modal, "a11y modal 必须跟 FocusPolicy::Trap 走");
         let wrapper_id = accesskit::NodeId(wrapper.id.get());
         let wrapper_ak = update
             .nodes
@@ -719,7 +857,9 @@ mod tests {
             .expect("模态包装必须在本笔增量里");
         assert!(wrapper_ak.is_modal());
 
-        app.app_mut().close_overlay(&modal);
+        let _ = app
+            .app_mut()
+            .begin_close_popup(modal, DismissReason::Programmatic);
         let _ = app.drain().expect("关闭帧");
         app.assert_a11y_contract();
         let update = app.a11y_update().expect("模态关闭必须产生 a11y 增量");

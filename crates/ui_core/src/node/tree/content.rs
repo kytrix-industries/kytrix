@@ -8,7 +8,7 @@ use super::{BakedGeometryChunk, NodeKind, NodeTree};
 use crate::paint::style::Style;
 use crate::{
     error::EngineError,
-    interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
+    interaction::{NodeInteraction, ScrollSlot, VirtualSlot},
     math::{DeviceRect, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform, px},
     node::{dependency::ReadCtx, dirty::DirtyFlags, id::NodeId, signal::SignalId},
     paint::{extent::PaintedExtent, geometry::GeometryId, scene::LaneId, style::StylePatch},
@@ -697,6 +697,40 @@ pub(crate) fn set_painted_extent(tree: &mut NodeTree, node: NodeId, extent: Opti
     tree.painted_extents[index] = extent;
 }
 
+pub(crate) fn popup_transform(tree: &NodeTree, node: NodeId) -> Option<super::PopupTransform> {
+    tree.popup_transforms
+        .get(node.index() as usize)
+        .copied()
+        .flatten()
+}
+
+pub(crate) fn set_popup_transform(
+    tree: &mut NodeTree,
+    node: NodeId,
+    transform: Option<super::PopupTransform>,
+) {
+    let index = node.index() as usize;
+    if tree.popup_transforms.len() <= index {
+        tree.popup_transforms.resize_with(index + 1, || None);
+    }
+    tree.popup_transforms[index] = transform;
+}
+
+pub(crate) fn popup_pointer_transparent(tree: &NodeTree, node: NodeId) -> bool {
+    tree.popup_pointer_transparent
+        .get(node.index() as usize)
+        .copied()
+        .unwrap_or(false)
+}
+
+pub(crate) fn set_popup_pointer_transparent(tree: &mut NodeTree, node: NodeId, transparent: bool) {
+    let index = node.index() as usize;
+    if tree.popup_pointer_transparent.len() <= index {
+        tree.popup_pointer_transparent.resize(index + 1, false);
+    }
+    tree.popup_pointer_transparent[index] = transparent;
+}
+
 pub(crate) fn paint_state(
     tree: &NodeTree,
     node: NodeId,
@@ -997,10 +1031,6 @@ pub(crate) fn scroll_slot(tree: &NodeTree, node: NodeId) -> Option<ScrollSlot> {
 pub(crate) fn scroll_slot_mut(tree: &mut NodeTree, node: NodeId) -> Option<&mut ScrollSlot> {
     tree.ensure_interaction(node)
         .and_then(|slot| slot.scroll.as_mut())
-}
-
-pub(crate) fn overlay_slot(tree: &NodeTree, node: NodeId) -> Option<OverlaySlot> {
-    tree.interaction(node).and_then(|slot| slot.overlay)
 }
 
 pub(crate) fn virtual_slot(tree: &NodeTree, node: NodeId) -> Option<&VirtualSlot> {

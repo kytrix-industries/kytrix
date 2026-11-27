@@ -136,9 +136,16 @@ pub(crate) fn scroll_to(
     if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
         slot.offset = next;
     }
+    if !target.tree().is_ancestor(target.popups().root(), node) {
+        target.bump_scroll_epoch();
+    }
     let damage = scroll::to_screen(target.tree(), node, viewport);
     target.request_damage(damage);
     target.a11y_note_scroll(node);
+    target.popups_mut().mark(crate::popup::PopupDirty {
+        geometry: true,
+        order: false,
+    });
     app.request_frame();
     app.rewindow_virtual(window, node);
     Ok(())
@@ -169,9 +176,16 @@ pub(crate) fn clamp_scroll_offsets(app: &mut App, window: WindowId) -> bool {
         if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
             slot.offset = next;
         }
+        if !target.tree().is_ancestor(target.popups().root(), node) {
+            target.bump_scroll_epoch();
+        }
         let damage = scroll::to_screen(target.tree(), node, viewport);
         target.request_damage(damage);
         target.a11y_note_scroll(node);
+        target.popups_mut().mark(crate::popup::PopupDirty {
+            geometry: true,
+            order: false,
+        });
         changed = true;
     }
     changed

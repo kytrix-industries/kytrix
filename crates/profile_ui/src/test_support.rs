@@ -21,13 +21,11 @@ use ui_core::{
     event::{InputEvent, Modifiers, PointerButton},
     math::{LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
+    popup::PopupTier,
     test_support::{app::TestApp, diagnostics::SignalSlotStats},
     window::{WindowId, WindowOptions},
 };
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
+use ui_kit::theme::{appearance::Appearance, handle::ThemeHandle};
 use widget::{frame::FrameRouter, services::WidgetServices};
 use zeroize::Zeroizing;
 
@@ -363,9 +361,7 @@ impl Harness {
             .build()
             .expect("the test runtime");
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let layer = Rc::new(Layer::new());
         let router = Rc::new(FrameRouter::new(app.app_mut()).expect("the test host owns the hook"));
-        let animation = Rc::new(AnimationRouter::new());
         let opened_urls = Rc::new(RefCell::new(Vec::new()));
         let opened = Rc::clone(&opened_urls);
         let window = app.window_id();
@@ -375,9 +371,7 @@ impl Harness {
                 runtime.handle().clone(),
                 translate(LanguageCode::En),
                 theme,
-                Rc::clone(&layer),
                 Rc::clone(&router),
-                Rc::clone(&animation),
             )
             .open_url(move |url| opened.borrow_mut().push(SmolStr::new(url)))
             .build(),
@@ -602,6 +596,7 @@ impl Harness {
             .expect("the alert draws its confirming button");
         self.click_node(node);
         self.settle(2);
+        self.advance(Duration::from_millis(200));
     }
 
     pub(crate) fn click_alert_cancel(&mut self) {
@@ -612,6 +607,7 @@ impl Harness {
             .expect("the alert draws its declining button");
         self.click_node(node);
         self.settle(2);
+        self.advance(Duration::from_millis(200));
     }
 
     pub(crate) fn start_sign_in(&mut self) {
@@ -790,8 +786,23 @@ impl Harness {
             .len()
     }
 
+    pub(crate) fn popup_total(&self) -> usize {
+        self.app
+            .app()
+            .popup_stack(self.app.window_id())
+            .map_or(0, |stack| stack.entries.len())
+    }
     pub(crate) fn overlay_count(&self) -> usize {
-        self.app.app().overlays(self.app.window_id()).len()
+        self.app
+            .app()
+            .popup_stack(self.app.window_id())
+            .map_or(0, |stack| {
+                stack
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.tier != PopupTier::Scrim)
+                    .count()
+            })
     }
 
     pub(crate) fn frame_requests(&self) -> u64 {

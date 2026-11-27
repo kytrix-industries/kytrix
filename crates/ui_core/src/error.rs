@@ -103,6 +103,15 @@ pub enum EngineError {
     InvalidDpiScale { factor: f32 },
 
     #[error(
+        "node {node:?} has an invalid runtime max size: width {width:?} / height {height:?}; each set axis must be finite and non-negative"
+    )]
+    InvalidMaxSize {
+        node: NodeId,
+        width: Option<LogicalPx>,
+        height: Option<LogicalPx>,
+    },
+
+    #[error(
         "stale node handle {node:?}: the node was unmounted or never existed in this window, \
          or cannot be used as a text hit target"
     )]

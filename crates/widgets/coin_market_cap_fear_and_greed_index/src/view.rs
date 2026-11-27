@@ -729,14 +729,10 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             .build_themed(cx.app_mut(), window, row, &theme, Role::FgSubtle)
             .map_err(|error| icon_error(error, row))?;
         let key = cx.unique_key(descriptor.key);
-        let layer = cx.layer().clone();
-        let animation = cx.animation().clone();
         let content = t_smol!(self.translate, descriptor.info);
         let tooltip = Tooltip::new(
             cx.app_mut(),
             self.theme.clone(),
-            layer,
-            animation,
             key,
             TooltipOptions::default(),
         );

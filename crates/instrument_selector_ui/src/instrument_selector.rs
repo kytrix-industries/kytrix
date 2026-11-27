@@ -434,13 +434,11 @@ impl SelectorState {
     }
 
     fn build_dialog(selector: &Rc<InstrumentSelector>, app: &mut App) -> Dialog {
-        let (theme, translate, layer, animation, closed, key) = {
+        let (theme, translate, closed, key) = {
             let inner = selector.inner.borrow();
             (
                 inner.host.theme().clone(),
                 inner.host.translate().clone(),
-                inner.host.layer().clone(),
-                inner.host.animation(),
                 Rc::clone(&inner.closed),
                 inner.key.clone(),
             )
@@ -455,6 +453,7 @@ impl SelectorState {
         DialogBuilder::new(title)
             .header(false)
             .close_button(false)
+            .width(DIALOG_WIDTH)
             .content(move |app, window, body| {
                 let Some(selector) = content_weak.upgrade() else {
                     return Ok(());
@@ -472,7 +471,7 @@ impl SelectorState {
                 }
             })
             .on_close(move |_close, _app| closed.set(true))
-            .build(app, theme, layer, animation, key)
+            .build(app, theme, key)
     }
 
     fn register_route(selector: &Rc<InstrumentSelector>, host: &SelectorHost) -> RouteId {
@@ -681,7 +680,7 @@ impl SelectorState {
         let open = self
             .dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.is_open(app) || dialog.is_closing());
+            .is_some_and(|dialog| dialog.is_open(app) || dialog.is_closing(app));
         if !open {
             self.closed.set(true);
             self.finish(app);

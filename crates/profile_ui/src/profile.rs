@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc};
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use app_config::settings::AccountConfig;
 use bytes::Bytes;
@@ -10,6 +10,7 @@ use tokio::sync::{
     oneshot,
 };
 use ui_core::{
+    a11y::A11yRole,
     app::App,
     error::EngineError,
     event::Event,
@@ -19,21 +20,21 @@ use ui_core::{
         id::NodeId,
         signal::{Signal, SignalScope},
     },
+    popup::{
+        Alignment, Anchor, DismissPolicy, DismissReason, EscapePolicy, FocusPolicy, OutsidePress,
+        Placement, PlacementSpec, PopupA11y, PopupAnimation, PopupSpec, RestoreFocus, Side,
+    },
     resources::PendingResource,
     window::WindowId,
 };
 use ui_kit::kit::{
     button::Button,
-    dialog::{Dialog, DialogError},
-    layer::{Band, LayerSlot},
-    overlay::{
-        Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayError, OverlayOptions, OverlaySurface,
-        Placement,
-    },
+    dialog::Dialog,
+    popup_panel::{PanelWidth, PopupPanel, PopupPanelOptions, PopupSurface},
     size::UnifiedSizable,
     tooltip::{Tooltip, TooltipContent, TooltipOptions},
 };
-use widget::error::TranslatedError;
+use widget::error::{TranslatedError, dialog_engine_error, popup_engine_error};
 
 use crate::{
     account::SignedInAccount,
@@ -101,7 +102,7 @@ struct State {
     signals: MenuSignals,
     trigger: Trigger,
     tooltip: Tooltip,
-    overlay: Overlay,
+    panel: PopupPanel,
     snapshot: crate::host::AccountSnapshot,
     face: Option<FaceTexture>,
     face_job: Option<SmolStr>,
@@ -116,6 +117,7 @@ struct State {
     events_tx: UnboundedSender<MenuEvent>,
     sign_in: Option<oneshot::Sender<()>>,
     awaiting_alert: bool,
+    dismissed: Rc<Cell<Option<DismissReason>>>,
     session: Option<oneshot::Sender<()>>,
 }
 
@@ -164,32 +166,21 @@ impl ProfileMenu {
         let tooltip = Tooltip::new(
             app,
             self.host.theme().clone(),
-            self.host.layer().clone(),
-            self.host.animation(),
             format_smolstr!("{key}:hint"),
-            TooltipOptions {
-                placement: Placement::BOTTOM,
-                ..TooltipOptions::default()
-            },
+            TooltipOptions::default(),
         );
         tooltip.attach(app, window, trigger.node);
-        let overlay = Overlay::new(
+        let panel = PopupPanel::new(
             app,
             self.host.theme().clone(),
-            self.host.layer().clone(),
-            self.host.animation(),
             format_smolstr!("{key}:menu"),
-            OverlayOptions {
-                placement: Placement::BOTTOM_END,
-                band: Band::Popup,
-                slot: LayerSlot::Exclusive,
-                dismiss: DismissPolicy::OutsideClick,
-                modal: false,
-                surface: OverlaySurface::menu(),
-                a11y: OverlayA11y::menu(trigger_a11y_label(&snapshot, self.host.translate())),
-                ..OverlayOptions::default()
-            },
+            PopupPanelOptions::new(PopupSurface::menu(), PanelWidth::Auto),
         );
+        let dismissed: Rc<Cell<Option<DismissReason>>> = Rc::new(Cell::new(None));
+        {
+            let dismissed = Rc::clone(&dismissed);
+            panel.on_close(move |_, reason| dismissed.set(Some(reason)));
+        }
         let (events_tx, events) = unbounded_channel();
         let mut state = State {
             window,
@@ -201,7 +192,7 @@ impl ProfileMenu {
             signals,
             trigger,
             tooltip,
-            overlay,
+            panel,
             snapshot,
             face: None,
             face_job: None,
@@ -216,6 +207,7 @@ impl ProfileMenu {
             events_tx,
             sign_in: None,
             awaiting_alert: false,
+            dismissed,
             session: None,
         };
         self.start_session_watch(app, &mut state);
@@ -265,7 +257,7 @@ impl ProfileMenu {
             remove_if_present(app, state.window, content.root);
             content.release(app);
         }
-        state.overlay.release(app);
+        state.panel.release(app);
         state.tooltip.release(app);
         state.trigger.button.release(app);
         let _ = app.release_scope(state.scope);
@@ -275,7 +267,7 @@ impl ProfileMenu {
     pub fn is_menu_open(&self, app: &App) -> bool {
         self.state
             .as_ref()
-            .is_some_and(|state| state.wants_open && state.overlay.is_open(app))
+            .is_some_and(|state| state.wants_open && state.panel.is_open(app))
     }
 
     #[must_use]
@@ -404,7 +396,7 @@ impl ProfileMenu {
                 if state.snapshot.account.is_some() {
                     state.wants_open = !state.wants_open;
                     if !state.wants_open {
-                        state.overlay.close(app);
+                        state.panel.close(app);
                     }
                 } else {
                     self.start_sign_in(app, state)?;
@@ -606,7 +598,7 @@ impl ProfileMenu {
     }
 
     fn rebuild_trigger(&self, app: &mut App, state: &mut State) -> Result<(), EngineError> {
-        let was_open = state.wants_open && state.overlay.is_open(app);
+        let was_open = state.wants_open && state.panel.is_open(app);
         remove_if_present(app, state.window, state.trigger.node);
         state.trigger.button.release(app);
         state.trigger = TriggerBuild {
@@ -621,14 +613,16 @@ impl ProfileMenu {
         .build(app)?;
         state.tooltip.attach(app, state.window, state.trigger.node);
         if was_open {
-            let reopened = state.overlay.open(
-                app,
-                state.window,
-                Anchor::node(state.trigger.node),
-                |_tree, _panel| Ok(()),
-            );
-            if let Err(error) = reopened {
-                log::warn!("failed to re-anchor the account menu: {error}");
+            let anchor = Anchor::Node {
+                node: state.trigger.node,
+            };
+            if state.panel.is_open(app) {
+                if !state.panel.set_anchor(app, anchor) {
+                    log::warn!("failed to re-anchor the account menu");
+                }
+            } else {
+                state.wants_open = true;
+                self.open_menu(app, state)?;
             }
         }
 
@@ -636,27 +630,35 @@ impl ProfileMenu {
     }
 
     fn open_menu(&self, app: &mut App, state: &mut State) -> Result<(), EngineError> {
-        if state.overlay.is_open(app) {
+        if state.panel.is_open(app) {
             return Ok(());
         }
         let Some(account) = state.snapshot.account.as_ref() else {
             return Ok(());
         };
-        let opened = state
-            .overlay
-            .open(
-                app,
-                state.window,
-                Anchor::node(state.trigger.node),
-                |_tree, _panel| Ok(()),
-            )
-            .map_err(|error| overlay_error(state.window, error))?;
-        if !opened {
-            log::debug!("the account menu could not be anchored yet");
-
-            return Ok(());
-        }
-        let Some(panel) = state.overlay.panel_node() else {
+        let trigger = state.trigger.node;
+        let mut spec = PopupSpec::new(Anchor::Node { node: trigger }, menu_placement());
+        spec.dismiss = DismissPolicy::Chain {
+            outside: OutsidePress::Replay,
+            escape: EscapePolicy::CloseTopmost,
+            anchor_lost: true,
+            focus_lost: true,
+        };
+        spec.focus = FocusPolicy::Take {
+            restore: RestoreFocus::Opener,
+        };
+        spec.opener = Some(trigger);
+        spec.animation = PopupAnimation::Fade;
+        spec.a11y = PopupA11y {
+            role: Some(A11yRole::Menu),
+            label: Some(trigger_a11y_label(&state.snapshot, self.host.translate())),
+            ..PopupA11y::default()
+        };
+        state
+            .panel
+            .open(app, state.window, spec, |_, _, _| Ok(()))
+            .map_err(popup_engine_error)?;
+        let Some(panel) = state.panel.body_node() else {
             return Err(EngineError::UnknownWindow {
                 window: state.window,
             });
@@ -680,7 +682,7 @@ impl ProfileMenu {
 
     fn close_menu(&self, app: &mut App, state: &mut State) {
         state.wants_open = false;
-        state.overlay.close(app);
+        state.panel.close(app);
     }
 
     fn release_menu_content(&self, app: &mut App, state: &mut State) {
@@ -691,17 +693,24 @@ impl ProfileMenu {
     }
 
     fn sync_menu(&self, app: &mut App, state: &mut State) -> Result<(), EngineError> {
-        let was_open = state.overlay.is_open(app);
-        state.overlay.sync(app);
-        if was_open && !state.overlay.is_open(app) {
+        let was_open = state.panel.is_open(app);
+        state.panel.sync(app);
+        if let Some(reason) = state.dismissed.take()
+            && reason != DismissReason::Programmatic
+        {
             state.wants_open = false;
         }
-        if !state.overlay.is_open(app) {
+        if was_open && !state.panel.is_open(app) {
+            state.wants_open = false;
+        }
+        if !state.panel.is_open(app) {
             app.write(&state.open, false);
-            if state.wants_open && state.snapshot.account.is_some() {
-                self.open_menu(app, state)?;
-            } else {
-                self.release_menu_content(app, state);
+            if state.panel.id().is_none() {
+                if state.wants_open && state.snapshot.account.is_some() {
+                    self.open_menu(app, state)?;
+                } else {
+                    self.release_menu_content(app, state);
+                }
             }
 
             return Ok(());
@@ -737,7 +746,7 @@ impl ProfileMenu {
         state: &mut State,
         account: &AccountConfig,
     ) -> Result<(), EngineError> {
-        let Some(panel) = state.overlay.panel_node() else {
+        let Some(panel) = state.panel.body_node() else {
             return Ok(());
         };
         if let Some(previous) = state.menu.take() {
@@ -778,9 +787,7 @@ impl ProfileMenu {
         let Some(alert) = state.alert.clone() else {
             return Ok(());
         };
-        alert
-            .sync(app)
-            .map_err(|error| dialog_error(state.window, error))?;
+        alert.sync(app).map_err(dialog_engine_error)?;
         if !alert.is_open(app) {
             state.alert = None;
             alert.release(app);
@@ -797,9 +804,7 @@ impl ProfileMenu {
     ) -> Result<(), EngineError> {
         let key = format_smolstr!("{}:alert", state.key);
         let alert = dialogs::build(app, &self.host, key, content);
-        alert
-            .open(app, state.window)
-            .map_err(|error| dialog_error(state.window, error))?;
+        alert.open(app, state.window).map_err(dialog_engine_error)?;
         if let Some(previous) = state.alert.replace(alert) {
             previous.release(app);
         }
@@ -1094,8 +1099,8 @@ impl ProfileMenu {
     }
 
     #[cfg(test)]
-    pub(crate) fn menu_overlay(&self) -> Option<&Overlay> {
-        self.state.as_ref().map(|state| &state.overlay)
+    pub(crate) fn menu_panel(&self) -> Option<&PopupPanel> {
+        self.state.as_ref().map(|state| &state.panel)
     }
 
     #[cfg(test)]
@@ -1323,20 +1328,12 @@ fn remove_if_present(app: &mut App, window: WindowId, node: NodeId) {
     }
 }
 
-fn dialog_error(window: WindowId, error: DialogError) -> EngineError {
-    match error {
-        DialogError::Engine(error) => error,
-        DialogError::Overlay(OverlayError::Engine(error)) => error,
-        DialogError::Overlay(OverlayError::PlacementConfig { .. }) | DialogError::NotOpen => {
-            EngineError::UnknownWindow { window }
-        }
-    }
-}
-
-fn overlay_error(window: WindowId, error: OverlayError) -> EngineError {
-    match error {
-        OverlayError::Engine(error) => error,
-        OverlayError::PlacementConfig { .. } => EngineError::UnknownWindow { window },
+fn menu_placement() -> PlacementSpec {
+    PlacementSpec {
+        side: Side::Bottom,
+        align: Alignment::End,
+        fallbacks: vec![Placement::new(Side::Top, Alignment::End)].into(),
+        ..PlacementSpec::default()
     }
 }
 
@@ -1353,9 +1350,10 @@ mod tests {
     use ui_core::{
         math::{DevicePixelRatio, LogicalSize, px},
         node::{image::ImageSource, tree::NodeKind},
+        popup::PopupTier,
         resources::ImageResourceKind,
     };
-    use ui_kit::kit::{layer::Band, size::UnifiedSize};
+    use ui_kit::kit::size::UnifiedSize;
     use widget::error::TranslatedError;
 
     use super::{MenuEvent, ProfileMenu};
@@ -1562,8 +1560,8 @@ mod tests {
 
         let panel = harness
             .menu()
-            .menu_overlay()
-            .and_then(|overlay| overlay.panel_node())
+            .menu_panel()
+            .and_then(|panel| panel.panel_node())
             .expect("the menu draws a panel");
         assert_eq!(
             harness
@@ -1574,20 +1572,23 @@ mod tests {
             px(MENU_WIDTH),
             "the menu is the one width the account block is centred on"
         );
+        let stack = harness
+            .app()
+            .popup_stack(harness.window())
+            .expect("the window owns a popup stack");
         assert_eq!(
-            harness
-                .menu()
-                .menu_overlay()
-                .expect("the menu")
-                .options()
-                .band,
-            Band::Popup,
-            "a menu belongs in the popup band"
+            stack
+                .entries
+                .iter()
+                .map(|entry| entry.tier)
+                .collect::<Vec<_>>(),
+            [PopupTier::Auto],
+            "a menu belongs in the auto tier"
         );
         assert_eq!(
             harness.overlay_count(),
             1,
-            "the menu is one overlay in the window"
+            "the menu is one popup in the window"
         );
         for (id, what) in [
             ("TEST_PROFILE_MENU", "the menu's content"),
@@ -1925,6 +1926,11 @@ mod tests {
                 .is_some_and(|alert| alert.is_open(harness.app())),
             "the alert goes with the attempt it reported"
         );
+        assert_eq!(
+            harness.popup_total(),
+            0,
+            "the closed alert leaves neither a dialog nor a scrim in the popup stack"
+        );
         assert!(harness.menu().account().is_none());
     }
 
@@ -2010,6 +2016,11 @@ mod tests {
                 .is_some_and(|alert| alert.is_open(harness.app())),
             "reading the report closes it"
         );
+        assert_eq!(
+            harness.popup_total(),
+            0,
+            "the closed report leaves neither a dialog nor a scrim in the popup stack"
+        );
     }
 
     #[test]
@@ -2036,6 +2047,11 @@ mod tests {
                 .alert()
                 .is_some_and(|alert| alert.is_open(harness.app())),
             "declining closes the question"
+        );
+        assert_eq!(
+            harness.popup_total(),
+            0,
+            "the declined question leaves neither a dialog nor a scrim in the popup stack"
         );
         assert_eq!(
             harness.settings().read(harness.app()).account.as_ref(),
@@ -2105,6 +2121,11 @@ mod tests {
             "a sign-out reports nothing: there is no failure left for it to report"
         );
         assert_eq!(
+            harness.popup_total(),
+            0,
+            "a sign-out leaves no popup entry behind"
+        );
+        assert_eq!(
             hint_text(&harness),
             t_smol!(en(), "window.account.sign_in"),
             "the signed-out control offers a sign-in again"
@@ -2121,6 +2142,7 @@ mod tests {
 
         assert!(harness.settle_until(60, |harness| { !harness.menu().is_waiting_for_browser() }));
         harness.settle(3);
+        harness.advance(Duration::from_millis(200));
         assert!(harness.settings().read(harness.app()).account.is_none());
         assert!(
             !harness
@@ -2128,6 +2150,11 @@ mod tests {
                 .alert()
                 .is_some_and(|alert| alert.is_open(harness.app())),
             "a sign-out the user asked for is not a failed sign-in to report"
+        );
+        assert_eq!(
+            harness.popup_total(),
+            0,
+            "the ended sign-in leaves neither a dialog nor a scrim in the popup stack"
         );
     }
 

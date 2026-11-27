@@ -6,12 +6,12 @@ mod canvas_text;
 #[cfg(feature = "hud")]
 mod debug;
 mod event_queue;
-mod focus;
+pub(crate) mod focus;
 mod frame;
 mod geometry;
 mod input;
 mod invalidate;
-mod overlay;
+pub(crate) mod popup;
 mod resources;
 mod scroll;
 mod signal_api;
@@ -38,8 +38,8 @@ use crate::{
     },
     interaction::{
         ActionCtx, AnimatedValue, AnimationId, AnimationSpec, DragInfo, DragState, Easing,
-        InputThresholds, ItemAlign, Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement,
-        ScrollConfig, ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
+        InputThresholds, ItemAlign, ScrollConfig, ScrollHandle, ScrollState, VirtualList,
+        VirtualListConfig, VirtualListState,
     },
     layout::hit_test::HitResult,
     math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize},
@@ -49,8 +49,12 @@ use crate::{
         id::NodeId,
         signal::{Derived, Signal, SignalId, SignalRef, SignalScope, StateStore, Transient},
     },
-    paint::{color::Color, style::Cursor, style_builder::StyleBuilder},
+    paint::{color::Color, style::Cursor},
     platform::dispatcher::{Dispatcher, UserTask},
+    popup::{
+        Anchor, DismissOutcome, DismissReason, PopupA11y, PopupDismiss, PopupError, PopupId,
+        PopupRect, PopupSpec, PopupStackSnapshot, PopupState,
+    },
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
     resources::{
         DecodeState, ImageDiagnostic, PendingResource, ResourceCache, ResourceId, ResourceImage,
@@ -292,14 +296,6 @@ fn default_bindings() -> Vec<KeyBinding> {
             action: Action::Dismiss,
         },
     ]
-}
-
-fn overlay_style(origin: LogicalPoint) -> crate::paint::style::Style {
-    StyleBuilder::new()
-        .absolute()
-        .left(origin.x)
-        .top(origin.y)
-        .build()
 }
 
 #[derive(Clone)]
@@ -1156,7 +1152,7 @@ impl App {
         scroll::normalize_scroll_offsets(self, window)
     }
 
-    fn clamp_scroll_offsets(&mut self, window: WindowId) -> bool {
+    pub(crate) fn clamp_scroll_offsets(&mut self, window: WindowId) -> bool {
         scroll::clamp_scroll_offsets(self, window)
     }
 
@@ -1226,7 +1222,7 @@ impl App {
         virtual_list::scroll_to_item(self, list, index, align)
     }
 
-    fn rewindow_virtuals(&mut self, window: WindowId) {
+    pub(crate) fn rewindow_virtuals(&mut self, window: WindowId) {
         virtual_list::rewindow_virtuals(self, window)
     }
 
@@ -1234,36 +1230,113 @@ impl App {
         virtual_list::rewindow_virtual(self, window, node)
     }
 
-    pub fn create_overlay(
+    pub fn open_popup(
         &mut self,
         window: WindowId,
-        options: OverlayOptions,
-    ) -> Result<Overlay, EngineError> {
-        overlay::create_overlay(self, window, options)
+        spec: PopupSpec,
+        content: impl FnOnce(&mut App, WindowId, NodeId) -> Result<(), EngineError>,
+        on_dismiss: Option<Box<dyn Fn(&mut App, PopupDismiss) -> DismissOutcome>>,
+    ) -> Result<PopupId, PopupError> {
+        popup::open_popup(self, window, spec, content, on_dismiss)
     }
 
-    pub fn close_overlay(&mut self, overlay: &Overlay) -> bool {
-        overlay::close_overlay(self, overlay)
+    pub fn close_popup(&mut self, id: PopupId) -> Result<(), PopupError> {
+        popup::close_popup(self, id)
     }
 
-    fn resolve_overlay_placements(&mut self, window: WindowId) {
-        overlay::resolve_overlay_placements(self, window)
+    pub fn close_popup_chain(&mut self, id: PopupId) -> Result<(), PopupError> {
+        popup::close_popup_chain(self, id)
     }
 
-    pub fn place_overlay(&mut self, overlay: &Overlay, placement: OverlayPlacement) -> bool {
-        overlay::place_overlay(self, overlay, placement)
+    pub fn begin_close_popup(
+        &mut self,
+        id: PopupId,
+        reason: DismissReason,
+    ) -> Result<bool, PopupError> {
+        popup::begin_close_popup(self, id, reason)
     }
 
-    pub fn bring_overlay_to_front(&mut self, overlay: &Overlay) -> bool {
-        overlay::bring_overlay_to_front(self, overlay)
+    #[must_use]
+    pub fn popup_state(&self, id: PopupId) -> Option<PopupState> {
+        popup::popup_state(self, id)
     }
 
-    pub fn overlays(&self, window: WindowId) -> Vec<(NodeId, OverlayDismiss)> {
-        overlay::overlays(self, window)
+    pub fn set_popup_a11y(&mut self, id: PopupId, a11y: PopupA11y) -> Result<bool, PopupError> {
+        popup::set_popup_a11y(self, id, a11y)
     }
 
-    fn dismiss_overlay(&mut self, window: WindowId) -> bool {
-        overlay::dismiss_overlay(self, window)
+    pub fn set_popup_initial_focus(
+        &mut self,
+        id: PopupId,
+        node: NodeId,
+    ) -> Result<bool, PopupError> {
+        popup::set_popup_initial_focus(self, id, node)
+    }
+
+    pub fn raise_popup(&mut self, id: PopupId) -> Result<(), PopupError> {
+        popup::raise_popup(self, id)
+    }
+
+    pub fn set_popup_anchor(&mut self, id: PopupId, anchor: Anchor) -> Result<(), PopupError> {
+        popup::set_popup_anchor(self, id, anchor)
+    }
+
+    pub fn request_popup_measure(&mut self, id: PopupId) -> Result<(), PopupError> {
+        popup::request_popup_measure(self, id)
+    }
+
+    #[must_use]
+    pub fn popup_rect(&self, id: PopupId) -> Option<PopupRect> {
+        popup::popup_rect(self, id)
+    }
+
+    #[must_use]
+    pub fn popup_anchor_rect(&self, id: PopupId) -> Option<LogicalRect> {
+        popup::popup_anchor_rect(self, id)
+    }
+
+    #[must_use]
+    pub fn popup_anchor_visible(&self, id: PopupId) -> Option<bool> {
+        popup::popup_anchor_visible(self, id)
+    }
+
+    #[must_use]
+    pub fn window_scroll_epoch(&self, window: WindowId) -> Option<u64> {
+        self.window(window).map(Window::scroll_epoch)
+    }
+
+    #[must_use]
+    pub fn popup_stack(&self, window: WindowId) -> Option<PopupStackSnapshot> {
+        popup::popup_stack(self, window)
+    }
+
+    #[must_use]
+    pub fn popup_pointer(&self, window: WindowId) -> Option<LogicalPoint> {
+        popup::popup_pointer(self, window)
+    }
+
+    pub fn dismiss_topmost(&mut self, window: WindowId, reason: DismissReason) -> bool {
+        popup::dismiss_topmost(self, window, reason)
+    }
+
+    #[must_use]
+    pub fn popup_diagnostics(&self, window: WindowId) -> Vec<crate::popup::PopupDiagnostic> {
+        self.window(window)
+            .map_or_else(Vec::new, |target| target.popups().diagnostics().to_vec())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn dispatch_input_tracked_for_test(
+        &mut self,
+        window: WindowId,
+        event: crate::event::InputEvent,
+    ) -> (crate::event::InputOutcome, bool) {
+        input::dispatch_input_tracked(self, window, event)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn window_focus_lost(&mut self, window: WindowId) {
+        self.on_window_focus_lost(window);
     }
 
     pub fn remove_node(

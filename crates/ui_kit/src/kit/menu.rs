@@ -18,6 +18,11 @@ use ui_core::{
         tree::NodeTree,
     },
     paint::{style::StylePatch, style_builder::StyleBuilder},
+    popup::{
+        Alignment, Anchor, DismissPolicy, DismissReason, EscapePolicy, FocusPolicy, HasPopup,
+        OutsidePress, PlacementSpec, PopupA11y, PopupAnimation, PopupError, PopupId, PopupSpec,
+        PopupState, PopupTier, RestoreFocus, Side,
+    },
     resources::ResourceId,
     text::{TextStyle, TextWrap},
     window::WindowId,
@@ -26,11 +31,10 @@ use ui_core::{
 use crate::{
     kit::{
         icon::{ICON_INTRINSIC_SIZE, IconKind, svg},
-        layer::{Band, Layer, LayerSlot},
         list::{List, ListOptions, RowHeight, Selection, SelectionMode},
-        overlay::{
-            Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayError,
-            OverlayOptions, OverlaySurface, Placement,
+        popup_panel::{
+            AnchorChange, AnchorWatch, PanelMeasure as PopupMeasure, PanelWidth as PopupWidth,
+            PopupPanel, PopupPanelOptions, PopupSurface,
         },
         size::UnifiedSize,
     },
@@ -41,7 +45,17 @@ const MENU_PADDING: LogicalPx = LogicalPx::new(4.0);
 const GROUP_HEIGHT_RATIO: f32 = 0.75;
 const SEPARATOR_HEIGHT: LogicalPx = LogicalPx::new(9.0);
 const SUBMENU_GAP: LogicalPx = LogicalPx::ZERO;
-const SUBMENU_DELAY: Duration = Duration::from_millis(150);
+const SUBMENU_DELAY: Duration = Duration::from_millis(200);
+const MENU_ROLES: PanelRoles = PanelRoles {
+    panel: Some(A11yRole::Menu),
+    row: A11yRole::MenuItem,
+};
+const MENU_DISMISS: DismissPolicy = DismissPolicy::Chain {
+    outside: OutsidePress::Replay,
+    escape: EscapePolicy::CloseTopmost,
+    anchor_lost: true,
+    focus_lost: true,
+};
 
 fn build_icon(
     tree: &mut NodeTree,
@@ -105,14 +119,12 @@ pub(crate) struct ItemPanelOptions {
     pub size: UnifiedSize,
     pub max_height: LogicalPx,
     pub row_height: LogicalPx,
-    pub band: Band,
-    pub modal: bool,
-    pub placement: Placement,
-    pub gap: LogicalPx,
+    pub placement: PlacementSpec,
+    pub dismiss: DismissPolicy,
+    pub tier: PopupTier,
     pub roles: PanelRoles,
     pub label: Option<SmolStr>,
     pub width: PanelWidth,
-    pub slot: LayerSlot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +133,14 @@ pub(crate) enum PanelWidth {
     AtLeast,
 }
 
-type PanelResult<T> = Result<T, OverlayError>;
+pub(crate) struct PanelOpen {
+    pub anchor: Anchor,
+    pub opener: Option<NodeId>,
+    pub focus: FocusPolicy,
+    pub parent: Option<PopupId>,
+    pub width: LogicalPx,
+    pub a11y_parent: Option<NodeId>,
+}
 
 struct PanelActions {
     up: Action,
@@ -135,26 +154,19 @@ struct PanelActions {
 struct PanelState {
     window: Option<WindowId>,
     surface: Option<NodeId>,
-    width: LogicalPx,
-    min_width: LogicalPx,
-    content_width: LogicalPx,
-    measured: bool,
-    measure: Option<NodeId>,
     height: LogicalPx,
-    opened: bool,
 }
 
 struct PanelInner {
     key: SmolStr,
     options: ItemPanelOptions,
-    overlay: Overlay,
+    panel: PopupPanel,
     list: List,
     content: Rc<RefCell<Option<PanelContent>>>,
     actions: PanelActions,
     on_activate: RefCell<Option<Rc<dyn Fn(&mut App, usize)>>>,
-    on_close: RefCell<Option<Rc<dyn Fn(&mut App)>>>,
+    on_close: RefCell<Option<Rc<dyn Fn(&mut App, DismissReason)>>>,
     state: RefCell<PanelState>,
-    open: Signal<bool>,
 }
 
 #[derive(Clone)]
@@ -166,8 +178,6 @@ impl ItemPanel {
     pub(crate) fn new(
         app: &mut App,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         key: impl Into<SmolStr>,
         options: ItemPanelOptions,
     ) -> Self {
@@ -230,32 +240,13 @@ impl ItemPanel {
                 },
             )
         };
-        let overlay = Overlay::new(
+        list.set_row_action(row_action.clone());
+        let panel = PopupPanel::new(
             app,
             theme,
-            layer,
-            router,
             key.clone(),
-            OverlayOptions {
-                placement: options.placement,
-                gap: options.gap,
-                margin: px(4.0),
-                flip: true,
-                dismiss: DismissPolicy::OutsideClick,
-                modal: options.modal,
-                restore_focus: true,
-                band: options.band,
-                slot: options.slot,
-                surface: OverlaySurface::menu(),
-                scrim: None,
-                a11y: OverlayA11y {
-                    role: options.roles.panel,
-                    label: options.label.clone(),
-                },
-                fade: true,
-            },
+            PopupPanelOptions::new(PopupSurface::menu(), PopupWidth::Exact(px(1.0))),
         );
-        let open = overlay.open_state();
         let inner = Rc::new(PanelInner {
             actions: PanelActions {
                 up: Action::Custom(format_smolstr!("{key}.up")),
@@ -267,7 +258,7 @@ impl ItemPanel {
             },
             key,
             options,
-            overlay,
+            panel: panel.clone(),
             list,
             content,
             on_activate: RefCell::new(None),
@@ -275,23 +266,40 @@ impl ItemPanel {
             state: RefCell::new(PanelState {
                 window: None,
                 surface: None,
-                width: LogicalPx::ZERO,
-                min_width: LogicalPx::ZERO,
-                content_width: LogicalPx::ZERO,
-                measured: false,
-                measure: None,
                 height: LogicalPx::ZERO,
-                opened: false,
             }),
-            open,
+        });
+        let weak = Rc::downgrade(&inner);
+        panel.on_close(move |app, reason| {
+            if let Some(inner) = weak.upgrade() {
+                let panel = Self { inner };
+                panel.reset_after_close(app);
+                if let Some(callback) = panel.inner.on_close.borrow().clone() {
+                    callback(app, reason);
+                }
+            }
         });
         let panel = Self { inner };
+        panel.inner.list.on_activate({
+            let panel = panel.clone();
+            move |app, index| {
+                let _ = panel.activate(app, index);
+            }
+        });
         panel.register_actions(app);
         panel
     }
 
-    pub(crate) fn overlay(&self) -> &Overlay {
-        &self.inner.overlay
+    pub(crate) fn panel_node(&self) -> Option<NodeId> {
+        self.inner.panel.panel_node()
+    }
+
+    pub(crate) fn popup_node(&self) -> Option<NodeId> {
+        self.inner.panel.popup_node()
+    }
+
+    pub(crate) fn id(&self) -> Option<PopupId> {
+        self.inner.panel.id()
     }
 
     pub(crate) fn list(&self) -> &List {
@@ -299,11 +307,15 @@ impl ItemPanel {
     }
 
     pub(crate) fn open_state(&self) -> Signal<bool> {
-        self.inner.open
+        self.inner.panel.open_state()
     }
 
     pub(crate) fn is_open(&self, app: &App) -> bool {
-        self.inner.overlay.is_open(app)
+        self.inner.panel.is_open(app)
+    }
+
+    pub(crate) fn state(&self, app: &App) -> Option<PopupState> {
+        self.inner.panel.state(app)
     }
 
     pub(crate) fn surface_node(&self) -> Option<NodeId> {
@@ -348,16 +360,24 @@ impl ItemPanel {
             .filter_map(|(index, row)| row.disabled.then_some(index))
             .collect();
         let a11y = content.a11y.clone();
+        let measure = content.measure.clone();
         {
             let mut slot = self.inner.content.borrow_mut();
             *slot = Some(content);
         }
         self.inner.list.set_disabled_rows(disabled);
         self.inner.list.set_row_a11y(move |_cx, index| a11y(index));
-        if self.inner.overlay.is_open(app) {
+        if self.inner.panel.is_open(app) {
             self.inner.list.set_items(app, count)?;
-            self.reset_measure(app)?;
-            self.apply_geometry(app)?;
+            self.inner
+                .panel
+                .set_measure(app, self.popup_measure(measure.as_ref()));
+            let height = self.inner.panel.available_body_height(app).map_or_else(
+                || self.content_height(),
+                |available| self.content_height().min(available),
+            );
+            self.write_height(app, height);
+            self.inner.state.borrow_mut().height = height;
             self.select_first(app);
         }
         Ok(())
@@ -367,234 +387,211 @@ impl ItemPanel {
         &self,
         app: &mut App,
         window: WindowId,
-        anchor: Anchor,
-        width: LogicalPx,
-    ) -> PanelResult<bool> {
+        request: PanelOpen,
+    ) -> Result<bool, PopupError> {
         let content = self.inner.content.borrow().clone();
         let Some(content) = content else {
             return Ok(false);
         };
-        let width = (width.max(px(1.0)) - MENU_PADDING * 2.0).max(px(1.0));
-        let total = content
-            .rows
-            .iter()
-            .fold(LogicalPx::ZERO, |total, row| total + row.height);
-        let height = total
-            .min((self.inner.options.max_height - MENU_PADDING * 2.0).max(px(1.0)))
-            .max(LogicalPx::ZERO);
+        self.set_width(app, request.width);
+        self.inner
+            .panel
+            .set_measure(app, self.popup_measure(content.measure.as_ref()));
+        if self.inner.panel.is_open(app) {
+            if let Some(id) = self.inner.panel.id() {
+                let _ = app.set_popup_anchor(id, request.anchor);
+                let _ = app.raise_popup(id);
+            }
+            return Ok(false);
+        }
+        let height = self.content_height();
         let key = self.inner.key.clone();
         let list = self.inner.list.clone();
         let activate = self.inner.actions.activate.clone();
-        let text_size = self.inner.options.size.text_size();
-        let measure = match self.inner.options.width {
-            PanelWidth::Exact => None,
-            PanelWidth::AtLeast => content.measure.clone(),
-        };
-        let surface_slot = Rc::new(Cell::new(None));
-        let measure_slot = Rc::new(Cell::new(None));
+        let surface_slot: Rc<Cell<Option<NodeId>>> = Rc::new(Cell::new(None));
         let slot = surface_slot.clone();
-        let measure_slot_inner = measure_slot.clone();
+        let mut spec = PopupSpec::new(request.anchor, self.inner.options.placement.clone());
+        spec.parent = request.parent;
+        spec.tier = self.inner.options.tier;
+        spec.dismiss = self.inner.options.dismiss;
+        spec.focus = request.focus;
+        spec.opener = request.opener;
+        spec.animation = PopupAnimation::Fade;
+        spec.a11y = PopupA11y {
+            role: self.inner.options.roles.panel,
+            label: self.inner.options.label.clone(),
+            a11y_parent: request.a11y_parent,
+            ..PopupA11y::default()
+        };
         let opened = self
             .inner
-            .overlay
-            .open(app, window, anchor, move |tree, panel| {
-                let surface = NodeBuilder::boxed()
-                    .id(format_smolstr!("{key}:surface"))
-                    .style(
-                        StyleBuilder::new()
-                            .flex_col()
-                            .width(width)
-                            .height(height)
-                            .min_width_0()
-                            .min_height_0()
-                            .overflow_hidden()
-                            .build(),
-                    )
-                    .tab_stop(true)
-                    .on_click(activate)
-                    .a11y(A11yOverride {
-                        role: Some(A11yRole::GenericContainer),
-                        ..A11yOverride::default()
-                    })
-                    .build(tree, panel)?;
+            .panel
+            .open(app, window, spec, move |app, window, body| {
+                let surface = {
+                    let Some(target) = app.window_mut(window) else {
+                        return Err(EngineError::UnknownWindow { window });
+                    };
+                    NodeBuilder::boxed()
+                        .id(format_smolstr!("{key}:surface"))
+                        .style(
+                            StyleBuilder::new()
+                                .flex_col()
+                                .flex_none()
+                                .width_full()
+                                .height(height)
+                                .min_width_0()
+                                .min_height_0()
+                                .overflow_hidden()
+                                .build(),
+                        )
+                        .tab_stop(true)
+                        .on_click(activate)
+                        .a11y(A11yOverride {
+                            role: Some(A11yRole::GenericContainer),
+                            ..A11yOverride::default()
+                        })
+                        .build(target.tree_mut(), body)?
+                };
                 slot.set(Some(surface));
-                list.build(tree, surface)?;
-                if let Some(measure) = measure.as_ref()
-                    && !measure.labels.is_empty()
                 {
-                    measure_slot_inner
-                        .set(Some(build_measure_node(tree, surface, measure, text_size)?));
+                    let Some(target) = app.window_mut(window) else {
+                        return Err(EngineError::UnknownWindow { window });
+                    };
+                    list.build(target.tree_mut(), surface)?;
                 }
                 Ok(())
             })?;
-        if !opened {
-            self.resize(app, width)?;
-            return Ok(false);
-        }
-        self.inner.list.attach(app, window)?;
+        let Some(surface) = surface_slot.get() else {
+            let _ = self.inner.panel.close_now(app);
+            return Err(PopupError::UnknownPopup { id: opened });
+        };
         {
             let mut state = self.inner.state.borrow_mut();
             state.window = Some(window);
-            state.surface = surface_slot.get();
-            state.min_width = width;
-            state.content_width = LogicalPx::ZERO;
-            state.width = width;
-            state.measure = measure_slot.get();
-            state.measured = state.measure.is_none();
+            state.surface = Some(surface);
             state.height = height;
-            state.opened = true;
         }
-        self.inner.list.set_items(app, content.rows.len())?;
-        self.bind_keys(app, window)?;
+        let _ = app.refresh_text(window);
+        if let Some(target) = app.window_mut(window) {
+            let _ = target.compute_layout();
+        }
+        self.inner
+            .list
+            .attach(app, window)
+            .map_err(|source| PopupError::ContentBuild {
+                node: surface,
+                source,
+            })?;
+        let wired = self
+            .inner
+            .list
+            .set_items(app, content.rows.len())
+            .map_err(|source| PopupError::ContentBuild {
+                node: surface,
+                source,
+            })
+            .and_then(|()| {
+                self.bind_keys(app, window)
+                    .map_err(|source| PopupError::ContentBuild {
+                        node: surface,
+                        source,
+                    })
+            });
+        if let Err(error) = wired {
+            let _ = self.inner.panel.close_now(app);
+            return Err(error);
+        }
         self.select_first(app);
         Ok(true)
     }
 
-    pub(crate) fn resize(&self, app: &mut App, width: LogicalPx) -> Result<(), EngineError> {
-        let min_width = (width.max(px(1.0)) - MENU_PADDING * 2.0).max(px(1.0));
-        {
-            let mut state = self.inner.state.borrow_mut();
-            if state.surface.is_none() || (state.min_width - min_width).abs() < px(0.5) {
-                return Ok(());
-            }
-            state.min_width = min_width;
-        }
-        self.write_surface_width(app)?;
-        Ok(())
+    pub(crate) fn set_width(&self, app: &mut App, width: LogicalPx) -> bool {
+        let width = width.max(px(1.0));
+        let mode = match self.inner.options.width {
+            PanelWidth::Exact => PopupWidth::Exact(width),
+            PanelWidth::AtLeast => PopupWidth::AtLeast { min: width },
+        };
+        self.inner.panel.set_width(app, mode)
     }
 
-    fn write_surface_width(&self, app: &mut App) -> Result<bool, EngineError> {
-        let (window, surface, previous, target) = {
-            let state = self.inner.state.borrow();
-            let target = match self.inner.options.width {
-                PanelWidth::Exact => state.min_width,
-                PanelWidth::AtLeast => state.min_width.max(state.content_width),
-            };
-            (state.window, state.surface, state.width, target)
+    fn content_height(&self) -> LogicalPx {
+        let content = self.inner.content.borrow();
+        let Some(content) = content.as_ref() else {
+            return LogicalPx::ZERO;
         };
-        let (Some(window), Some(surface)) = (window, surface) else {
-            return Ok(false);
-        };
-        if previous > LogicalPx::ZERO && (previous - target).abs() < px(0.5) {
-            return Ok(false);
-        }
-        if let Some(tree) = app.window_mut(window).map(|target| target.tree_mut())
-            && let Ok(node) = tree.get(surface)
-        {
-            let mut style = node.style().clone();
-            style.width_length(target);
-            tree.set_style(surface, style)?;
-        }
-        self.inner.state.borrow_mut().width = target;
-        Ok(true)
+        let total = content
+            .rows
+            .iter()
+            .fold(LogicalPx::ZERO, |total, row| total + row.height);
+        total
+            .min((self.inner.options.max_height - MENU_PADDING * 2.0).max(px(1.0)))
+            .max(LogicalPx::ZERO)
     }
 
-    fn reset_measure(&self, app: &mut App) -> Result<(), EngineError> {
-        if self.inner.options.width != PanelWidth::AtLeast {
-            return Ok(());
+    fn popup_measure(&self, measure: Option<&PanelMeasure>) -> Option<PopupMeasure> {
+        let measure = measure?;
+        if measure.labels.is_empty() {
+            return None;
         }
+        Some(PopupMeasure {
+            labels: measure.labels.clone(),
+            extra: measure.extra + MENU_PADDING * 2.0,
+            text_size: self.inner.options.size.text_size(),
+        })
+    }
+
+    fn write_height(&self, app: &mut App, height: LogicalPx) {
         let (Some(window), Some(surface)) = (
             self.inner.state.borrow().window,
             self.inner.state.borrow().surface,
         ) else {
-            return Ok(());
+            return;
         };
-        let content = self.inner.content.borrow().clone();
-        let text_size = self.inner.options.size.text_size();
-        let mut state = self.inner.state.borrow_mut();
-        state.content_width = LogicalPx::ZERO;
-        state.measured = false;
-        let Some(tree) = app.window_mut(window).map(|target| target.tree_mut()) else {
-            return Ok(());
-        };
-        if let Some(previous) = state.measure.take() {
-            let _ = tree.remove(previous);
-        }
-        let Some(measure) = content.and_then(|content| content.measure) else {
-            state.measured = true;
-            return Ok(());
-        };
-        if measure.labels.is_empty() {
-            state.measured = true;
-            return Ok(());
-        }
-        let node = build_measure_node(tree, surface, &measure, text_size)?;
-        state.measure = Some(node);
-        Ok(())
-    }
-
-    fn measure_content(&self, app: &App) -> Option<LogicalPx> {
-        let (window, node) = {
-            let state = self.inner.state.borrow();
-            (state.window?, state.measure?)
-        };
-        let tree = app.window(window)?.tree();
-        let content = self.inner.content.borrow();
-        let measure = content.as_ref()?.measure.as_ref()?;
-        let mut offset = 0usize;
-        let mut width = LogicalPx::ZERO;
-        for label in &measure.labels {
-            let bytes = label.as_bytes();
-            let mut segment_start = 0usize;
-            for (index, byte) in bytes.iter().enumerate() {
-                if *byte != b'\n' && *byte != b'\r' {
-                    continue;
-                }
-                let start = tree.text_caret_rect(node, offset + segment_start).ok()?;
-                let end = tree.text_caret_rect(node, offset + index).ok()?;
-                width = width.max((end.origin.x - start.origin.x).abs());
-                segment_start = index + 1;
-            }
-            let start = tree.text_caret_rect(node, offset + segment_start).ok()?;
-            let end = tree.text_caret_rect(node, offset + label.len()).ok()?;
-            width = width.max((end.origin.x - start.origin.x).abs());
-            offset += label.len() + 1;
-        }
-        Some(width + measure.extra + MENU_PADDING * 2.0)
-    }
-
-    fn apply_content_width(&self, app: &mut App) -> Result<bool, EngineError> {
-        if self.inner.options.width != PanelWidth::AtLeast {
-            return Ok(false);
-        }
+        if let Some(tree) = app.window_mut(window).map(|target| target.tree_mut())
+            && let Ok(node) = tree.get(surface)
         {
-            let state = self.inner.state.borrow();
-            if state.measured || state.measure.is_none() {
-                return Ok(false);
-            }
+            let mut style = node.style().clone();
+            style.height_length(height);
+            let _ = tree.set_style(surface, style);
         }
-        let Some(content_width) = self.measure_content(app) else {
-            return Ok(false);
+    }
+
+    fn sync_height(&self, app: &mut App) -> bool {
+        let Some(available) = self.inner.panel.available_body_height(app) else {
+            return false;
         };
-        let (window, node) = {
+        let target = self.content_height().min(available);
+        if (target - self.inner.state.borrow().height).value().abs() < 0.01 {
+            return false;
+        }
+        self.write_height(app, target);
+        self.inner.state.borrow_mut().height = target;
+        true
+    }
+
+    fn reset_after_close(&self, app: &mut App) {
+        {
             let mut state = self.inner.state.borrow_mut();
-            state.content_width = content_width;
-            state.measured = true;
-            (state.window, state.measure.take())
-        };
-        if let (Some(window), Some(node)) = (window, node)
-            && let Some(tree) = app.window_mut(window).map(|target| target.tree_mut())
-        {
-            let _ = tree.remove(node);
+            state.window = None;
+            state.surface = None;
+            state.height = LogicalPx::ZERO;
         }
-        self.write_surface_width(app)
+        let _ = self.inner.list.clear_selection(app);
     }
 
     pub(crate) fn close(&self, app: &mut App) -> bool {
-        self.inner.overlay.close(app)
+        self.inner.panel.close(app)
     }
 
     pub(crate) fn close_now(&self, app: &mut App) -> bool {
-        let closed = self.inner.overlay.close_now(app);
-        self.finish_close(app);
-        closed
+        self.inner.panel.close_now(app)
     }
 
     pub(crate) fn on_activate(&self, callback: impl Fn(&mut App, usize) + 'static) {
         *self.inner.on_activate.borrow_mut() = Some(Rc::new(callback));
     }
 
-    pub(crate) fn on_close(&self, callback: impl Fn(&mut App) + 'static) {
+    pub(crate) fn on_close(&self, callback: impl Fn(&mut App, DismissReason) + 'static) {
         *self.inner.on_close.borrow_mut() = Some(Rc::new(callback));
     }
 
@@ -644,49 +641,17 @@ impl ItemPanel {
         app.set_focus(window, Some(surface))
     }
 
-    pub(crate) fn sync(&self, app: &mut App, claim_focus: bool) -> Result<bool, EngineError> {
-        let mut changed = self.inner.overlay.sync(app);
-        if self.inner.state.borrow().opened && !self.inner.overlay.is_open(app) {
-            self.finish_close(app);
-            return Ok(true);
-        }
-        if !self.inner.overlay.is_open(app) {
+    pub(crate) fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
+        let mut changed = self.inner.panel.sync(app);
+        if !self.inner.panel.is_open(app) {
             return Ok(changed);
         }
+        changed |= self.sync_height(app);
         changed |= self.inner.list.sync(app)?;
-        changed |= self.apply_content_width(app)?;
-        if claim_focus {
-            changed |= self.claim_focus(app);
-        }
         Ok(changed)
     }
 
-    fn claim_focus(&self, app: &mut App) -> bool {
-        let (Some(window), Some(surface)) = (
-            self.inner.state.borrow().window,
-            self.inner.state.borrow().surface,
-        ) else {
-            return false;
-        };
-        let Some(root) = self.inner.overlay.overlay_node() else {
-            return false;
-        };
-        if let Some(focused) = app.focused(window)
-            && let Some(tree) = app.window(window).map(|target| target.tree())
-        {
-            let mut cursor = Some(focused);
-            while let Some(node) = cursor {
-                if node == root {
-                    return false;
-                }
-                cursor = tree.get(node).ok().and_then(|target| target.parent());
-            }
-        }
-        app.set_focus(window, Some(surface))
-    }
-
     pub(crate) fn release(&self, app: &mut App) -> usize {
-        self.close_now(app);
         for action in [
             &self.inner.actions.up,
             &self.inner.actions.down,
@@ -697,7 +662,7 @@ impl ItemPanel {
         ] {
             app.off_action(action);
         }
-        self.inner.overlay.release(app);
+        self.inner.panel.release(app);
         self.inner.list.release(app)
     }
 
@@ -742,12 +707,10 @@ impl ItemPanel {
         });
         let this = self.clone();
         app.on_action(self.inner.actions.row.clone(), move |ctx| {
-            let Some(hit) = ctx.hit().map(|hit| hit.node) else {
-                return;
-            };
             let window = ctx.window();
+            let node = ctx.hit().map_or_else(|| ctx.node(), |hit| hit.node);
             let app = ctx.app_mut();
-            let Some(index) = this.row_at_node(app, window, hit) else {
+            let Some(index) = this.row_at_node(app, window, node) else {
                 return;
             };
             this.focus(app);
@@ -755,7 +718,7 @@ impl ItemPanel {
         });
     }
 
-    fn bind_keys(&self, app: &mut App, window: WindowId) -> PanelResult<()> {
+    fn bind_keys(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let Some(surface) = self.inner.state.borrow().surface else {
             return Ok(());
         };
@@ -805,66 +768,6 @@ impl ItemPanel {
         };
         if next.is_some() {
             self.set_highlighted(app, next);
-        }
-    }
-
-    fn apply_geometry(&self, app: &mut App) -> Result<(), EngineError> {
-        let (window, surface, width) = {
-            let state = self.inner.state.borrow();
-            let width = match self.inner.options.width {
-                PanelWidth::Exact => state.min_width,
-                PanelWidth::AtLeast => state.min_width.max(state.content_width),
-            };
-            (state.window, state.surface, width)
-        };
-        let (Some(window), Some(surface)) = (window, surface) else {
-            return Ok(());
-        };
-        let content = self.inner.content.borrow().clone();
-        let Some(content) = content else {
-            return Ok(());
-        };
-        let total = content
-            .rows
-            .iter()
-            .fold(LogicalPx::ZERO, |total, row| total + row.height);
-        let height = total
-            .min((self.inner.options.max_height - MENU_PADDING * 2.0).max(px(1.0)))
-            .max(LogicalPx::ZERO);
-        {
-            let mut state = self.inner.state.borrow_mut();
-            state.height = height;
-            state.width = width;
-        }
-        if let Some(tree) = app.window_mut(window).map(|target| target.tree_mut())
-            && let Ok(node) = tree.get(surface)
-        {
-            let mut style = node.style().clone();
-            style.size_length(width, height);
-            tree.set_style(surface, style)?;
-        }
-        Ok(())
-    }
-
-    fn finish_close(&self, app: &mut App) {
-        let was_opened = {
-            let mut state = self.inner.state.borrow_mut();
-            let opened = state.opened;
-            state.opened = false;
-            state.surface = None;
-            state.window = None;
-            state.measure = None;
-            state.measured = false;
-            state.content_width = LogicalPx::ZERO;
-            state.width = LogicalPx::ZERO;
-            state.min_width = LogicalPx::ZERO;
-            state.height = LogicalPx::ZERO;
-            opened
-        };
-        let _ = app.write(&self.inner.open, false);
-        let _ = self.inner.list.clear_selection(app);
-        if was_opened && let Some(callback) = self.inner.on_close.borrow().clone() {
-            callback(app);
         }
     }
 }
@@ -975,50 +878,14 @@ pub enum MenuEntry {
     Submenu(MenuSubmenu),
 }
 
-impl MenuEntry {
-    #[must_use]
-    pub fn is_actionable(&self) -> bool {
-        match self {
-            Self::Action(action) => !action.disabled,
-            Self::Submenu(submenu) => !submenu.disabled,
-            Self::Group(_) | Self::Separator => false,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum MenuMode {
-    #[default]
-    Menu,
-    ListBox,
-}
-
-impl MenuMode {
-    fn roles(self) -> PanelRoles {
-        match self {
-            Self::Menu => PanelRoles {
-                panel: Some(A11yRole::Menu),
-                row: A11yRole::MenuItem,
-            },
-            Self::ListBox => PanelRoles {
-                panel: None,
-                row: A11yRole::ListBoxOption,
-            },
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct MenuOptions {
     pub size: UnifiedSize,
     pub width: LogicalPx,
     pub max_height: LogicalPx,
-    pub mode: MenuMode,
-    pub placement: Placement,
-    pub gap: LogicalPx,
-    pub band: Band,
+    pub placement: PlacementSpec,
     pub label: Option<SmolStr>,
-    pub submenu_delay: Duration,
+    pub submenu_open_delay: Duration,
 }
 
 impl Default for MenuOptions {
@@ -1027,12 +894,14 @@ impl Default for MenuOptions {
             size: UnifiedSize::Medium,
             width: px(200.0),
             max_height: px(320.0),
-            mode: MenuMode::Menu,
-            placement: Placement::BOTTOM_START,
-            gap: px(4.0),
-            band: Band::Popup,
+            placement: PlacementSpec {
+                side: Side::Bottom,
+                align: Alignment::Start,
+                gap: px(4.0),
+                ..PlacementSpec::default()
+            },
             label: None,
-            submenu_delay: SUBMENU_DELAY,
+            submenu_open_delay: SUBMENU_DELAY,
         }
     }
 }
@@ -1051,26 +920,14 @@ impl MenuOptions {
     }
 
     #[must_use]
-    pub fn mode(mut self, mode: MenuMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    #[must_use]
     pub fn label(mut self, label: impl Into<SmolStr>) -> Self {
         self.label = Some(label.into());
         self
     }
 
     #[must_use]
-    pub fn band(mut self, band: Band) -> Self {
-        self.band = band;
-        self
-    }
-
-    #[must_use]
-    pub fn submenu_delay(mut self, delay: Duration) -> Self {
-        self.submenu_delay = delay;
+    pub fn submenu_open_delay(mut self, delay: Duration) -> Self {
+        self.submenu_open_delay = delay;
         self
     }
 }
@@ -1091,7 +948,7 @@ enum RowKind {
 #[derive(Default)]
 struct MenuSink {
     on_activate: RefCell<Option<Rc<dyn Fn(&mut App, MenuActivation)>>>,
-    on_close: RefCell<Option<Rc<dyn Fn(&mut App)>>>,
+    on_close: RefCell<Option<Rc<dyn Fn(&mut App, DismissReason)>>>,
 }
 
 struct OpenSubmenu {
@@ -1106,11 +963,10 @@ pub struct Menu {
 
 struct MenuSeed {
     theme: ThemeHandle,
-    layer: Layer,
-    router: AnimationRouter,
     options: MenuOptions,
     kind: MenuKind,
     parent: Option<(Weak<MenuInner>, usize)>,
+    a11y_parent: Option<NodeId>,
     sink: Rc<MenuSink>,
 }
 
@@ -1124,30 +980,29 @@ struct MenuInner {
     key: SmolStr,
     theme: ThemeHandle,
     options: MenuOptions,
-    layer: Layer,
-    router: AnimationRouter,
     panel: ItemPanel,
     icons: RefCell<IconSnapshot>,
     rows: RefCell<Vec<RowKind>>,
     entries: RefCell<Rc<Vec<MenuEntry>>>,
     kind: MenuKind,
     parent: Option<(Weak<MenuInner>, usize)>,
+    a11y_parent: Option<NodeId>,
     sink: Rc<MenuSink>,
     submenus: RefCell<Vec<OpenSubmenu>>,
     submenu_timer: Cell<Option<TimerId>>,
     last_hovered: Cell<Option<usize>>,
     window: Cell<Option<WindowId>>,
+    watch: RefCell<AnchorWatch>,
+    scroll_closes: Cell<bool>,
+    internal_scroll: Cell<Option<LogicalPx>>,
     right_action: Action,
     left_action: Action,
-    claim_focus: Cell<bool>,
 }
 
 impl Menu {
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         key: impl Into<SmolStr>,
         entries: impl IntoIterator<Item = MenuEntry>,
         options: MenuOptions,
@@ -1158,11 +1013,10 @@ impl Menu {
             entries,
             MenuSeed {
                 theme,
-                layer,
-                router,
                 options,
                 kind: MenuKind::Root,
                 parent: None,
+                a11y_parent: None,
                 sink: Rc::new(MenuSink::default()),
             },
         )
@@ -1176,69 +1030,55 @@ impl Menu {
     ) -> Self {
         let MenuSeed {
             theme,
-            layer,
-            router,
             options,
             kind,
             parent,
+            a11y_parent,
             sink,
         } = seed;
         let key = key.into();
-        let root = kind == MenuKind::Root;
         let panel = ItemPanel::new(
             app,
             theme.clone(),
-            layer.clone(),
-            router.clone(),
             format_smolstr!("{key}:panel"),
             ItemPanelOptions {
                 size: options.size,
                 max_height: options.max_height,
                 row_height: options.size.h(),
-                band: options.band,
-                modal: root,
-                placement: options.placement,
-                gap: options.gap,
-                roles: options.mode.roles(),
+                placement: options.placement.clone(),
+                dismiss: MENU_DISMISS,
+                tier: PopupTier::Auto,
+                roles: MENU_ROLES,
                 label: options.label.clone(),
                 width: PanelWidth::Exact,
-                slot: if root {
-                    LayerSlot::Exclusive
-                } else {
-                    LayerSlot::Nested
-                },
             },
         );
         let inner = Rc::new(MenuInner {
             key: key.clone(),
             theme,
             options,
-            layer,
-            router,
             panel,
             icons: RefCell::new(IconSnapshot::default()),
             rows: RefCell::new(Vec::new()),
             entries: RefCell::new(Rc::new(entries.into_iter().collect())),
             kind,
             parent,
+            a11y_parent,
             sink,
             submenus: RefCell::new(Vec::new()),
             submenu_timer: Cell::new(None),
             last_hovered: Cell::new(None),
             window: Cell::new(None),
+            watch: RefCell::new(AnchorWatch::default()),
+            scroll_closes: Cell::new(false),
+            internal_scroll: Cell::new(None),
             right_action: Action::Custom(format_smolstr!("{key}.right")),
             left_action: Action::Custom(format_smolstr!("{key}.left")),
-            claim_focus: Cell::new(false),
         });
         let menu = Self { inner };
         menu.install_content(app);
         menu.install_handlers();
         menu
-    }
-
-    #[must_use]
-    pub fn key(&self) -> &str {
-        &self.inner.key
     }
 
     pub fn set_entries(
@@ -1269,16 +1109,12 @@ impl Menu {
 
     #[must_use]
     pub fn panel_node(&self) -> Option<NodeId> {
-        self.inner.panel.overlay().panel_node()
+        self.inner.panel.panel_node()
     }
 
     #[must_use]
-    pub fn surface_node(&self) -> Option<NodeId> {
-        self.inner.panel.surface_node()
-    }
-
-    pub(crate) fn overlay_node(&self) -> Option<NodeId> {
-        self.inner.panel.overlay().overlay_node()
+    pub fn popup_node(&self) -> Option<NodeId> {
+        self.inner.panel.popup_node()
     }
 
     #[must_use]
@@ -1296,16 +1132,55 @@ impl Menu {
         app: &mut App,
         window: WindowId,
         anchor: Anchor,
-    ) -> Result<bool, OverlayError> {
+    ) -> Result<bool, PopupError> {
+        self.open_focused(app, window, anchor, true)
+    }
+
+    fn open_focused(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        anchor: Anchor,
+        take_focus: bool,
+    ) -> Result<bool, PopupError> {
         self.inner.window.set(Some(window));
-        self.resolve_icons(app, window)?;
+        self.close_submenus(app);
+        self.resolve_icons(app, window)
+            .map_err(|source| popup_error(app, window, source))?;
         self.install_content(app);
-        let width = self.inner.options.width;
-        let opened = self.inner.panel.open(app, window, anchor, width)?;
-        if opened {
-            self.inner.claim_focus.set(true);
-            self.inner.panel.focus(app);
-            self.bind_extra_keys(app, window)?;
+        let parent = match self.inner.kind {
+            MenuKind::Root => None,
+            MenuKind::Submenu => self.parent_popup_id(),
+        };
+        let focus = if self.inner.kind == MenuKind::Root || take_focus {
+            FocusPolicy::Take {
+                restore: RestoreFocus::Previous,
+            }
+        } else {
+            FocusPolicy::None
+        };
+        let opener = match anchor {
+            Anchor::Node { node } => Some(node),
+            Anchor::WindowRect(_) | Anchor::NodeRect { .. } => None,
+        };
+        self.inner.watch.borrow_mut().reset();
+        self.inner.internal_scroll.set(None);
+        let opened = self.inner.panel.open(
+            app,
+            window,
+            PanelOpen {
+                anchor,
+                opener,
+                focus,
+                parent,
+                width: self.inner.options.width,
+                a11y_parent: self.inner.a11y_parent,
+            },
+        )?;
+        if opened && let Err(source) = self.bind_extra_keys(app, window) {
+            let error = popup_error(app, window, source);
+            self.close_now(app);
+            return Err(error);
         }
         Ok(opened)
     }
@@ -1316,7 +1191,7 @@ impl Menu {
         window: WindowId,
         anchor: Anchor,
         highlighted: Option<&str>,
-    ) -> Result<bool, OverlayError> {
+    ) -> Result<bool, PopupError> {
         let opened = self.open(app, window, anchor)?;
         if let Some(id) = highlighted
             && let Some(row) = self.row_of(id)
@@ -1341,18 +1216,25 @@ impl Menu {
         self
     }
 
-    pub fn on_close(self, callback: impl Fn(&mut App) + 'static) -> Self {
+    pub fn on_close(self, callback: impl Fn(&mut App, DismissReason) + 'static) -> Self {
         *self.inner.sink.on_close.borrow_mut() = Some(Rc::new(callback));
         self
     }
 
+    pub(crate) fn closing_on_scroll(self) -> Self {
+        self.inner.scroll_closes.set(true);
+        self
+    }
+
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
-        let has_submenu = !self.inner.submenus.borrow().is_empty();
-        let claim = self.inner.claim_focus.get() && !has_submenu;
-        let mut changed = self.inner.panel.sync(app, claim)?;
+        let mut changed = self.inner.panel.sync(app)?;
         if !self.inner.panel.is_open(app) {
             self.close_submenus(app);
             return Ok(changed);
+        }
+        if self.sync_anchor(app) {
+            self.close_submenus(app);
+            return Ok(true);
         }
         changed |= self.sync_hover(app)?;
         let submenus: Vec<Menu> = self
@@ -1370,7 +1252,7 @@ impl Menu {
     }
 
     pub fn release(&self, app: &mut App) -> usize {
-        self.close_now(app);
+        self.close_submenus(app);
         if let Some(timer) = self.inner.submenu_timer.take() {
             app.cancel_timer(&timer);
         }
@@ -1388,6 +1270,14 @@ impl Menu {
             released += submenu.release(app);
         }
         released
+    }
+
+    fn parent_popup_id(&self) -> Option<PopupId> {
+        let (parent, _) = self.inner.parent.as_ref()?;
+        let parent = Menu {
+            inner: parent.upgrade()?,
+        };
+        parent.inner.panel.id()
     }
 
     fn install_content(&self, app: &mut App) {
@@ -1506,7 +1396,6 @@ impl Menu {
                     }
                 }
             });
-        let roles = self.inner.options.mode.roles();
         let entries_a11y = entries;
         let a11y: Rc<dyn Fn(usize) -> A11yPatch> = Rc::new(move |index| {
             let Some(entry) = entries_a11y.get(index) else {
@@ -1517,20 +1406,18 @@ impl Menu {
             };
             match entry {
                 MenuEntry::Action(action) => A11yPatch {
-                    role: Some(roles.row),
+                    role: Some(MENU_ROLES.row),
                     label: Some(action.label.clone()),
                     disabled: Some(action.disabled),
                     checked: action.checked,
-                    selected: match (roles.row, action.checked) {
-                        (A11yRole::ListBoxOption, Some(checked)) => Some(checked),
-                        _ => None,
-                    },
                     ..A11yPatch::default()
                 },
                 MenuEntry::Submenu(submenu) => A11yPatch {
-                    role: Some(roles.row),
+                    role: Some(MENU_ROLES.row),
                     label: Some(submenu.label.clone()),
                     disabled: Some(submenu.disabled),
+                    has_popup: Some(HasPopup::Menu),
+                    expanded: Some(false),
                     ..A11yPatch::default()
                 },
                 MenuEntry::Group(label) => A11yPatch {
@@ -1562,9 +1449,9 @@ impl Menu {
             this.handle_row(app, row);
         });
         let this = self.clone();
-        self.inner.panel.on_close(move |app| {
+        self.inner.panel.on_close(move |app, reason| {
             this.close_submenus(app);
-            this.fire_close(app);
+            this.fire_close(app, reason);
         });
     }
 
@@ -1594,25 +1481,28 @@ impl Menu {
         }
     }
 
-    fn fire_close(&self, app: &mut App) {
+    fn fire_close(&self, app: &mut App, reason: DismissReason) {
         if self.inner.kind != MenuKind::Root {
             return;
         }
         if let Some(callback) = self.inner.sink.on_close.borrow().clone() {
-            callback(app);
+            callback(app, reason);
+        }
+    }
+
+    fn root(&self) -> Menu {
+        let Some((parent, _)) = self.inner.parent.as_ref() else {
+            return self.clone();
+        };
+        match parent.upgrade() {
+            Some(parent) => Menu { inner: parent }.root(),
+            None => self.clone(),
         }
     }
 
     fn close_chain(&self, app: &mut App) {
-        self.inner.panel.close_now(app);
-        let parent = self
-            .inner
-            .parent
-            .as_ref()
-            .and_then(|(parent, _)| parent.upgrade());
-        if let Some(parent) = parent {
-            Menu { inner: parent }.close_chain(app);
-        }
+        let root = self.root();
+        let _ = root.inner.panel.close(app);
     }
 
     fn open_submenu(&self, app: &mut App, row: usize, index: usize, focus: bool) {
@@ -1640,29 +1530,25 @@ impl Menu {
         };
         self.close_submenus(app);
         let mut options = self.inner.options.clone();
-        options.placement = Placement::RIGHT_START;
-        options.gap = SUBMENU_GAP;
+        let mut placement = PlacementSpec::submenu();
+        placement.gap = SUBMENU_GAP;
+        options.placement = placement;
         let child = Menu::build(
             app,
             format_smolstr!("{}:sub:{row}", self.inner.key),
             submenu.entries.clone(),
             MenuSeed {
                 theme: self.inner.theme.clone(),
-                layer: self.inner.layer.clone(),
-                router: self.inner.router.clone(),
                 options,
                 kind: MenuKind::Submenu,
                 parent: Some((Rc::downgrade(&self.inner), row)),
+                a11y_parent: Some(row_node),
                 sink: self.inner.sink.clone(),
             },
         );
-        child.inner.claim_focus.set(focus);
-        let anchor = Anchor::node(row_node);
-        match child.open(app, window, anchor) {
+        let anchor = Anchor::Node { node: row_node };
+        match child.open_focused(app, window, anchor, focus) {
             Ok(true) => {
-                if focus {
-                    let _ = child.inner.panel.focus(app);
-                }
                 self.inner
                     .submenus
                     .borrow_mut()
@@ -1695,7 +1581,7 @@ impl Menu {
             let mut submenus = self.inner.submenus.borrow_mut();
             let mut index = 0;
             while index < submenus.len() {
-                if submenus[index].menu.is_open(app) {
+                if submenus[index].menu.inner.panel.state(app).is_some() {
                     index += 1;
                 } else {
                     stale.push(submenus.remove(index));
@@ -1705,6 +1591,32 @@ impl Menu {
         for open in stale {
             let _ = open.menu.release(app);
         }
+    }
+
+    fn sync_anchor(&self, app: &mut App) -> bool {
+        let (Some(id), Some(window)) = (self.inner.panel.id(), self.inner.window.get()) else {
+            return false;
+        };
+        let change = self.inner.watch.borrow_mut().observe(app, id, window);
+        let internal_scroll = self.sync_internal_scroll(app);
+        match change {
+            AnchorChange::Lost | AnchorChange::Resized | AnchorChange::Moved => {
+                self.close_chain(app);
+                true
+            }
+            AnchorChange::Scrolled if self.inner.scroll_closes.get() && !internal_scroll => {
+                self.close_chain(app);
+                true
+            }
+            AnchorChange::None | AnchorChange::Scrolled => false,
+        }
+    }
+
+    fn sync_internal_scroll(&self, app: &App) -> bool {
+        let offset = self.inner.panel.list().offset(app);
+        let changed = offset.is_some() && offset != self.inner.internal_scroll.get();
+        self.inner.internal_scroll.set(offset);
+        changed
     }
 
     fn sync_hover(&self, app: &mut App) -> Result<bool, EngineError> {
@@ -1729,7 +1641,7 @@ impl Menu {
         });
         match kind {
             Some((row, RowKind::Submenu(index))) => {
-                let delay = self.inner.options.submenu_delay;
+                let delay = self.inner.options.submenu_open_delay;
                 if delay.is_zero() {
                     self.open_submenu(app, row, index, false);
                 } else {
@@ -1792,7 +1704,6 @@ impl Menu {
             if let Some((parent, row)) = parent {
                 let parent = Menu { inner: parent };
                 parent.inner.panel.set_highlighted(app, Some(row));
-                let _ = parent.inner.panel.focus(app);
             }
         });
         Ok(())
@@ -1815,10 +1726,9 @@ impl Menu {
                 icons.resolve(app, window, kind)?;
             }
         }
-        if self.inner.options.mode == MenuMode::Menu
-            && entries
-                .iter()
-                .any(|entry| matches!(entry, MenuEntry::Submenu(_)))
+        if entries
+            .iter()
+            .any(|entry| matches!(entry, MenuEntry::Submenu(_)))
         {
             icons.resolve(app, window, IconKind::CaretRight)?;
         }
@@ -1874,39 +1784,17 @@ impl IconSnapshot {
     }
 }
 
-const MEASURE_WIDTH: LogicalPx = LogicalPx::new(4096.0);
-
-fn build_measure_node(
-    tree: &mut NodeTree,
-    surface: NodeId,
-    measure: &PanelMeasure,
-    text_size: LogicalPx,
-) -> Result<NodeId, EngineError> {
-    let mut text = String::with_capacity(measure.labels.iter().map(|label| label.len() + 1).sum());
-    for (index, label) in measure.labels.iter().enumerate() {
-        if index > 0 {
-            text.push('\n');
-        }
-        text.push_str(label);
+pub(crate) fn popup_error(app: &App, window: WindowId, source: EngineError) -> PopupError {
+    if let EngineError::UnknownWindow { window } = source {
+        return PopupError::UnknownWindow { window };
     }
-    NodeBuilder::text(
-        SmolStr::new(text),
-        TextStyle::new(text_size).with_wrap(TextWrap::NoWrap),
-    )
-    .style(
-        StyleBuilder::new()
-            .absolute()
-            .left(-MEASURE_WIDTH)
-            .top(px(0.0))
-            .width(MEASURE_WIDTH)
-            .height(px(1.0))
-            .build(),
-    )
-    .a11y(A11yOverride {
-        hidden: true,
-        ..A11yOverride::default()
-    })
-    .build(tree, surface)
+    match app.window(window) {
+        Some(target) => PopupError::ContentBuild {
+            node: target.tree().root(),
+            source,
+        },
+        None => PopupError::StackSync { source },
+    }
 }
 
 pub(crate) fn build_icon_slot(
@@ -2012,7 +1900,6 @@ fn action_foreground(action: &MenuAction) -> Role {
 
 #[cfg(test)]
 mod tests {
-
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -2021,21 +1908,20 @@ mod tests {
 
     use smol_str::SmolStr;
     use ui_core::{
-        a11y::A11yRole,
-        event::{InputEvent, KeyCode, Modifiers, PointerButton},
+        a11y::{A11yAction, A11yRole},
+        event::{Action, ActionSource, InputEvent, KeyCode, Modifiers, PointerButton},
+        interaction::ScrollConfig,
         math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
-        test_support::app::TestApp,
-        window::WindowId,
+        paint::style_builder::StyleBuilder,
+        popup::{Anchor, HasPopup, PopupId, PopupSnapshotEntry, PopupState},
+        test_support::{app::TestApp, record::FrameRecord},
+        window::{WindowId, WindowOptions},
     };
 
-    use super::{Menu, MenuAction, MenuEntry, MenuMode, MenuOptions, MenuSubmenu};
+    use super::{Menu, MenuAction, MenuEntry, MenuOptions, MenuSubmenu};
     use crate::{
-        kit::{
-            layer::Layer,
-            overlay::{Anchor, AnimationRouter},
-            test_support::{full_a11y, overlay_wrapper},
-        },
+        kit::test_support::full_a11y,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
@@ -2048,16 +1934,23 @@ mod tests {
         app: TestApp,
         window: WindowId,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         anchor: NodeId,
+        background: NodeId,
         activated: Rc<RefCell<Vec<SmolStr>>>,
         closes: Rc<Cell<usize>>,
+        background_clicks: Rc<Cell<usize>>,
     }
 
     impl Harness {
         fn new() -> Self {
-            let mut app = TestApp::new();
+            Self::sized(LogicalSize::new(px(800.0), px(600.0)))
+        }
+
+        fn sized(size: LogicalSize) -> Self {
+            let mut app = TestApp::with_options(WindowOptions {
+                size,
+                ..WindowOptions::default()
+            });
             let window = app.window_id();
             let root = app.app().window(window).expect("窗口").tree().root();
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
@@ -2069,15 +1962,30 @@ mod tests {
                     root,
                 )
                 .expect("锚点");
+            let clicks = Rc::new(Cell::new(0));
+            let sink = clicks.clone();
+            app.app_mut().on_action(
+                Action::Custom(SmolStr::new_static("background.click")),
+                move |_| sink.set(sink.get() + 1),
+            );
+            let background = NodeBuilder::boxed()
+                .id("background")
+                .layout_override(LogicalRect::new(px(600.0), px(500.0), px(80.0), px(40.0)))
+                .on_click(Action::Custom(SmolStr::new_static("background.click")))
+                .build(
+                    app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                    root,
+                )
+                .expect("背景节点");
             Self {
                 app,
                 window,
                 theme,
-                layer: Layer::new(),
-                router: AnimationRouter::new(),
                 anchor,
+                background,
                 activated: Rc::new(RefCell::new(Vec::new())),
                 closes: Rc::new(Cell::new(0)),
+                background_clicks: clicks,
             }
         }
 
@@ -2087,34 +1995,41 @@ mod tests {
             Menu::new(
                 self.app.app_mut(),
                 self.theme.clone(),
-                self.layer.clone(),
-                self.router.clone(),
                 "menu",
                 entries,
                 options,
             )
             .on_activate(move |_, activation| activated.borrow_mut().push(activation.id))
-            .on_close(move |_| closes.set(closes.get() + 1))
+            .on_close(move |_, _| closes.set(closes.get() + 1))
+        }
+
+        fn anchor(&self) -> Anchor {
+            Anchor::Node { node: self.anchor }
         }
 
         fn open(&mut self, menu: &Menu) -> bool {
+            let anchor = self.anchor();
             let opened = menu
-                .open(self.app.app_mut(), self.window, Anchor::node(self.anchor))
+                .open(self.app.app_mut(), self.window, anchor)
                 .expect("打开菜单");
-            self.settle(menu);
+            let _ = menu.sync(self.app.app_mut());
+            self.drain(menu);
             opened
+        }
+
+        fn drain(&mut self, menu: &Menu) -> FrameRecord {
+            let record = self.app.drain().expect("帧").clone();
+            let _ = menu.sync(self.app.app_mut());
+            record
         }
 
         fn settle(&mut self, menu: &Menu) {
             for _ in 0..6 {
                 self.app.advance(Duration::from_millis(40));
-                let _ = self.app.drain().expect("帧");
-                let _ = menu.sync(self.app.app_mut());
+                self.drain(menu);
             }
             self.app.advance(Duration::from_millis(200));
-            let _ = self.app.drain().expect("帧");
-            let _ = menu.sync(self.app.app_mut());
-            let _ = self.app.drain().expect("帧");
+            self.drain(menu);
         }
 
         fn key(&mut self, menu: &Menu, code: KeyCode) {
@@ -2124,8 +2039,7 @@ mod tests {
             let _ = self
                 .app
                 .inject(InputEvent::key_up(code, Modifiers::empty()));
-            let _ = self.app.drain().expect("帧");
-            let _ = menu.sync(self.app.app_mut());
+            self.drain(menu);
         }
 
         fn click(&mut self, menu: &Menu, at: LogicalPoint) {
@@ -2139,26 +2053,31 @@ mod tests {
                 PointerButton::Primary,
                 Modifiers::empty(),
             ));
-            let _ = self.app.drain().expect("帧");
-            let _ = menu.sync(self.app.app_mut());
+            self.drain(menu);
         }
 
         fn hover(&mut self, menu: &Menu, at: LogicalPoint) {
             let _ = self
                 .app
                 .inject(InputEvent::pointer_move(at, Modifiers::empty()));
-            let _ = self.app.drain().expect("帧");
-            let _ = menu.sync(self.app.app_mut());
+            self.drain(menu);
         }
 
         fn advance(&mut self, menu: &Menu, duration: Duration) {
             self.app.advance(duration);
-            let _ = self.app.drain().expect("帧");
-            let _ = menu.sync(self.app.app_mut());
+            self.drain(menu);
         }
 
         fn bounds(&self, node: NodeId) -> LogicalRect {
             self.app.probe().bounds(node).expect("布局盒")
+        }
+
+        fn screen_bounds(&self, node: NodeId) -> LogicalRect {
+            self.app
+                .app()
+                .window(self.window)
+                .and_then(|target| target.node_screen_rect(node))
+                .expect("屏幕盒")
         }
 
         fn find(&self, debug_id: &str) -> Option<NodeId> {
@@ -2188,28 +2107,53 @@ mod tests {
             )
         }
 
-        fn root_children(&self) -> Vec<NodeId> {
+        fn stack(&self) -> Vec<PopupSnapshotEntry> {
             self.app
                 .app()
-                .window(self.window)
-                .expect("窗口")
-                .tree()
-                .get(
-                    self.app
-                        .app()
-                        .window(self.window)
-                        .expect("窗口")
-                        .tree()
-                        .root(),
-                )
-                .expect("根")
-                .children()
-                .to_vec()
+                .popup_stack(self.window)
+                .expect("浮层栈")
+                .entries
         }
 
-        fn idles(&mut self) -> bool {
-            let record = self.app.drain().expect("帧");
-            !record.rendered
+        fn root_entry(&self, menu: &Menu) -> PopupSnapshotEntry {
+            let node = menu.popup_node().expect("浮层内容节点");
+            self.stack()
+                .into_iter()
+                .find(|entry| entry.node == node)
+                .expect("根菜单在栈里")
+        }
+
+        fn submenu_entry(&self, root: PopupId) -> PopupSnapshotEntry {
+            self.stack()
+                .into_iter()
+                .find(|entry| entry.parent == Some(root))
+                .expect("子菜单在栈里")
+        }
+
+        fn text_exists(&self, text: &str) -> bool {
+            let tree = self.app.app().window(self.window).expect("窗口").tree();
+            let mut stack = vec![tree.root()];
+            while let Some(node) = stack.pop() {
+                if let Ok(target) = tree.get(node) {
+                    if matches!(target.kind(), ui_core::node::tree::NodeKind::Text(content) if content.text == text)
+                    {
+                        return true;
+                    }
+                    stack.extend(target.children().iter().rev().copied());
+                }
+            }
+            false
+        }
+
+        fn focused_debug_id(&self) -> Option<String> {
+            let focused = self.app.app().focused(self.window)?;
+            let tree = self.app.app().window(self.window).expect("窗口").tree();
+            tree.debug_id(focused).map(str::to_owned)
+        }
+
+        fn idles(&mut self, menu: &Menu) -> bool {
+            let rendered = self.app.drain().expect("帧").rendered;
+            !rendered && !menu.sync(self.app.app_mut()).expect("同步")
         }
     }
 
@@ -2224,6 +2168,32 @@ mod tests {
                     .danger(true)
                     .shortcut("Del"),
             ),
+        ]
+    }
+
+    fn submenu_entries() -> Vec<MenuEntry> {
+        vec![
+            MenuEntry::Action(MenuAction::new("a", "A")),
+            MenuEntry::Submenu(MenuSubmenu::new(
+                "更多",
+                [MenuEntry::Action(MenuAction::new("inner", "内部"))],
+            )),
+        ]
+    }
+
+    fn nested_submenu_entries() -> Vec<MenuEntry> {
+        vec![
+            MenuEntry::Action(MenuAction::new("a", "A")),
+            MenuEntry::Submenu(MenuSubmenu::new(
+                "更多",
+                [
+                    MenuEntry::Action(MenuAction::new("inner", "内部")),
+                    MenuEntry::Submenu(MenuSubmenu::new(
+                        "更深",
+                        [MenuEntry::Action(MenuAction::new("deep", "深处"))],
+                    )),
+                ],
+            )),
         ]
     }
 
@@ -2252,6 +2222,39 @@ mod tests {
     }
 
     #[test]
+    fn the_first_visible_frame_already_has_the_settled_rect() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        assert!(harness.open(&menu));
+        let root = harness.root_entry(&menu);
+        let first = root.hit_rect;
+        assert_eq!(root.state, PopupState::Open, "首帧即 Open，无需等 reveal");
+        harness.settle(&menu);
+        let stable = harness.root_entry(&menu).hit_rect;
+        assert_eq!(first, stable, "首可见帧 rect 必须等于稳定帧");
+    }
+
+    #[test]
+    fn the_first_visible_frame_already_has_the_row_contents() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        assert!(harness.open(&menu));
+        assert_eq!(menu.row_count(), 5, "行模型在打开时就绪（含分组 / 分隔线）");
+        assert!(
+            harness.find("menu:panel:list:row:1").is_some(),
+            "首帧行节点已挂载"
+        );
+        assert!(
+            harness.text_exists("资料"),
+            "首帧行文本已经排版进树（C2：内容尺寸不晚于首帧）"
+        );
+        assert!(
+            harness.find("menu:panel:list:row:1:content").is_some(),
+            "行内容已填充"
+        );
+    }
+
+    #[test]
     fn a_menu_near_the_bottom_flips_above_its_anchor() {
         let mut harness = Harness::new();
         let root = harness
@@ -2275,15 +2278,16 @@ mod tests {
             )
             .expect("锚点");
         let menu = harness.menu(entries(), options());
+        let anchor = Anchor::Node { node: bottom };
         let opened = menu
-            .open(harness.app.app_mut(), harness.window, Anchor::node(bottom))
+            .open(harness.app.app_mut(), harness.window, anchor)
             .expect("打开");
         assert!(opened);
         harness.settle(&menu);
         let panel = harness.bounds(menu.panel_node().expect("面板"));
         assert!(
-            panel.max().y.value() <= 560.0 + 0.5,
-            "放不下时翻到锚点上方：{panel:?}"
+            panel.origin.y.value() < 560.0 && panel.max().y.value() <= 592.0 + 0.5,
+            "放不下时翻到锚点边沿上方（引擎 edge 锚点语义，不再按节点外框）：{panel:?}"
         );
     }
 
@@ -2331,7 +2335,97 @@ mod tests {
             "回车激活高亮条目"
         );
         assert!(!menu.is_open(harness.app.app()), "选中后关闭菜单");
+        harness.settle(&menu);
         assert_eq!(harness.closes.get(), 1, "关闭回调一次");
+    }
+
+    #[test]
+    fn a_space_press_activates_the_highlighted_entry_like_enter() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        harness.open(&menu);
+        harness.key(&menu, KeyCode::End);
+        harness.key(&menu, KeyCode::Space);
+
+        assert_eq!(
+            harness.activated.borrow().as_slice(),
+            &[SmolStr::new_static("delete")],
+            "Space 与 Enter 走同一条激活路径"
+        );
+        harness.settle(&menu);
+        assert_eq!(harness.closes.get(), 1, "激活后关闭一次");
+        assert!(!menu.is_open(harness.app.app()));
+    }
+
+    #[test]
+    fn an_a11y_click_activates_the_menu_entry_it_targets() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let menu = harness.menu(entries(), options());
+        harness.open(&menu);
+        harness.key(&menu, KeyCode::End);
+        assert_eq!(menu.highlighted(harness.app.app()), Some(4));
+
+        let row = harness
+            .find("menu:panel:list:row:1")
+            .expect("首条可激活行节点");
+        let snapshot = full_a11y(&mut harness.app);
+        let record = snapshot.node_for(row).expect("行的 a11y 记录");
+        assert_eq!(record.role, A11yRole::MenuItem);
+        assert!(
+            record.actions.contains(&A11yAction::Click),
+            "MenuItem 必须宣告 a11y Click：{:?}",
+            record.actions
+        );
+
+        let action = Action::Custom(SmolStr::new_static("menu:panel.row"));
+        let handled = harness.app.app_mut().dispatch_action(
+            harness.window,
+            row,
+            action,
+            ActionSource::Programmatic,
+        );
+        assert!(
+            handled,
+            "AT Click 必须被分发到行 action（与引擎 on_click 同路径）"
+        );
+        harness.drain(&menu);
+        assert_eq!(
+            harness.activated.borrow().as_slice(),
+            &[SmolStr::new_static("profile")],
+            "AT Click 激活它指向的行，而不是当前高亮行"
+        );
+        harness.settle(&menu);
+        assert_eq!(harness.closes.get(), 1);
+        assert!(!menu.is_open(harness.app.app()));
+    }
+
+    #[test]
+    fn the_list_activation_path_activates_the_highlighted_entry() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        harness.open(&menu);
+        harness.key(&menu, KeyCode::End);
+        let viewport = menu
+            .inner
+            .panel
+            .list()
+            .viewport_node()
+            .expect("列表 viewport");
+        let action = Action::Custom(SmolStr::new_static("menu:panel:list.select"));
+        let handled = harness.app.app_mut().dispatch_action(
+            harness.window,
+            viewport,
+            action,
+            ActionSource::Programmatic,
+        );
+        assert!(handled, "列表级激活路径必须被分发");
+        harness.drain(&menu);
+        assert_eq!(
+            harness.activated.borrow().as_slice(),
+            &[SmolStr::new_static("delete")],
+            "列表 activate 回调与键盘/AT 共享 ItemPanel 激活路径"
+        );
     }
 
     #[test]
@@ -2368,94 +2462,218 @@ mod tests {
         harness.open(&menu);
         harness.key(&menu, KeyCode::Escape);
         assert!(!menu.is_open(harness.app.app()), "Esc 关闭最上层浮层");
+        harness.settle(&menu);
         assert_eq!(harness.closes.get(), 1);
     }
 
     #[test]
-    fn a_press_outside_closes_the_menu() {
+    fn a_press_outside_closes_the_menu_and_replays_the_press_to_the_page() {
         let mut harness = Harness::new();
         let menu = harness.menu(entries(), options());
         harness.open(&menu);
-        harness.click(&menu, LogicalPoint::new(px(10.0), px(10.0)));
+        harness.click(&menu, LogicalPoint::new(px(640.0), px(520.0)));
         assert!(!menu.is_open(harness.app.app()), "点击外部关闭");
+        harness.settle(&menu);
         assert_eq!(harness.closes.get(), 1);
+        assert_eq!(
+            harness.background_clicks.get(),
+            1,
+            "D14：外部按下按 Replay 重派给下层命中控件"
+        );
     }
 
     #[test]
     fn a_submenu_opens_beside_its_row_after_the_hover_delay() {
         let mut harness = Harness::new();
-        let entries = vec![
-            MenuEntry::Action(MenuAction::new("a", "A")),
-            MenuEntry::Submenu(MenuSubmenu::new(
-                "更多",
-                [MenuEntry::Action(MenuAction::new("inner", "内部"))],
-            )),
-        ];
-        let menu = harness.menu(entries, options());
+        let menu = harness.menu(submenu_entries(), options());
         harness.open(&menu);
-        let root_before = harness.root_children().len();
+        let root = harness.root_entry(&menu).id;
 
         let at = harness.row_center(1);
         harness.hover(&menu, at);
-        let root_during = harness.root_children().len();
-        assert_eq!(root_during, root_before, "延迟未到不开子菜单");
+        harness.advance(&menu, Duration::from_millis(150));
+        assert_eq!(harness.stack().len(), 1, "200ms 延迟未到不开子菜单");
 
-        harness.advance(&menu, Duration::from_millis(200));
-        let root_after = harness.root_children();
-        assert_eq!(root_after.len(), root_before + 1, "延迟到点打开子菜单");
-        let submenu_overlay = *root_after.last().expect("子菜单浮层");
-        let submenu_panel = harness
-            .app
-            .app()
-            .window(harness.window)
-            .expect("窗口")
-            .tree()
-            .get(submenu_overlay)
-            .expect("子菜单浮层")
-            .children()
-            .first()
-            .copied()
-            .expect("子菜单面板");
-        let submenu = harness.bounds(submenu_panel);
+        harness.advance(&menu, Duration::from_millis(60));
+        let entries = harness.stack();
+        assert_eq!(entries.len(), 2, "延迟到点打开子菜单");
+        let submenu = harness.submenu_entry(root);
+        assert!(submenu.z > harness.root_entry(&menu).z, "子菜单 z 在父之上");
         let row_bounds = harness.bounds(harness.row(1));
         assert!(
-            submenu.origin.x >= row_bounds.max().x - 0.5,
-            "子菜单在所属行右侧：行 {row_bounds:?} / 子 {submenu:?}"
+            submenu.hit_rect.origin.x >= row_bounds.max().x - 0.5,
+            "子菜单在所属行右侧：行 {row_bounds:?} / 子 {:?}",
+            submenu.hit_rect
         );
         assert!(
-            (submenu.origin.y - row_bounds.origin.y).value().abs() < 1.0,
+            (submenu.hit_rect.origin.y - row_bounds.origin.y)
+                .value()
+                .abs()
+                < 1.0,
             "子菜单与所属行顶部对齐"
+        );
+        assert!(
+            harness.find("menu:sub:1:panel:list:row:0").is_some(),
+            "子菜单行已挂载"
+        );
+    }
+
+    #[test]
+    fn a_submenu_row_keeps_static_haspopup_and_projects_expanded() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let menu = harness.menu(submenu_entries(), options());
+        harness.open(&menu);
+        harness.key(&menu, KeyCode::ArrowDown);
+        harness.key(&menu, KeyCode::ArrowRight);
+
+        let row = menu
+            .inner
+            .panel
+            .list()
+            .row_node(harness.app.app(), 1)
+            .expect("子菜单行");
+        let snapshot = full_a11y(&mut harness.app);
+        let record = snapshot.node_for(row).expect("行 a11y");
+        assert_eq!(
+            record.has_popup,
+            Some(HasPopup::Menu),
+            "子菜单行必须持久宣告 aria-haspopup=menu"
+        );
+        assert_eq!(
+            record.expanded,
+            Some(true),
+            "子菜单打开时父 menuitem 投影 expanded=true"
+        );
+
+        let submenu = menu.inner.submenus.borrow()[0].menu.clone();
+        assert!(submenu.close(harness.app.app_mut()));
+        harness.settle(&menu);
+        let snapshot = full_a11y(&mut harness.app);
+        let record = snapshot.node_for(row).expect("行 a11y");
+        assert_eq!(
+            record.has_popup,
+            Some(HasPopup::Menu),
+            "关闭后静态 haspopup 不丢失"
+        );
+        assert_eq!(record.expanded, Some(false), "关闭后 expanded 复原为 false");
+    }
+
+    #[test]
+    fn a_two_level_submenu_chain_attaches_to_its_parent_menu_items() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let menu = harness.menu(nested_submenu_entries(), options());
+        harness.open(&menu);
+        harness.key(&menu, KeyCode::ArrowDown);
+        harness.key(&menu, KeyCode::ArrowRight);
+        let level2 = menu.inner.submenus.borrow()[0].menu.clone();
+        harness.key(&level2, KeyCode::ArrowDown);
+        harness.key(&level2, KeyCode::ArrowRight);
+        let level3 = level2.inner.submenus.borrow()[0].menu.clone();
+
+        let snapshot = full_a11y(&mut harness.app);
+        let root_row = menu
+            .inner
+            .panel
+            .list()
+            .row_node(harness.app.app(), 1)
+            .expect("root 子菜单行");
+        let level2_row = level2
+            .inner
+            .panel
+            .list()
+            .row_node(harness.app.app(), 1)
+            .expect("level2 子菜单行");
+        let level2_popup = level2.popup_node().expect("level2 浮层");
+        let level3_popup = level3.popup_node().expect("level3 浮层");
+        let root_id = snapshot.id_for_engine(root_row).expect("root 行 a11y id");
+        let level2_id = snapshot
+            .id_for_engine(level2_row)
+            .expect("level2 行 a11y id");
+        assert_eq!(
+            snapshot.node_for(level2_popup).expect("level2 a11y").parent,
+            Some(root_id),
+            "二级子菜单的 a11y 父必须是 root 的父 menuitem"
+        );
+        assert_eq!(
+            snapshot.node_for(level3_popup).expect("level3 a11y").parent,
+            Some(level2_id),
+            "三级子菜单的 a11y 父必须是二级的父 menuitem"
+        );
+        let root_record = snapshot.node_for(root_row).expect("root 行 a11y");
+        assert_eq!(root_record.has_popup, Some(HasPopup::Menu));
+        assert_eq!(root_record.expanded, Some(true));
+    }
+
+    #[test]
+    fn a_hover_opened_submenu_does_not_steal_focus() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(submenu_entries(), options());
+        harness.open(&menu);
+        let root = harness.root_entry(&menu).id;
+        assert_eq!(
+            harness.focused_debug_id().as_deref(),
+            Some("menu:panel:surface"),
+            "根菜单打开时取焦到面板 surface"
+        );
+
+        let at = harness.row_center(1);
+        harness.hover(&menu, at);
+        harness.advance(&menu, Duration::from_millis(220));
+        let _ = harness.submenu_entry(root);
+        assert_eq!(
+            harness.focused_debug_id().as_deref(),
+            Some("menu:panel:surface"),
+            "D13：hover 打开子菜单不夺焦"
+        );
+
+        harness.key(&menu, KeyCode::Escape);
+        harness.key(&menu, KeyCode::ArrowDown);
+        harness.key(&menu, KeyCode::ArrowRight);
+        assert_eq!(
+            harness.focused_debug_id().as_deref(),
+            Some("menu:sub:1:panel:surface"),
+            "键盘打开子菜单才把焦点移入"
         );
     }
 
     #[test]
     fn escape_closes_the_submenu_before_the_menu_it_belongs_to() {
         let mut harness = Harness::new();
-        let entries = vec![
-            MenuEntry::Action(MenuAction::new("a", "A")),
-            MenuEntry::Submenu(MenuSubmenu::new(
-                "更多",
-                [MenuEntry::Action(MenuAction::new("inner", "内部"))],
-            )),
-        ];
-        let menu = harness.menu(entries, options());
+        let menu = harness.menu(submenu_entries(), options());
         harness.open(&menu);
-        let root_before = harness.root_children().len();
+        let root = harness.root_entry(&menu).id;
         harness.key(&menu, KeyCode::ArrowDown);
         harness.key(&menu, KeyCode::ArrowRight);
-        assert_eq!(
-            harness.root_children().len(),
-            root_before + 1,
-            "→ 打开子菜单"
-        );
+        assert_eq!(harness.stack().len(), 2, "→ 打开子菜单");
 
         harness.key(&menu, KeyCode::Escape);
         assert!(menu.is_open(harness.app.app()), "第一下 Esc 只关子菜单");
-        assert_eq!(harness.root_children().len(), root_before);
+        let submenu = harness.submenu_entry(root);
+        assert!(
+            !submenu.state.is_dismissable(),
+            "子菜单进入关闭事务（不可再命中）"
+        );
 
         harness.key(&menu, KeyCode::Escape);
         assert!(!menu.is_open(harness.app.app()), "第二下 Esc 关父菜单");
+        harness.settle(&menu);
         assert_eq!(harness.closes.get(), 1);
+    }
+
+    #[test]
+    fn a_trigger_press_during_the_close_transaction_reopens_the_menu() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        harness.open(&menu);
+        harness.key(&menu, KeyCode::Escape);
+        assert!(!menu.is_open(harness.app.app()));
+        harness.click(&menu, LogicalPoint::new(px(310.0), px(210.0)));
+        assert!(
+            menu.is_open(harness.app.app()),
+            "Closing 中按 opener 由引擎取消关闭（Toggle 消费，不再二次打开）"
+        );
     }
 
     #[test]
@@ -2496,6 +2714,163 @@ mod tests {
     }
 
     #[test]
+    fn a_small_viewport_shrinks_the_menu_and_scrolls_its_last_row_into_view() {
+        let mut harness = Harness::sized(LogicalSize::new(px(260.0), px(200.0)));
+        let anchor = {
+            let root = harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            NodeBuilder::boxed()
+                .id("small-anchor")
+                .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(24.0)))
+                .build(
+                    harness
+                        .app
+                        .app_mut()
+                        .window_mut(harness.window)
+                        .expect("窗口")
+                        .tree_mut(),
+                    root,
+                )
+                .expect("锚点")
+        };
+        let entries: Vec<MenuEntry> = (0..12)
+            .map(|index| {
+                let id = format!("small-{index}");
+                MenuEntry::Action(MenuAction::new(id.clone(), id))
+            })
+            .collect();
+        let menu = harness.menu(entries, options());
+        let opened = menu
+            .open(
+                harness.app.app_mut(),
+                harness.window,
+                Anchor::Node { node: anchor },
+            )
+            .expect("打开");
+        assert!(opened);
+        harness.settle(&menu);
+
+        let panel = harness.bounds(menu.panel_node().expect("面板"));
+        assert!(
+            panel.max().y <= px(196.5),
+            "面板必须被视口夹住并留在边距内：{panel:?}"
+        );
+        assert!(
+            panel.size.height < px(320.0),
+            "小视口下面板必须收缩到可用高度（内部滚动而不是整块溢出）：{panel:?}"
+        );
+
+        harness.key(&menu, KeyCode::End);
+        harness.settle(&menu);
+        assert_eq!(menu.highlighted(harness.app.app()), Some(11));
+        let last = harness.screen_bounds(harness.row(11));
+        assert!(
+            last.origin.y >= panel.origin.y - 0.5 && last.max().y <= panel.max().y + 0.5,
+            "End 后末行必须滚进面板可见区：row={last:?} panel={panel:?}"
+        );
+    }
+
+    #[test]
+    fn an_ancestor_scroll_closes_the_whole_menu_chain() {
+        let mut harness = Harness::sized(LogicalSize::new(px(800.0), px(600.0)));
+        let page = {
+            let root = harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(harness.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id("scroll-page")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .width(px(800.0))
+                        .height(px(300.0))
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("滚动页面")
+        };
+        let anchor = {
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(harness.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id("scroll-anchor")
+                .layout_override(LogicalRect::new(px(20.0), px(20.0), px(120.0), px(32.0)))
+                .build(tree, page)
+                .expect("滚动锚点")
+        };
+        let scroll = harness
+            .app
+            .app_mut()
+            .make_scroll(harness.window, page, ScrollConfig::default())
+            .expect("滚动容器");
+        harness
+            .app
+            .app_mut()
+            .set_scroll_content(&scroll, LogicalSize::new(px(800.0), px(2400.0)))
+            .expect("滚动内容");
+        let menu = harness.menu(entries(), options());
+        assert!(
+            menu.open(
+                harness.app.app_mut(),
+                harness.window,
+                Anchor::Node { node: anchor },
+            )
+            .expect("打开")
+        );
+        harness.settle(&menu);
+        assert!(menu.is_open(harness.app.app()));
+
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&scroll, LogicalPoint::new(px(0.0), px(10.0)))
+            .expect("滚动");
+        harness.settle(&menu);
+        assert!(
+            !menu.is_open(harness.app.app()),
+            "菜单的祖先滚动必须关闭整链（设计 §4.7 矩阵）"
+        );
+    }
+
+    #[test]
+    fn a_window_resize_closes_the_menu_chain() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        assert!(harness.open(&menu));
+        harness
+            .app
+            .app_mut()
+            .window_mut(harness.window)
+            .expect("窗口")
+            .set_size(LogicalSize::new(px(700.0), px(500.0)));
+        harness.settle(&menu);
+        assert!(
+            !menu.is_open(harness.app.app()),
+            "窗口 resize 必须关闭菜单整链（设计 §4.7 矩阵）"
+        );
+    }
+
+    #[test]
     fn the_menu_declares_menu_and_menu_item_roles() {
         let mut harness = Harness::new();
         harness.app.enable_a11y_capture();
@@ -2504,13 +2879,13 @@ mod tests {
         let snapshot = full_a11y(&mut harness.app);
 
         let panel = menu.panel_node().expect("面板");
-        let wrapper = overlay_wrapper(harness.app.app(), harness.window, panel);
+        let wrapper = menu.popup_node().expect("浮层内容节点");
         let wrapper_record = snapshot.node_for(wrapper).expect("包装节点在 a11y 树里");
         assert_eq!(wrapper_record.role, A11yRole::Menu);
         assert_eq!(
             snapshot.node_for(panel).expect("面板在 a11y 树里").role,
             A11yRole::GenericContainer,
-            "面板节点不再重复声明 Menu（E12-R1）"
+            "面板节点不再重复声明 Menu"
         );
 
         let row = {
@@ -2545,35 +2920,94 @@ mod tests {
     }
 
     #[test]
+    fn releasing_a_menu_does_not_report_a_close() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        assert!(harness.open(&menu));
+        let _ = menu.release(harness.app.app_mut());
+        assert_eq!(
+            harness.closes.get(),
+            0,
+            "release 是静默拆卸，不得触发 on_close（K1-13）"
+        );
+        assert!(!menu.is_open(harness.app.app()));
+    }
+
+    #[test]
     fn a_settled_menu_with_no_input_requests_no_frames() {
         let mut harness = Harness::new();
         let menu = harness.menu(entries(), options());
         harness.open(&menu);
-        assert!(
-            !menu.sync(harness.app.app_mut()).expect("同步"),
-            "稳态无工作"
-        );
-        assert!(harness.idles(), "稳态不出帧（I3）");
+        harness.settle(&menu);
+        assert!(harness.idles(&menu), "稳态不出帧（I3）");
     }
 
     #[test]
-    fn a_menu_opened_from_a_modal_window_keeps_the_scope_it_was_opened_in() {
+    fn a_menu_is_non_modal_and_keeps_background_hover() {
         let mut harness = Harness::new();
         let menu = harness.menu(entries(), options());
         harness.open(&menu);
         assert!(
-            harness.app.app().modal_scope(harness.window).is_some(),
-            "菜单自带模态作用域"
+            harness.app.app().modal_scope(harness.window).is_none(),
+            "菜单是 Auto 非模态（不再是旧 modal/trap）"
         );
-        harness.app.inject(InputEvent::pointer_move(
-            LogicalPoint::new(px(5.0), px(5.0)),
+        let background = harness.background;
+        let _ = harness.app.inject(InputEvent::pointer_move(
+            LogicalPoint::new(px(620.0), px(520.0)),
             Modifiers::empty(),
         ));
         let _ = harness.app.drain().expect("帧");
         assert_eq!(
             harness.app.app().hovered(harness.window),
-            None,
-            "模态下的背景悬停被过滤（E12）"
+            Some(background),
+            "非模态菜单不阻断背景 hover"
+        );
+    }
+
+    #[test]
+    fn opening_and_closing_the_menu_never_forces_a_full_repaint() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        assert!(harness.open(&menu));
+        for _ in 0..4 {
+            let record = harness.drain(&menu);
+            assert!(!record.damage_full, "打开菜单不得全量重绘");
+        }
+        let id = harness.root_entry(&menu).id;
+        assert!(menu.close(harness.app.app_mut()));
+        for _ in 0..12 {
+            harness.app.advance(Duration::from_millis(16));
+            let record = harness.drain(&menu);
+            assert!(!record.damage_full, "关闭菜单不得全量重绘");
+            if harness.app.app().popup_rect(id).is_none() {
+                break;
+            }
+        }
+        assert!(
+            harness.app.app().popup_rect(id).is_none(),
+            "关闭动画结束后节点卸载"
+        );
+        assert_eq!(harness.closes.get(), 1);
+    }
+
+    #[test]
+    fn the_item_panel_debug_ids_stay_stable() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(entries(), options());
+        harness.open(&menu);
+        let panel = menu.panel_node().expect("面板");
+        assert_eq!(
+            harness.find("menu:panel:panel"),
+            Some(panel),
+            "PopupPanel 面板节点保持 {{key}}:panel 命名"
+        );
+        assert!(
+            harness.find("menu:panel:surface").is_some(),
+            "surface 保持 {{key}}:surface 命名"
+        );
+        assert!(
+            harness.find("menu:panel:list:viewport").is_some(),
+            "列表 viewport 保持 {{key}}:list:viewport 命名（menu_metrics 依赖）"
         );
     }
 
@@ -2599,43 +3033,5 @@ mod tests {
             }
         }
         rows
-    }
-
-    #[test]
-    fn the_list_box_mode_declares_list_and_list_box_option_roles() {
-        let mut harness = Harness::new();
-        harness.app.enable_a11y_capture();
-        let menu = harness.menu(
-            entries(),
-            MenuOptions {
-                mode: MenuMode::ListBox,
-                ..options()
-            },
-        );
-        harness.open(&menu);
-        let snapshot = full_a11y(&mut harness.app);
-        let panel = menu.panel_node().expect("面板");
-        let wrapper = overlay_wrapper(harness.app.app(), harness.window, panel);
-        assert_eq!(
-            snapshot.node_for(wrapper).expect("包装").role,
-            A11yRole::GenericContainer,
-            "ListBox 角色缺位（E15）时包装不声明角色"
-        );
-        assert_eq!(
-            snapshot
-                .nodes()
-                .iter()
-                .filter(|node| node.role == A11yRole::List)
-                .count(),
-            1,
-            "集合语义只来自内层 E9 虚拟列表容器（不得双 List）"
-        );
-        assert!(
-            snapshot
-                .nodes()
-                .iter()
-                .any(|node| node.role == A11yRole::ListBoxOption),
-            "行声明 ListBoxOption"
-        );
     }
 }

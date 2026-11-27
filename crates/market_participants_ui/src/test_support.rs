@@ -17,13 +17,11 @@ use ui_core::{
     event::{InputEvent, Modifiers, PointerButton},
     math::{LogicalPoint, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
+    popup::PopupTier,
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
 };
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
+use ui_kit::theme::{appearance::Appearance, handle::ThemeHandle};
 use widget::{frame::FrameRouter, services::WidgetServices};
 
 use crate::{
@@ -236,19 +234,15 @@ impl Harness {
         });
         let runtime = app.app().runtime_handle().clone();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let layer = Rc::new(Layer::new());
         let router =
             Rc::new(FrameRouter::new(app.app_mut()).expect("the test host owns the frame hook"));
-        let animation = Rc::new(AnimationRouter::new());
         let services = Rc::new(
             WidgetServices::builder(
                 app.app_mut(),
                 runtime,
                 translate(),
                 theme,
-                Rc::clone(&layer),
                 Rc::clone(&router),
-                Rc::clone(&animation),
             )
             .build(),
         );
@@ -470,8 +464,23 @@ impl Harness {
             .len()
     }
 
+    pub(crate) fn popup_total(&self) -> usize {
+        self.app
+            .app()
+            .popup_stack(self.window())
+            .map_or(0, |stack| stack.entries.len())
+    }
     pub(crate) fn overlay_count(&self) -> usize {
-        self.app.app().overlays(self.window()).len()
+        self.app
+            .app()
+            .popup_stack(self.window())
+            .map_or(0, |stack| {
+                stack
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.tier != PopupTier::Scrim)
+                    .count()
+            })
     }
 
     pub(crate) fn frame_requests(&self) -> u64 {

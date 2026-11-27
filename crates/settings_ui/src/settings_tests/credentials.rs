@@ -378,6 +378,7 @@ fn a_failed_clear_should_keep_the_set_until_the_retry_writes_it() {
 
     harness.press(KeyCode::Escape);
     harness.settle(3);
+    harness.advance(200);
 
     harness.click_node(kind.clear_selector().as_ref());
     harness.settle(3);

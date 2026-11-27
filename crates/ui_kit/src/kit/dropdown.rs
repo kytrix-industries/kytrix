@@ -10,6 +10,10 @@ use ui_core::{
     math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
+    popup::{
+        Alignment, Anchor, DismissPolicy, EscapePolicy, FocusPolicy, HasPopup, OutsidePress,
+        PlacementSpec, PopupError, PopupTier, RestoreFocus, Side,
+    },
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -18,15 +22,26 @@ use crate::{
     kit::{
         icon::IconKind,
         interactive::{Interactive, mount_dynamic_icon},
-        layer::{Band, Layer},
         menu::{
-            IconSnapshot, ItemPanel, ItemPanelOptions, PanelContent, PanelMeasure, PanelRoles,
-            PanelRow, PanelWidth, build_icon_slot,
+            IconSnapshot, ItemPanel, ItemPanelOptions, PanelContent, PanelMeasure, PanelOpen,
+            PanelRoles, PanelRow, PanelWidth, build_icon_slot, popup_error,
         },
-        overlay::{Anchor, AnimationRouter, OverlayError, Placement},
+        popup_panel::{AnchorChange, AnchorWatch},
         size::{UnifiedSizable, UnifiedSize},
     },
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
+};
+
+const DROPDOWN_DISMISS: DismissPolicy = DismissPolicy::Chain {
+    outside: OutsidePress::Replay,
+    escape: EscapePolicy::CloseTopmost,
+    anchor_lost: true,
+    focus_lost: true,
+};
+
+const DROPDOWN_ROLES: PanelRoles = PanelRoles {
+    panel: Some(A11yRole::Menu),
+    row: A11yRole::MenuItem,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,8 +82,7 @@ pub struct DropdownOptions {
     pub variant: InteractiveVariant,
     pub width: Option<LogicalPx>,
     pub max_height: LogicalPx,
-    pub placement: Placement,
-    pub gap: LogicalPx,
+    pub placement: PlacementSpec,
     pub label: Option<SmolStr>,
     pub placeholder: SmolStr,
 }
@@ -80,8 +94,12 @@ impl Default for DropdownOptions {
             variant: InteractiveVariant::Ghost,
             width: None,
             max_height: px(320.0),
-            placement: Placement::BOTTOM_START,
-            gap: px(4.0),
+            placement: PlacementSpec {
+                side: Side::Bottom,
+                align: Alignment::Start,
+                gap: px(4.0),
+                ..PlacementSpec::default()
+            },
             label: None,
             placeholder: SmolStr::new_static("Select…"),
         }
@@ -114,7 +132,7 @@ impl DropdownOptions {
     }
 
     #[must_use]
-    pub fn placement(mut self, placement: Placement) -> Self {
+    pub fn placement(mut self, placement: PlacementSpec) -> Self {
         self.placement = placement;
         self
     }
@@ -165,6 +183,7 @@ struct DropdownInner {
     a11y_label: Signal<SmolStr>,
     on_select: RefCell<Option<Rc<dyn Fn(&mut App, SmolStr)>>>,
     actions: DropdownActions,
+    watch: RefCell<AnchorWatch>,
     state: RefCell<DropdownState>,
 }
 
@@ -172,8 +191,6 @@ impl Dropdown {
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         key: impl Into<SmolStr>,
         options: DropdownOptions,
     ) -> Self {
@@ -183,28 +200,21 @@ impl Dropdown {
         let panel = ItemPanel::new(
             app,
             theme.clone(),
-            layer,
-            router,
             format_smolstr!("{key}:panel"),
             ItemPanelOptions {
                 size: options.size,
                 max_height: options.max_height,
                 row_height: options.size.h(),
-                band: Band::Popup,
-                modal: true,
-                placement: options.placement,
-                gap: options.gap,
-                roles: PanelRoles {
-                    panel: Some(A11yRole::Menu),
-                    row: A11yRole::MenuItem,
-                },
+                placement: options.placement.clone(),
+                dismiss: DROPDOWN_DISMISS,
+                tier: PopupTier::Auto,
+                roles: DROPDOWN_ROLES,
                 label: options.label.clone(),
                 width: if options.width.is_some() {
                     PanelWidth::Exact
                 } else {
                     PanelWidth::AtLeast
                 },
-                slot: crate::kit::layer::LayerSlot::Exclusive,
             },
         );
         let open_state = panel.open_state();
@@ -220,6 +230,7 @@ impl Dropdown {
             .label(static_label)
             .a11y_label_signal(a11y_label)
             .a11y_expanded(open_state)
+            .a11y_has_popup(HasPopup::Menu)
             .action(trigger_click.clone());
         let inner = Rc::new(DropdownInner {
             actions: DropdownActions {
@@ -238,6 +249,7 @@ impl Dropdown {
             display: app.signal_scoped(scope, SmolStr::new_static("")),
             a11y_label,
             on_select: RefCell::new(None),
+            watch: RefCell::new(AnchorWatch::default()),
             state: RefCell::new(DropdownState::default()),
         });
         let dropdown = Self { inner };
@@ -257,7 +269,12 @@ impl Dropdown {
 
     #[must_use]
     pub fn panel_node(&self) -> Option<NodeId> {
-        self.inner.panel.overlay().panel_node()
+        self.inner.panel.panel_node()
+    }
+
+    #[must_use]
+    pub fn popup_node(&self) -> Option<NodeId> {
+        self.inner.panel.popup_node()
     }
 
     #[must_use]
@@ -462,7 +479,7 @@ impl Dropdown {
         Ok(node)
     }
 
-    pub fn open(&self, app: &mut App) -> Result<bool, OverlayError> {
+    pub fn open(&self, app: &mut App) -> Result<bool, PopupError> {
         let (Some(window), Some(trigger)) = (
             self.inner.state.borrow().window,
             self.inner.state.borrow().trigger,
@@ -471,35 +488,47 @@ impl Dropdown {
         };
         self.measure_trigger(app);
         self.resolve_icons(app, window)
-            .map_err(OverlayError::from)?;
+            .map_err(|source| popup_error(app, window, source))?;
+        self.inner
+            .panel
+            .set_content(app, self.panel_content())
+            .map_err(|source| popup_error(app, window, source))?;
         let width = self
             .inner
             .options
             .width
             .unwrap_or_else(|| self.inner.state.borrow().trigger_width.max(px(1.0)));
-        self.inner
-            .panel
-            .set_content(app, self.panel_content())
-            .map_err(OverlayError::from)?;
-        let opened = self
-            .inner
-            .panel
-            .open(app, window, Anchor::node(trigger), width)?;
+        let opened = self.inner.panel.open(
+            app,
+            window,
+            PanelOpen {
+                anchor: Anchor::Node { node: trigger },
+                opener: Some(trigger),
+                focus: FocusPolicy::Take {
+                    restore: RestoreFocus::Opener,
+                },
+                parent: None,
+                width,
+                a11y_parent: None,
+            },
+        )?;
         if opened {
+            self.inner.watch.borrow_mut().reset();
             let row = app
                 .read_with(&self.inner.selected, |selected| *selected)
                 .or_else(|| self.first_enabled());
             self.inner.panel.set_highlighted(app, row);
-            let _ = self.inner.panel.focus(app);
         }
         Ok(opened)
     }
 
     pub fn close(&self, app: &mut App) -> bool {
+        self.inner.watch.borrow_mut().reset();
         self.inner.panel.close(app)
     }
 
     pub fn close_now(&self, app: &mut App) -> bool {
+        self.inner.watch.borrow_mut().reset();
         self.inner.panel.close_now(app)
     }
 
@@ -508,13 +537,24 @@ impl Dropdown {
         changed |= self.sync_trigger_a11y(app);
         changed |= self.sync_trigger_icon(app)?;
         if self.is_open(app) {
+            let lost = self
+                .inner
+                .panel
+                .id()
+                .zip(self.inner.state.borrow().window)
+                .is_some_and(|(id, window)| {
+                    self.inner.watch.borrow_mut().observe(app, id, window) == AnchorChange::Lost
+                });
+            if lost {
+                changed |= self.close(app);
+            }
             self.measure_trigger(app);
             if self.inner.options.width.is_none() {
                 let width = self.inner.state.borrow().trigger_width.max(px(1.0));
-                self.inner.panel.resize(app, width)?;
+                changed |= self.inner.panel.set_width(app, width);
             }
         }
-        changed |= self.inner.panel.sync(app, true)?;
+        changed |= self.inner.panel.sync(app)?;
         Ok(changed)
     }
 
@@ -523,6 +563,7 @@ impl Dropdown {
     }
 
     pub fn release(&self, app: &mut App) -> usize {
+        self.inner.watch.borrow_mut().reset();
         for action in [
             &self.inner.actions.trigger_click,
             &self.inner.actions.down,
@@ -636,16 +677,6 @@ impl Dropdown {
         let this = self.clone();
         self.inner.panel.on_activate(move |app, row| {
             this.select_row(app, row);
-        });
-        let this = self.clone();
-        self.inner.panel.on_close(move |app| {
-            let (Some(window), Some(trigger)) = (
-                this.inner.state.borrow().window,
-                this.inner.state.borrow().trigger,
-            ) else {
-                return;
-            };
-            let _ = app.set_focus(window, Some(trigger));
         });
     }
 
@@ -802,7 +833,6 @@ impl fmt::Debug for Dropdown {
             .finish()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -813,23 +843,20 @@ mod tests {
 
     use smol_str::SmolStr;
     use ui_core::{
-        a11y::A11yRole,
-        event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{LogicalPoint, LogicalRect, px},
+        a11y::{A11yAction, A11yRole},
+        event::{Action, ActionSource, InputEvent, KeyCode, Modifiers, PointerButton},
+        interaction::{ScrollConfig, ScrollHandle},
+        math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
         paint::style_builder::StyleBuilder,
+        popup::{HasPopup, PopupId, PopupSnapshotEntry, PopupState},
         test_support::app::TestApp,
         window::WindowId,
     };
 
     use super::{Dropdown, DropdownItem, DropdownOptions};
     use crate::{
-        kit::{
-            icon::IconKind,
-            layer::Layer,
-            overlay::AnimationRouter,
-            test_support::{a11y_snapshot_without_oracle, overlay_wrapper},
-        },
+        kit::{icon::IconKind, test_support::a11y_snapshot_without_oracle},
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
@@ -837,8 +864,6 @@ mod tests {
         app: TestApp,
         window: WindowId,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         selected: Rc<RefCell<Vec<SmolStr>>>,
         background_clicks: Rc<Cell<usize>>,
     }
@@ -851,6 +876,10 @@ mod tests {
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
             let clicks = Rc::new(Cell::new(0));
             let sink = clicks.clone();
+            app.app_mut().on_action(
+                Action::Custom(SmolStr::new_static("background.click")),
+                move |_| sink.set(sink.get() + 1),
+            );
             NodeBuilder::boxed()
                 .id("background")
                 .layout_override(LogicalRect::new(px(600.0), px(500.0), px(80.0), px(40.0)))
@@ -860,16 +889,10 @@ mod tests {
                     root,
                 )
                 .expect("背景节点");
-            app.app_mut().on_action(
-                Action::Custom(SmolStr::new_static("background.click")),
-                move |_| sink.set(sink.get() + 1),
-            );
             Self {
                 app,
                 window,
                 theme,
-                layer: Layer::new(),
-                router: AnimationRouter::new(),
                 selected: Rc::new(RefCell::new(Vec::new())),
                 background_clicks: clicks,
             }
@@ -877,15 +900,8 @@ mod tests {
 
         fn dropdown(&mut self, options: DropdownOptions) -> Dropdown {
             let selected = self.selected.clone();
-            Dropdown::new(
-                self.app.app_mut(),
-                self.theme.clone(),
-                self.layer.clone(),
-                self.router.clone(),
-                "dropdown",
-                options,
-            )
-            .on_select(move |_, id| selected.borrow_mut().push(id))
+            Dropdown::new(self.app.app_mut(), self.theme.clone(), "dropdown", options)
+                .on_select(move |_, id| selected.borrow_mut().push(id))
         }
 
         fn mount(&mut self, dropdown: &Dropdown, items: impl IntoIterator<Item = DropdownItem>) {
@@ -896,11 +912,75 @@ mod tests {
                 .expect("窗口")
                 .tree()
                 .root();
+            self.mount_under(dropdown, items, root);
+        }
+
+        fn mount_under(
+            &mut self,
+            dropdown: &Dropdown,
+            items: impl IntoIterator<Item = DropdownItem>,
+            parent: NodeId,
+        ) {
             dropdown.set_items(self.app.app_mut(), items).expect("条目");
             dropdown
-                .mount(self.app.app_mut(), self.window, root)
+                .mount(self.app.app_mut(), self.window, parent)
                 .expect("挂载");
             self.settle(dropdown);
+        }
+
+        fn scroll_page(&mut self) -> (NodeId, ScrollHandle) {
+            let root = self
+                .app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let page = {
+                let tree = self
+                    .app
+                    .app_mut()
+                    .window_mut(self.window)
+                    .expect("窗口")
+                    .tree_mut();
+                NodeBuilder::boxed()
+                    .id("page")
+                    .style(
+                        StyleBuilder::new()
+                            .relative()
+                            .flex_col()
+                            .width(px(400.0))
+                            .height(px(200.0))
+                            .overflow_hidden()
+                            .build(),
+                    )
+                    .build(tree, root)
+                    .expect("滚动页")
+            };
+            let handle = self
+                .app
+                .app_mut()
+                .make_scroll(self.window, page, ScrollConfig::default())
+                .expect("滚动容器");
+            self.app
+                .app_mut()
+                .set_scroll_content(&handle, LogicalSize::new(px(400.0), px(1200.0)))
+                .expect("滚动内容");
+            (page, handle)
+        }
+
+        fn spacer(&mut self, parent: NodeId, height: LogicalPx) {
+            let tree = self
+                .app
+                .app_mut()
+                .window_mut(self.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id("spacer")
+                .style(StyleBuilder::new().width_full().height(height).build())
+                .build(tree, parent)
+                .expect("占位");
         }
 
         fn settle(&mut self, dropdown: &Dropdown) {
@@ -915,6 +995,12 @@ mod tests {
             let _ = self.app.drain().expect("帧");
         }
 
+        fn drain(&mut self, dropdown: &Dropdown) -> ui_core::test_support::record::FrameRecord {
+            let record = self.app.drain().expect("帧").clone();
+            let _ = dropdown.sync(self.app.app_mut());
+            record
+        }
+
         fn focus_trigger(&mut self, dropdown: &Dropdown) {
             let trigger = dropdown.trigger_node().expect("触发器");
             self.app.app_mut().set_focus(self.window, Some(trigger));
@@ -927,11 +1013,10 @@ mod tests {
             let _ = self
                 .app
                 .inject(InputEvent::key_up(code, Modifiers::empty()));
-            let _ = self.app.drain().expect("帧");
-            let _ = dropdown.sync(self.app.app_mut());
+            self.drain(dropdown);
         }
 
-        fn click(&mut self, dropdown: &Dropdown, at: LogicalPoint) {
+        fn press_release(&mut self, at: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 at,
                 PointerButton::Primary,
@@ -942,6 +1027,10 @@ mod tests {
                 PointerButton::Primary,
                 Modifiers::empty(),
             ));
+        }
+
+        fn click(&mut self, dropdown: &Dropdown, at: LogicalPoint) {
+            self.press_release(at);
             self.settle(dropdown);
         }
 
@@ -977,11 +1066,7 @@ mod tests {
         }
 
         fn row_center(&self, index: usize) -> LogicalPoint {
-            let bounds = self.bounds(self.row(index));
-            LogicalPoint::new(
-                bounds.origin.x + bounds.size.width / 2.0,
-                bounds.origin.y + bounds.size.height / 2.0,
-            )
+            self.center(self.row(index))
         }
 
         fn trigger_text(&self, dropdown: &Dropdown) -> SmolStr {
@@ -1044,6 +1129,32 @@ mod tests {
             }
             count
         }
+
+        fn popup_entry(&self, dropdown: &Dropdown) -> PopupSnapshotEntry {
+            let node = dropdown.popup_node().expect("浮层内容节点");
+            self.app
+                .app()
+                .popup_stack(self.window)
+                .expect("浮层栈")
+                .entries
+                .into_iter()
+                .find(|entry| entry.node == node)
+                .expect("面板在栈里")
+        }
+
+        fn popup_rect(&self, dropdown: &Dropdown) -> LogicalRect {
+            self.popup_entry(dropdown).hit_rect
+        }
+
+        fn trigger_screen_rect(&self, dropdown: &Dropdown) -> LogicalRect {
+            let trigger = dropdown.trigger_node().expect("触发器");
+            self.app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .node_screen_rect(trigger)
+                .expect("触发器屏幕矩形")
+        }
     }
 
     fn items() -> Vec<DropdownItem> {
@@ -1070,8 +1181,9 @@ mod tests {
         harness.click(&dropdown, center);
         assert!(
             !dropdown.is_open(harness.app.app()),
-            "再点触发器关闭面板（触发器在浮层外）"
+            "再点触发器关闭面板（opener Toggle 消费 press）"
         );
+        assert_eq!(harness.background_clicks.get(), 0, "opener 按下被消费");
     }
 
     #[test]
@@ -1136,6 +1248,62 @@ mod tests {
     }
 
     #[test]
+    fn an_a11y_click_chooses_the_option_it_targets() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+
+        let row = harness
+            .find("dropdown:panel:list:row:3")
+            .expect("选项行节点");
+        let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
+        let record = snapshot.node_for(row).expect("行 a11y 记录");
+        assert_eq!(record.role, A11yRole::MenuItem);
+        assert!(
+            record.actions.contains(&A11yAction::Click),
+            "MenuItem 必须宣告 a11y Click：{:?}",
+            record.actions
+        );
+
+        let action = Action::Custom(SmolStr::new_static("dropdown:panel.row"));
+        let handled = harness.app.app_mut().dispatch_action(
+            harness.window,
+            row,
+            action,
+            ActionSource::Programmatic,
+        );
+        assert!(handled, "AT Click 必须被分发到行 action");
+        harness.settle(&dropdown);
+        assert_eq!(
+            harness.selected.borrow().as_slice(),
+            &[SmolStr::new_static("d")],
+            "AT Click 选中它指向的选项"
+        );
+        assert!(!dropdown.is_open(harness.app.app()));
+    }
+
+    #[test]
+    fn a_space_press_also_chooses_the_highlighted_option() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+
+        harness.key(&dropdown, KeyCode::End);
+        harness.key(&dropdown, KeyCode::Space);
+        assert_eq!(
+            harness.selected.borrow().as_slice(),
+            &[SmolStr::new_static("d")],
+            "Space 与 Enter 走同一条激活路径"
+        );
+        assert!(!dropdown.is_open(harness.app.app()));
+    }
+
+    #[test]
     fn a_disabled_item_cannot_be_chosen_and_keeps_the_panel_open() {
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions::default());
@@ -1162,6 +1330,94 @@ mod tests {
             (panel.size.width - trigger_width).abs() < px(0.5),
             "面板宽度对齐触发器：面板 {} / 触发器 {trigger_width}",
             panel.size.width
+        );
+    }
+
+    #[test]
+    fn the_first_visible_frame_already_has_the_settled_rect() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        let trigger_width = harness.bounds(trigger).size.width;
+        let _ = harness.app.drain().expect("帧");
+        harness.press_release(harness.center(trigger));
+        let _ = harness.app.drain().expect("帧");
+        let first_entry = harness.popup_entry(&dropdown);
+        assert_eq!(
+            first_entry.state,
+            PopupState::Open,
+            "首帧即 Open（不再需要等 reveal）"
+        );
+        let first = first_entry.hit_rect;
+        let first_panel = harness.bounds(dropdown.panel_node().expect("面板"));
+        assert!(
+            (first_panel.size.width - trigger_width).abs() < px(0.5),
+            "首帧面板宽度已跟随触发器：面板 {} / 触发器 {trigger_width}",
+            first_panel.size.width
+        );
+        harness.settle(&dropdown);
+        let stable = harness.popup_rect(&dropdown);
+        assert_eq!(first, stable, "首可见帧 rect 等于稳定帧");
+        let stable_panel = harness.bounds(dropdown.panel_node().expect("面板"));
+        assert_eq!(
+            first_panel.size.width, stable_panel.size.width,
+            "首帧面板宽度等于稳定帧"
+        );
+    }
+
+    #[test]
+    fn scrolling_the_trigger_out_of_the_page_closes_the_dropdown() {
+        let mut harness = Harness::new();
+        let (page, scroll) = harness.scroll_page();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount_under(&dropdown, items(), page);
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&scroll, LogicalPoint::new(px(0.0), px(600.0)))
+            .expect("滚动");
+        harness.settle(&dropdown);
+        assert!(
+            !dropdown.is_open(harness.app.app()),
+            "触发器滚出滚动页后关闭面板"
+        );
+    }
+
+    #[test]
+    fn scrolling_a_visible_trigger_re_anchors_the_open_dropdown() {
+        let mut harness = Harness::new();
+        let (page, scroll) = harness.scroll_page();
+        harness.spacer(page, px(100.0));
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount_under(&dropdown, items(), page);
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()), "面板打开");
+        let before = harness.popup_rect(&dropdown);
+
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&scroll, LogicalPoint::new(px(0.0), px(60.0)))
+            .expect("滚动");
+        harness.settle(&dropdown);
+        let after_trigger = harness.trigger_screen_rect(&dropdown);
+        assert!(
+            dropdown.is_open(harness.app.app()),
+            "触发器仍可见时保持打开：滚动前浮层 {before:?} / 滚动后触发器 {after_trigger:?}"
+        );
+        let after = harness.popup_rect(&dropdown);
+        assert_ne!(before, after, "滚动后浮层随锚点重新落位");
+        let trigger_rect = harness.trigger_screen_rect(&dropdown);
+        assert!(
+            (after.origin.y - (trigger_rect.origin.y + trigger_rect.size.height + px(4.0))).abs()
+                < px(0.5),
+            "浮层贴住触发器下沿：浮层 {after:?} / 触发器 {trigger_rect:?}"
         );
     }
 
@@ -1198,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_press_outside_closes_the_panel_and_returns_focus_to_the_trigger() {
+    fn a_press_outside_closes_the_panel_and_replays_the_press_to_the_page() {
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions::default());
         harness.mount(&dropdown, items());
@@ -1210,18 +1466,13 @@ mod tests {
         assert!(!dropdown.is_open(harness.app.app()), "点击外部关闭");
         assert_eq!(
             harness.background_clicks.get(),
-            0,
-            "外部按下被模态浮层消费（已接受偏差 F5：不穿透背景）"
-        );
-        assert_eq!(
-            harness.app.app().focused(harness.window),
-            Some(trigger),
-            "关闭后焦点回到触发器"
+            1,
+            "D14：外部按下按 Replay 重派给下层命中控件"
         );
     }
 
     #[test]
-    fn escape_closes_the_panel() {
+    fn escape_closes_the_panel_and_returns_focus_to_the_trigger() {
         let mut harness = Harness::new();
         let dropdown = harness.dropdown(DropdownOptions::default());
         harness.mount(&dropdown, items());
@@ -1229,6 +1480,34 @@ mod tests {
         harness.click(&dropdown, harness.center(trigger));
         harness.key(&dropdown, KeyCode::Escape);
         assert!(!dropdown.is_open(harness.app.app()), "Esc 关闭面板");
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(trigger),
+            "关闭后焦点回到 opener"
+        );
+    }
+
+    #[test]
+    fn a_closing_dropdown_reopens_when_its_trigger_is_pressed_again() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        let center = harness.center(trigger);
+        harness.click(&dropdown, center);
+        harness.key(&dropdown, KeyCode::Escape);
+        assert!(!dropdown.is_open(harness.app.app()));
+
+        let _ = harness.app.inject(InputEvent::pointer_down(
+            center,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let _ = dropdown.sync(harness.app.app_mut());
+        assert!(
+            dropdown.is_open(harness.app.app()),
+            "Closing 中按 opener 由引擎取消关闭并回到 Opening（Toggle 消费）"
+        );
     }
 
     #[test]
@@ -1250,7 +1529,7 @@ mod tests {
         harness.click(&dropdown, harness.center(trigger));
         let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
         let panel = dropdown.panel_node().expect("面板");
-        let wrapper = overlay_wrapper(harness.app.app(), harness.window, panel);
+        let wrapper = dropdown.popup_node().expect("浮层内容节点");
         assert_eq!(
             snapshot.node_for(wrapper).expect("包装").role,
             A11yRole::Menu
@@ -1314,7 +1593,7 @@ mod tests {
         let panel = harness.bounds(dropdown.panel_node().expect("面板"));
         assert!(
             panel.size.width > trigger_width + 100.0,
-            "长条目把面板撑宽（旧 min_w 下限口径）：面板 {} / 触发器 {trigger_width}",
+            "长条目把面板撑宽：面板 {} / 触发器 {trigger_width}",
             panel.size.width
         );
     }
@@ -1397,12 +1676,22 @@ mod tests {
         let record = snapshot.node_for(trigger).expect("触发器进 a11y");
         assert_eq!(record.role, A11yRole::Button);
         assert_eq!(record.label_text(), Some("请选择"), "占位文本是可访问名");
+        assert_eq!(
+            record.has_popup,
+            Some(HasPopup::Menu),
+            "关闭态静态 aria-haspopup=menu"
+        );
         assert_eq!(record.expanded, Some(false), "关闭态 aria-expanded=false");
 
         harness.click(&dropdown, harness.center(trigger));
         harness.settle(&dropdown);
         let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
         let record = snapshot.node_for(trigger).expect("触发器进 a11y");
+        assert_eq!(
+            record.has_popup,
+            Some(HasPopup::Menu),
+            "打开态 haspopup 仍保留"
+        );
         assert_eq!(record.expanded, Some(true), "打开态 aria-expanded=true");
 
         harness.click(&dropdown, harness.row_center(1));
@@ -1410,11 +1699,16 @@ mod tests {
         let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
         let record = snapshot.node_for(trigger).expect("触发器进 a11y");
         assert_eq!(record.label_text(), Some("Beta"), "可访问名跟随选中项");
+        assert_eq!(
+            record.has_popup,
+            Some(HasPopup::Menu),
+            "关闭后静态 haspopup 不丢失"
+        );
         assert_eq!(record.expanded, Some(false), "关闭后 expanded 复原");
     }
 
     #[test]
-    fn an_open_dropdown_consumes_background_scroll() {
+    fn an_open_dropdown_does_not_swallow_background_scroll() {
         let mut harness = Harness::new();
         let root = harness
             .app
@@ -1446,19 +1740,12 @@ mod tests {
         let handle = harness
             .app
             .app_mut()
-            .make_scroll(
-                harness.window,
-                page,
-                ui_core::interaction::ScrollConfig::default(),
-            )
+            .make_scroll(harness.window, page, ScrollConfig::default())
             .expect("滚动容器");
         harness
             .app
             .app_mut()
-            .set_scroll_content(
-                &handle,
-                ui_core::math::LogicalSize::new(px(800.0), px(2400.0)),
-            )
+            .set_scroll_content(&handle, LogicalSize::new(px(800.0), px(2400.0)))
             .expect("内容");
 
         let dropdown = harness.dropdown(DropdownOptions::default());
@@ -1474,25 +1761,7 @@ mod tests {
                 Modifiers::empty(),
             ));
             harness.settle(dropdown);
-            for _ in 0..8 {
-                harness.app.advance(Duration::from_millis(40));
-                let _ = harness.app.drain().expect("帧");
-            }
         };
-        wheel(&mut harness, &dropdown);
-        assert_eq!(
-            harness
-                .app
-                .app()
-                .scroll_state(&handle)
-                .expect("滚动状态")
-                .offset
-                .y,
-            px(0.0),
-            "面板打开时背景滚轮被消费"
-        );
-
-        harness.click(&dropdown, harness.center(trigger));
         wheel(&mut harness, &dropdown);
         assert!(
             harness
@@ -1503,7 +1772,141 @@ mod tests {
                 .offset
                 .y
                 > px(50.0),
-            "无浮层时背景可滚"
+            "Auto 非模态下拉不吞背景滚动"
+        );
+
+        harness.key(&dropdown, KeyCode::Escape);
+        harness.settle(&dropdown);
+    }
+
+    #[test]
+    fn an_open_dropdown_follows_its_scrolled_trigger() {
+        let mut harness = Harness::new();
+        let root = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .tree()
+            .root();
+        let page = {
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(harness.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id("page")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .width(px(700.0))
+                        .height(px(400.0))
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("页面")
+        };
+        let handle = harness
+            .app
+            .app_mut()
+            .make_scroll(harness.window, page, ScrollConfig::default())
+            .expect("滚动容器");
+        harness
+            .app
+            .app_mut()
+            .set_scroll_content(&handle, LogicalSize::new(px(700.0), px(1600.0)))
+            .expect("内容");
+        let content = {
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(harness.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id("page-content")
+                .style(
+                    StyleBuilder::new()
+                        .width_full()
+                        .height(px(1600.0))
+                        .flex_col()
+                        .padding_y(px(300.0))
+                        .build(),
+                )
+                .build(tree, page)
+                .expect("内容节点")
+        };
+        let dropdown = harness.dropdown(DropdownOptions::default().width(px(120.0)));
+        harness.mount_under(&dropdown, items(), content);
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        assert!(dropdown.is_open(harness.app.app()));
+
+        let before = harness.popup_rect(&dropdown);
+        let _ = harness.app.inject(InputEvent::scroll_lines(
+            LogicalPoint::new(px(500.0), px(200.0)),
+            LogicalPoint::new(px(0.0), px(-2.0)),
+            Modifiers::empty(),
+        ));
+        harness.settle(&dropdown);
+
+        let trigger_rect = harness.trigger_screen_rect(&dropdown);
+        let after = harness.popup_rect(&dropdown);
+        assert!(
+            after.origin.y < before.origin.y - px(10.0),
+            "触发器滚动后面板同帧跟随：before={before:?} after={after:?}"
+        );
+        let expected = trigger_rect.max().y + px(4.0);
+        assert!(
+            (after.origin.y - expected).value().abs() < 0.5,
+            "面板顶边贴触发器底边：expected {expected} actual {}",
+            after.origin.y
+        );
+    }
+
+    #[test]
+    fn opening_and_closing_the_dropdown_never_forces_a_full_repaint() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        let id: PopupId = harness.popup_entry(&dropdown).id;
+        for _ in 0..4 {
+            let record = harness.drain(&dropdown);
+            assert!(!record.damage_full, "打开面板不得全量重绘");
+        }
+        assert!(dropdown.close(harness.app.app_mut()));
+        for _ in 0..12 {
+            harness.app.advance(Duration::from_millis(16));
+            let record = harness.drain(&dropdown);
+            assert!(!record.damage_full, "关闭面板不得全量重绘");
+            if harness.app.app().popup_rect(id).is_none() {
+                break;
+            }
+        }
+        assert!(
+            harness.app.app().popup_rect(id).is_none(),
+            "关闭动画结束后节点卸载"
+        );
+    }
+
+    #[test]
+    fn the_panel_debug_ids_stay_stable() {
+        let mut harness = Harness::new();
+        let dropdown = harness.dropdown(DropdownOptions::default());
+        harness.mount(&dropdown, items());
+        let trigger = dropdown.trigger_node().expect("触发器");
+        harness.click(&dropdown, harness.center(trigger));
+        let panel = dropdown.panel_node().expect("面板");
+        assert_eq!(harness.find("dropdown:panel:panel"), Some(panel));
+        assert!(harness.find("dropdown:panel:surface").is_some());
+        assert!(
+            harness.find("dropdown:panel:list:viewport").is_some(),
+            "列表 viewport 命名保持（menu_metrics 依赖）"
         );
     }
 }

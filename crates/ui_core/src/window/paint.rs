@@ -81,6 +81,7 @@ pub(crate) fn paint_frame(
     }
     let force_full = window.tree.take_force_full_paint();
     let structure_changed = window.tree.structure_changed();
+    let order_dirty = window.tree.take_order_dirty();
     let registry_changed = window.tree.scroll_registry_changed();
     let first_paint = window.tree.paint_counters().full_frames == 0;
     let epoch_full = force_full || registry_changed || first_paint;
@@ -136,7 +137,7 @@ pub(crate) fn paint_frame(
                 window.tree.mark_paint_closure(&dirty);
             }
             window.tree.recycle(dirty);
-            let focused = window.focus.focused();
+            let focused = window.effective_focus();
             let canvas_text = &window.canvas_text;
             let mut pass = PaintPass {
                 tree: &mut window.tree,
@@ -165,7 +166,10 @@ pub(crate) fn paint_frame(
         }
     };
     let mut report = report;
-    if !full_paint && !report.order_rebuilt && (structure_changed || !removed.is_empty()) {
+    if !full_paint
+        && !report.order_rebuilt
+        && (structure_changed || order_dirty || !removed.is_empty())
+    {
         let Window {
             tree,
             scene,
@@ -412,7 +416,7 @@ mod tests {
             }
         }
         let node_count = app.window(window).expect("窗口").tree().len();
-        assert_eq!(node_count, LEAVES + 1, "树规模 = 根 + 叶子");
+        assert_eq!(node_count, LEAVES + 2, "树规模 = 根 + popup root + 叶子");
 
         let first = frame_once(&mut app, window);
         assert!(matches!(first, FrameOutcome::Committed(_)), "首帧必须提交");

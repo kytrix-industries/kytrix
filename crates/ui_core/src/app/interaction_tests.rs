@@ -8,8 +8,8 @@ use crate::{
         PointerButton, ScrollPhase, ScrollUnit,
     },
     interaction::{
-        AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, OverlayDismiss,
-        OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig, VirtualListConfig,
+        AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, ScrollAxis, ScrollConfig,
+        VirtualListConfig,
     },
     math::{DeviceRect, LogicalPoint, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
@@ -18,6 +18,10 @@ use crate::{
         primitive::Primitive,
         style::{Clip, FocusRing, PaintSpec, Style, StylePatch},
         style_builder::StyleBuilder,
+    },
+    popup::{
+        Alignment, Anchor, DismissPolicy, FocusPolicy, InitialFocus, PlacementSpec, PopupAnimation,
+        PopupId, PopupSpec, PopupTier, RestoreFocus, Side,
     },
     window::{FrameOutcome, WindowId, WindowOptions},
 };
@@ -102,6 +106,55 @@ fn mount_scroll_container(app: &mut App, window: WindowId, height: f32) -> NodeI
         .style(style)
         .build(tree, root)
         .expect("mount")
+}
+
+fn point_anchor(x: f32, y: f32) -> Anchor {
+    Anchor::WindowRect(LogicalRect::new(px(x), px(y), px(0.0), px(0.0)))
+}
+
+fn at_point(x: f32, y: f32) -> PopupSpec {
+    let mut spec = PopupSpec::new(
+        point_anchor(x, y),
+        PlacementSpec {
+            gap: px(0.0),
+            fallbacks: Default::default(),
+            viewport_margin: px(0.0),
+            ..PlacementSpec::default()
+        },
+    );
+    spec.animation = PopupAnimation::None;
+    spec.focus = FocusPolicy::None;
+    spec
+}
+
+fn open_box(app: &mut App, window: WindowId, spec: PopupSpec, size: (f32, f32)) -> PopupId {
+    app.open_popup(
+        window,
+        spec,
+        move |app, window, content| {
+            NodeBuilder::boxed()
+                .style(StyleBuilder::new().size(px(size.0), px(size.1)).build())
+                .build(app.window_mut(window).expect("window").tree_mut(), content)?;
+            Ok(())
+        },
+        None,
+    )
+    .expect("popup")
+}
+
+fn popup_len(app: &App, window: WindowId) -> usize {
+    app.popup_stack(window)
+        .map_or(0, |stack| stack.entries.len())
+}
+
+fn popup_content(app: &App, window: WindowId, id: PopupId) -> NodeId {
+    app.popup_stack(window)
+        .expect("popup stack")
+        .entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("popup entry")
+        .node
 }
 
 #[test]
@@ -1706,53 +1759,31 @@ fn anchor_placement_converges_with_a_root_border() {
     );
     frame(&mut app, window);
 
-    let overlay = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Anchor {
-                    node: anchor,
-                    side: crate::interaction::AnchorSide::Below,
-                    gap: 4.0,
-                },
-                dismiss: OverlayDismiss::Explicit,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("overlay");
-    let overlay_node = overlay.node();
-    let style = StyleBuilder::new()
-        .absolute()
-        .size(px(60.0), px(30.0))
-        .build();
-    app.window_mut(window)
-        .expect("window")
-        .tree_mut()
-        .set_style(overlay_node, style)
-        .expect("style");
-    frame(&mut app, window);
+    let mut spec = PopupSpec::new(
+        Anchor::Node { node: anchor },
+        PlacementSpec {
+            side: Side::Bottom,
+            align: Alignment::Start,
+            gap: px(4.0),
+            fallbacks: Default::default(),
+            ..PlacementSpec::default()
+        },
+    );
+    spec.animation = PopupAnimation::None;
+    spec.focus = FocusPolicy::None;
+    let id = open_box(&mut app, window, spec, (60.0, 30.0));
     frame(&mut app, window);
 
-    let bounds = app
-        .window(window)
-        .expect("window")
-        .tree()
-        .get(overlay_node)
-        .expect("overlay node")
-        .layout()
-        .bounds;
+    let bounds = app.popup_rect(id).expect("popup rect").hit;
     assert!(
         (bounds.origin.x - 100.0).abs() < px(0.5) && (bounds.origin.y - 124.0).abs() < px(0.5),
-        "浮层落点必须是窗口绝对坐标（Below: y = 100+20+4）：{bounds:?}"
+        "浮层落点必须是窗口绝对坐标（Bottom: y = 100+20+4）：{bounds:?}"
     );
 
     frame(&mut app, window);
     let _ = app.take_wake_request();
     frame(&mut app, window);
-    assert!(
-        !app.take_wake_request(),
-        "纠位必须收敛，不得每帧都重写 inset"
-    );
+    assert!(!app.take_wake_request(), "纠位必须收敛，不得每帧都重写定位");
 }
 
 #[test]
@@ -1767,135 +1798,50 @@ fn anchored_above_overlay_sits_above_the_anchor() {
     );
     frame(&mut app, window);
 
-    let overlay = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Anchor {
-                    node: anchor,
-                    side: crate::interaction::AnchorSide::Above,
-                    gap: 4.0,
-                },
-                dismiss: OverlayDismiss::Explicit,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("overlay");
-    let overlay_node = overlay.node();
-    let style = StyleBuilder::new()
-        .absolute()
-        .size(px(60.0), px(30.0))
-        .build();
-    app.window_mut(window)
-        .expect("window")
-        .tree_mut()
-        .set_style(overlay_node, style)
-        .expect("style");
+    let mut spec = PopupSpec::new(
+        Anchor::Node { node: anchor },
+        PlacementSpec {
+            side: Side::Top,
+            align: Alignment::Start,
+            gap: px(4.0),
+            fallbacks: Default::default(),
+            ..PlacementSpec::default()
+        },
+    );
+    spec.animation = PopupAnimation::None;
+    spec.focus = FocusPolicy::None;
+    let id = open_box(&mut app, window, spec, (60.0, 30.0));
     frame(&mut app, window);
     frame(&mut app, window);
     frame(&mut app, window);
 
-    let bounds = app
-        .window(window)
-        .expect("window")
-        .tree()
-        .get(overlay_node)
-        .expect("overlay")
-        .layout()
-        .bounds;
+    let bounds = app.popup_rect(id).expect("popup rect").hit;
     assert_eq!(
         (bounds.origin.x, bounds.origin.y, bounds.size.height),
         (px(100.0), px(66.0), px(30.0)),
-        "Above：y = 锚点顶 - gap - 自身高度（下边缘贴锚点），实际 {bounds:?}"
+        "Top：y = 锚点顶 - gap - 自身高度（下边缘贴锚点），实际 {bounds:?}"
     );
 }
 
 #[test]
-fn overlay_is_last_and_closes_on_outside_click() {
-    let (_rt, mut app, window) = setup();
-    let root = root_of(&app, window);
-    let _background = mount_override(
-        &mut app,
-        window,
-        root,
-        LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)),
-    );
-    frame(&mut app, window);
-    let overlay = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(200.0), px(10.0))),
-                dismiss: OverlayDismiss::OutsideClick,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("overlay");
-    let overlay_node = overlay.node();
-    let style = StyleBuilder::new()
-        .absolute()
-        .left(px(200.0))
-        .top(px(10.0))
-        .size(px(80.0), px(80.0))
-        .build();
-    app.window_mut(window)
-        .expect("window")
-        .tree_mut()
-        .set_style(overlay_node, style)
-        .expect("style");
-    frame(&mut app, window);
-
-    assert_eq!(
-        app.window(window)
-            .expect("window")
-            .tree()
-            .dfs_ids()
-            .last()
-            .copied(),
-        Some(overlay_node),
-        "浮层必须是 DFS 先序的最后一个子树"
-    );
-    assert_eq!(app.overlays(window).len(), 1);
-    assert_eq!(
-        app.window(window)
-            .expect("window")
-            .tree()
-            .hit_test(LogicalPoint::new(px(210.0), px(20.0)))
-            .map(|hit| hit.node),
-        Some(overlay_node),
-        "浮层优先命中"
-    );
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_down(
-            LogicalPoint::new(px(10.0), px(10.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-    assert!(app.overlays(window).is_empty(), "点击外部关闭");
-}
-
-#[test]
-fn dismiss_action_closes_the_topmost_overlay_including_explicit() {
+fn dismiss_action_closes_the_topmost_popup_including_explicit() {
     let (_rt, mut app, window) = setup();
     frame(&mut app, window);
-    let overlay = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::ZERO),
-                dismiss: OverlayDismiss::Explicit,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("overlay");
+    let mut spec = at_point(0.0, 0.0);
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: false,
+        escape: true,
+    };
+    let id = open_box(&mut app, window, spec, (20.0, 20.0));
     let root = root_of(&app, window);
 
     assert!(app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic));
-    assert!(app.overlays(window).is_empty(), "Dismiss 关 Explicit 浮层");
-    assert!(!app.close_overlay(&overlay), "重复关闭返回 false");
+    assert_eq!(popup_len(&app, window), 0, "Dismiss 关 Explicit 弹层");
+    assert!(app.popup_rect(id).is_none(), "关闭后弹层不再有几何");
+    assert!(
+        !app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic),
+        "没有弹层时 Dismiss 返回 false"
+    );
 }
 
 #[test]
@@ -2017,31 +1963,23 @@ fn animation_ticks_write_the_transient_and_end_in_idle() {
 #[test]
 fn closed_window_returns_unknown_window() {
     let (_rt, mut app, window) = setup();
-    let overlay = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::ZERO),
-                dismiss: OverlayDismiss::Explicit,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("overlay");
+    let _id = open_box(&mut app, window, at_point(0.0, 0.0), (20.0, 20.0));
     let transient = app.transient(0.0_f32);
     assert!(app.close_window(window));
-    let _ = overlay;
+    assert!(app.popup_stack(window).is_none());
 
     let error = app
-        .create_overlay(
+        .open_popup(
             window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::ZERO),
-                dismiss: OverlayDismiss::Explicit,
-                ..OverlayOptions::default()
-            },
+            at_point(0.0, 0.0),
+            |_app, _window, _content| Ok(()),
+            None,
         )
         .expect_err("窗口已关闭");
-    assert!(matches!(error, EngineError::UnknownWindow { window: closed } if closed == window));
+    assert!(matches!(
+        error,
+        crate::popup::PopupError::UnknownWindow { window: closed } if closed == window
+    ));
 
     let error = app
         .animate(
@@ -2071,57 +2009,6 @@ fn hit_after_scrolling_50_lands_on_the_second_row() {
         .hit_test(LogicalPoint::new(px(50.0), px(60.0)))
         .expect("hit");
     assert_eq!(hit.local_point, LogicalPoint::new(px(50.0), px(10.0)));
-}
-
-#[test]
-fn overlay_outside_click_consumes_the_whole_press() {
-    let (_rt, mut app, window) = setup();
-    let calls = Rc::new(Cell::new(0_u32));
-    let seen = calls.clone();
-    app.on_action(Action::custom("under"), move |_ctx| {
-        seen.set(seen.get() + 1)
-    });
-    let root = root_of(&app, window);
-    let button = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)))
-        .paint(background())
-        .on_click(Action::custom("under"))
-        .build(app.window_mut(window).expect("window").tree_mut(), root)
-        .expect("mount");
-    frame(&mut app, window);
-    app.create_overlay(
-        window,
-        OverlayOptions {
-            placement: OverlayPlacement::Point(LogicalPoint::new(px(200.0), px(10.0))),
-            dismiss: OverlayDismiss::OutsideClick,
-            ..OverlayOptions::default()
-        },
-    )
-    .expect("overlay");
-    frame(&mut app, window);
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_down(
-            LogicalPoint::new(px(20.0), px(20.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-    let up = app.dispatch_input(
-        window,
-        InputEvent::pointer_up(
-            LogicalPoint::new(px(20.0), px(20.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-
-    assert!(app.overlays(window).is_empty(), "按下即关浮层");
-    assert_eq!(calls.get(), 0, "这次按下必须整体消费");
-    assert_eq!(up.action, None);
-    assert_eq!(up.click_count, 0);
-    let _ = button;
 }
 
 #[test]
@@ -3024,91 +2911,6 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
 }
 
 #[test]
-fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
-    let (_rt, mut app, window) = setup();
-    let root = root_of(&app, window);
-    let opener = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
-        .on_click(Action::custom("opener"))
-        .build(app.window_mut(window).expect("window").tree_mut(), root)
-        .expect("mount");
-    let background = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(50.0), px(0.0), px(40.0), px(40.0)))
-        .on_click(Action::custom("background"))
-        .build(app.window_mut(window).expect("window").tree_mut(), root)
-        .expect("mount");
-    frame(&mut app, window);
-    assert!(app.set_focus(window, Some(opener)));
-    let _ = app.drain_events();
-
-    let overlay = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(100.0), px(100.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                restore_focus: true,
-                a11y: crate::a11y::A11yOverride::default(),
-            },
-        )
-        .expect("overlay");
-    let first = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(110.0), px(110.0), px(40.0), px(20.0)))
-        .on_click(Action::custom("first"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            overlay.node(),
-        )
-        .expect("mount");
-    let second = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(160.0), px(110.0), px(40.0), px(20.0)))
-        .on_click(Action::custom("second"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            overlay.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-
-    assert!(
-        !app.set_focus(window, Some(background)),
-        "模态外节点不可聚焦"
-    );
-    assert_eq!(
-        app.focused(window),
-        None,
-        "模态打开后作用域外的焦点不得再被报告"
-    );
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_move(LogicalPoint::new(px(5.0), px(5.0)), Modifiers::empty()),
-    );
-    assert_eq!(
-        app.focused(window),
-        Some(first),
-        "焦点修复：移入模态内第一个可聚焦节点"
-    );
-    app.dispatch_input(
-        window,
-        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
-    );
-    assert_eq!(app.focused(window), Some(second));
-    app.dispatch_input(
-        window,
-        InputEvent::key_down(KeyCode::Tab, Modifiers::empty()),
-    );
-    assert_eq!(app.focused(window), Some(first), "Tab 在浮层内回绕");
-
-    assert!(app.close_overlay(&overlay));
-    assert_eq!(
-        app.focused(window),
-        Some(opener),
-        "关闭必须恢复 opener 焦点"
-    );
-}
-
-#[test]
 fn the_event_buffer_is_bounded() {
     let (_rt, mut app, window) = setup();
     let capacity = super::event_queue::EVENT_QUEUE_CAPACITY;
@@ -3232,242 +3034,6 @@ fn scrollable_container(app: &mut App, window: WindowId) -> NodeId {
 }
 
 #[test]
-fn a_popup_opened_from_a_modal_receives_clicks() {
-    let (_rt, mut app, window) = setup();
-    let clicks = Rc::new(Cell::new(0_u32));
-    let seen = clicks.clone();
-    app.on_action(Action::custom("menu.item"), move |_ctx| {
-        seen.set(seen.get() + 1);
-    });
-    let root = root_of(&app, window);
-    let background = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(400.0), px(300.0)))
-        .on_click(Action::custom("background"))
-        .build(app.window_mut(window).expect("window").tree_mut(), root)
-        .expect("mount");
-    frame(&mut app, window);
-    assert!(app.set_focus(window, Some(background)));
-
-    let modal = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(20.0), px(20.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                restore_focus: true,
-                a11y: crate::a11y::A11yOverride::default(),
-            },
-        )
-        .expect("modal");
-    let confirm = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(24.0)))
-        .on_click(Action::custom("modal.confirm"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            modal.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_move(LogicalPoint::new(px(5.0), px(5.0)), Modifiers::empty()),
-    );
-    assert_eq!(app.focused(window), Some(confirm), "焦点必须移入模态");
-
-    let menu = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(120.0), px(60.0))),
-                dismiss: OverlayDismiss::OutsideClick,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("menu");
-    let item = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(20.0)))
-        .on_click(Action::custom("menu.item"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            menu.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-
-    let position = LogicalPoint::new(px(140.0), px(78.0));
-    assert_eq!(
-        app.hit_at(window, position).map(|hit| hit.node),
-        Some(item),
-        "命中必须落在菜单项上"
-    );
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_down(position, PointerButton::Primary, Modifiers::empty()),
-    );
-    let outcome = app.dispatch_input(
-        window,
-        InputEvent::pointer_up(position, PointerButton::Primary, Modifiers::empty()),
-    );
-    assert_eq!(outcome.click_count, 1, "模态之上的菜单项必须收到点击");
-    assert_eq!(clicks.get(), 1, "菜单项的动作必须派发");
-}
-
-#[test]
-fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
-    let (_rt, mut app, window) = setup();
-    let clicks = Rc::new(Cell::new(0_u32));
-    let seen = clicks.clone();
-    app.on_action(Action::custom("menu.item"), move |_ctx| {
-        seen.set(seen.get() + 1);
-    });
-    let root = root_of(&app, window);
-    let background_button = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0)))
-        .on_click(Action::custom("background"))
-        .build(app.window_mut(window).expect("window").tree_mut(), root)
-        .expect("mount");
-    frame(&mut app, window);
-    assert!(app.set_focus(window, Some(background_button)));
-
-    let modal = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(20.0), px(20.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                restore_focus: true,
-                a11y: crate::a11y::A11yOverride::default(),
-            },
-        )
-        .expect("modal");
-    let menu = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(120.0), px(60.0))),
-                dismiss: OverlayDismiss::OutsideClick,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("menu");
-    let confirm = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(30.0), px(30.0), px(60.0), px(24.0)))
-        .on_click(Action::custom("modal.confirm"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            modal.node(),
-        )
-        .expect("mount");
-    let item = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(20.0)))
-        .on_click(Action::custom("menu.item"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            menu.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-
-    assert_eq!(
-        app.focused(window),
-        None,
-        "模态打开后作用域外的焦点视为无焦点"
-    );
-
-    let position = LogicalPoint::new(px(140.0), px(78.0));
-    assert_eq!(
-        app.hit_at(window, position).map(|hit| hit.node),
-        Some(item),
-        "命中必须落在菜单项上"
-    );
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_down(position, PointerButton::Primary, Modifiers::empty()),
-    );
-    let outcome = app.dispatch_input(
-        window,
-        InputEvent::pointer_up(position, PointerButton::Primary, Modifiers::empty()),
-    );
-    assert_eq!(outcome.click_count, 1, "模态之后立即打开的菜单必须可点");
-    assert_eq!(outcome.target, Some(item));
-    assert_eq!(clicks.get(), 1, "菜单项的动作必须派发");
-    let _ = confirm;
-}
-
-#[test]
-fn a_popup_opened_without_any_focus_still_receives_clicks() {
-    let (_rt, mut app, window) = setup();
-    let clicks = Rc::new(Cell::new(0_u32));
-    let seen = clicks.clone();
-    app.on_action(Action::custom("menu.item"), move |_ctx| {
-        seen.set(seen.get() + 1);
-    });
-    let root = root_of(&app, window);
-    let _background = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0)))
-        .build(app.window_mut(window).expect("window").tree_mut(), root)
-        .expect("mount");
-    frame(&mut app, window);
-    assert_eq!(app.focused(window), None, "前置：没有焦点");
-
-    let modal = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(20.0), px(20.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                restore_focus: true,
-                a11y: crate::a11y::A11yOverride::default(),
-            },
-        )
-        .expect("modal");
-    let menu = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(120.0), px(60.0))),
-                dismiss: OverlayDismiss::OutsideClick,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("menu");
-    let _confirm = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(30.0), px(30.0), px(60.0), px(24.0)))
-        .on_click(Action::custom("modal.confirm"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            modal.node(),
-        )
-        .expect("mount");
-    let item = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(20.0)))
-        .on_click(Action::custom("menu.item"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            menu.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-
-    let position = LogicalPoint::new(px(140.0), px(78.0));
-    assert_eq!(app.hit_at(window, position).map(|hit| hit.node), Some(item));
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_down(position, PointerButton::Primary, Modifiers::empty()),
-    );
-    let outcome = app.dispatch_input(
-        window,
-        InputEvent::pointer_up(position, PointerButton::Primary, Modifiers::empty()),
-    );
-    assert_eq!(outcome.click_count, 1, "无焦点时打开的菜单同样必须可点");
-    assert_eq!(clicks.get(), 1);
-}
-
-#[test]
 fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
     let (_rt, mut app, window) = setup();
     let activations = Rc::new(Cell::new(0_u32));
@@ -3500,31 +3066,39 @@ fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
     assert_eq!(app.focused(window), None, "前置：图表区不抢焦点");
     let _ = chart;
 
-    let modal = app
-        .create_overlay(
+    let slot = Rc::new(Cell::new(None));
+    let created = slot.clone();
+    let mut spec = at_point(40.0, 40.0);
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::FirstFocusable,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: false,
+        escape: true,
+    };
+    let _modal = app
+        .open_popup(
             window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(40.0), px(40.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                restore_focus: true,
-                a11y: crate::a11y::A11yOverride::default(),
+            spec,
+            move |app, window, content| {
+                let ok = NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(60.0), px(24.0)).build())
+                    .on_click(Action::custom("modal.ok"))
+                    .build(app.window_mut(window).expect("window").tree_mut(), content)?;
+                created.set(Some(ok));
+                Ok(())
             },
+            None,
         )
         .expect("modal");
-    let ok = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
-        .on_click(Action::custom("modal.ok"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            modal.node(),
-        )
-        .expect("mount");
+    let ok = slot.get().expect("ok button");
     frame(&mut app, window);
     assert_eq!(
         app.focused(window),
-        None,
-        "创建瞬间还没有候选（子节点在 create_overlay 之后才挂载）"
+        Some(ok),
+        "打开瞬间就必须把焦点交给模态内第一个可聚焦节点"
     );
 
     let outcome = app.dispatch_input(
@@ -3559,27 +3133,41 @@ fn enter_cannot_activate_a_background_button_behind_a_modal() {
     frame(&mut app, window);
     assert!(app.set_focus(window, Some(background)));
 
+    let slot = Rc::new(Cell::new(None));
+    let created = slot.clone();
+    let mut spec = at_point(200.0, 100.0);
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::FirstFocusable,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: false,
+        escape: true,
+    };
+    spec.opener = Some(background);
     let modal = app
-        .create_overlay(
+        .open_popup(
             window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(200.0), px(100.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                restore_focus: true,
-                a11y: crate::a11y::A11yOverride::default(),
+            spec,
+            move |app, window, content| {
+                let ok = NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(60.0), px(24.0)).build())
+                    .on_click(Action::custom("modal.ok"))
+                    .build(app.window_mut(window).expect("window").tree_mut(), content)?;
+                created.set(Some(ok));
+                Ok(())
             },
+            None,
         )
         .expect("modal");
-    let ok = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
-        .on_click(Action::custom("modal.ok"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            modal.node(),
-        )
-        .expect("mount");
+    let ok = slot.get().expect("ok button");
     frame(&mut app, window);
+    assert_eq!(
+        app.modal_scope(window),
+        Some(popup_content(&app, window, modal)),
+        "模态作用域根必须可查询"
+    );
 
     let outcome = app.dispatch_input(
         window,
@@ -3613,7 +3201,8 @@ fn enter_cannot_activate_a_background_button_behind_a_modal() {
 
     let root = root_of(&app, window);
     assert!(app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic));
-    assert!(app.overlays(window).is_empty(), "Dismiss 必须关掉模态");
+    assert_eq!(popup_len(&app, window), 0, "Dismiss 必须关掉模态");
+    assert_eq!(app.modal_scope(window), None, "关闭后模态作用域必须清空");
 }
 
 #[test]
@@ -3882,329 +3471,4 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
         px(3.0),
         "纵向分量必须传给外层容器"
     );
-}
-
-#[test]
-fn an_overlay_a11y_role_is_declared_explicitly_and_the_modal_scope_is_queryable() {
-    let (_rt, mut app, window) = setup();
-    frame(&mut app, window);
-    assert_eq!(app.modal_scope(window), None, "没有模态浮层");
-
-    let menu = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(120.0), px(60.0))),
-                dismiss: OverlayDismiss::OutsideClick,
-                a11y: crate::a11y::A11yOverride {
-                    role: Some(crate::a11y::A11yRole::Menu),
-                    label: Some(smol_str::SmolStr::new_static("交易菜单")),
-                    ..crate::a11y::A11yOverride::default()
-                },
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("menu");
-    frame(&mut app, window);
-    let snapshot = app.a11y_take(window).expect("首笔 a11y 交付");
-    let menu_record = snapshot
-        .node_for(menu.node())
-        .expect("浮层包装必须出现在 a11y 树里");
-    assert_eq!(
-        menu_record.role,
-        crate::a11y::A11yRole::Menu,
-        "显式 Menu 角色必须生效（不得被浮层 kind 覆盖成 Dialog）"
-    );
-    assert_eq!(menu_record.label_text(), Some("交易菜单"));
-    assert!(
-        menu_record.actions.is_empty(),
-        "菜单包装不得自动宣告 Expand/Collapse：{:?}",
-        menu_record.actions
-    );
-    assert!(!menu_record.hidden);
-
-    let modal = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(20.0), px(20.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                a11y: crate::a11y::A11yOverride {
-                    role: Some(crate::a11y::A11yRole::Dialog),
-                    label: Some(smol_str::SmolStr::new_static("确认下单")),
-                    ..crate::a11y::A11yOverride::default()
-                },
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("modal");
-    assert_eq!(
-        app.modal_scope(window),
-        Some(modal.node()),
-        "模态作用域根必须可查询"
-    );
-    let confirm = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(24.0)))
-        .on_click(Action::custom("modal.confirm"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            modal.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-    let snapshot = app.a11y_take(window).expect("模态打开必须交付 a11y 增量");
-    let modal_record = snapshot.node_for(modal.node()).expect("模态包装");
-    assert_eq!(modal_record.role, crate::a11y::A11yRole::Dialog);
-    assert!(
-        modal_record.modal,
-        "a11y modal 必须跟 trap_focus 走（引擎真值），与角色无关"
-    );
-    assert!(!modal_record.hidden);
-    assert!(
-        !snapshot.node_for(confirm).expect("确认按钮").hidden,
-        "模态子树对 AT 必须可见"
-    );
-    assert!(
-        snapshot.node_for(menu.node()).expect("菜单").hidden,
-        "模态作用域外的浮层必须 aria-hidden（tooltip / 菜单不得被 AT 读到）"
-    );
-
-    assert!(app.close_overlay(&modal));
-    assert_eq!(app.modal_scope(window), None);
-    frame(&mut app, window);
-    let snapshot = app.a11y_take(window).expect("模态关闭必须交付 a11y 增量");
-    assert!(
-        !snapshot.node_for(menu.node()).expect("菜单").hidden,
-        "模态关闭后背景必须重新可见"
-    );
-}
-
-#[test]
-fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
-    let (_rt, mut app, window) = setup();
-    let root = root_of(&app, window);
-    let trigger = mount_override(
-        &mut app,
-        window,
-        root,
-        LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)),
-    );
-    frame(&mut app, window);
-    let _ = app.drain_events();
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(50.0)), Modifiers::empty()),
-    );
-    assert_eq!(app.hovered(window), Some(trigger));
-    let _ = app.drain_events();
-
-    let modal = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(200.0), px(0.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("modal");
-    let confirm = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(40.0)))
-        .on_click(Action::custom("modal.confirm"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            modal.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-
-    assert_eq!(
-        app.hovered(window),
-        None,
-        "模态一打开，背景悬停必须立即失效（tooltip 不得留在模态之上）"
-    );
-    let hover_event = app
-        .drain_events()
-        .into_iter()
-        .find_map(|(_, event)| match event {
-            Event::HoverChanged { hovered, left, .. } => Some((hovered, left)),
-            _ => None,
-        })
-        .expect("作用域外悬停结束必须派生 HoverChanged");
-    assert_eq!(hover_event.0, None);
-    assert!(
-        hover_event.1.contains(&trigger),
-        "背景触发器必须收到 leave：{:?}",
-        hover_event.1
-    );
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_move(LogicalPoint::new(px(60.0), px(60.0)), Modifiers::empty()),
-    );
-    assert_eq!(app.hovered(window), None);
-    assert!(
-        app.drain_events()
-            .into_iter()
-            .all(|(_, event)| !matches!(event, Event::HoverChanged { .. })),
-        "背景被模态挡住时不得产生悬停迁移事件"
-    );
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_move(LogicalPoint::new(px(215.0), px(15.0)), Modifiers::empty()),
-    );
-    assert_eq!(app.hovered(window), Some(confirm), "模态内部的悬停必须正常");
-
-    let menu = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(300.0), px(100.0))),
-                dismiss: OverlayDismiss::OutsideClick,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("menu");
-    let item = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(20.0)))
-        .on_click(Action::custom("menu.item"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            menu.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_move(LogicalPoint::new(px(320.0), px(118.0)), Modifiers::empty()),
-    );
-    assert_eq!(
-        app.hovered(window),
-        Some(item),
-        "属于模态的弹出层必须可悬停（对话框里的下拉菜单）"
-    );
-}
-
-#[test]
-fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
-    let (_rt, mut app, window) = setup();
-    let clicks = Rc::new(Cell::new(0_u32));
-    let seen = clicks.clone();
-    app.on_action(Action::custom("background"), move |_ctx| {
-        seen.set(seen.get() + 1);
-    });
-    let ok_clicks = Rc::new(Cell::new(0_u32));
-    let seen_ok = ok_clicks.clone();
-    app.on_action(Action::custom("modal.ok"), move |_ctx| {
-        seen_ok.set(seen_ok.get() + 1);
-    });
-    let root = root_of(&app, window);
-    let background = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)))
-        .on_click(Action::custom("background"))
-        .build(app.window_mut(window).expect("window").tree_mut(), root)
-        .expect("mount");
-    frame(&mut app, window);
-    assert!(app.set_focus(window, Some(background)));
-
-    let modal = app
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(150.0), px(50.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                ..OverlayOptions::default()
-            },
-        )
-        .expect("modal");
-    let ok = NodeBuilder::boxed()
-        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
-        .on_click(Action::custom("modal.ok"))
-        .build(
-            app.window_mut(window).expect("window").tree_mut(),
-            modal.node(),
-        )
-        .expect("mount");
-    frame(&mut app, window);
-
-    let snapshot = app.a11y_take(window).expect("a11y 交付");
-    assert_ne!(
-        snapshot.focus_node().engine,
-        background,
-        "作用域外的背景不得成为 a11y 焦点"
-    );
-
-    assert!(
-        !app.set_focus(window, Some(background)),
-        "模态作用域外的节点不得获得焦点"
-    );
-    app.focus_next(window);
-    assert_eq!(app.focused(window), Some(ok), "Tab 必须落在模态内");
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_down(
-            LogicalPoint::new(px(50.0), px(50.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_up(
-            LogicalPoint::new(px(50.0), px(50.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-    assert_eq!(clicks.get(), 0, "模态作用域外的点击不得派发");
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_down(
-            LogicalPoint::new(px(170.0), px(70.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_up(
-            LogicalPoint::new(px(170.0), px(70.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-    assert_eq!(ok_clicks.get(), 1, "模态内的点击必须正常派发");
-
-    assert!(app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic));
-    assert_eq!(app.modal_scope(window), None, "Esc/Dismiss 必须关掉模态");
-
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(50.0)), Modifiers::empty()),
-    );
-    assert_eq!(app.hovered(window), Some(background));
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_down(
-            LogicalPoint::new(px(50.0), px(50.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-    app.dispatch_input(
-        window,
-        InputEvent::pointer_up(
-            LogicalPoint::new(px(50.0), px(50.0)),
-            PointerButton::Primary,
-            Modifiers::empty(),
-        ),
-    );
-    assert_eq!(clicks.get(), 1, "模态关闭后背景点击必须恢复");
 }

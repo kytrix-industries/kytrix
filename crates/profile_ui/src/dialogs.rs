@@ -46,13 +46,7 @@ pub(crate) fn build(
     DialogBuilder::alert(title, move |dialog, _theme| {
         alert(dialog.clone(), Rc::clone(&content))
     })
-    .build(
-        app,
-        host.theme().clone(),
-        host.layer().clone(),
-        host.animation(),
-        key,
-    )
+    .build(app, host.theme().clone(), key)
 }
 
 fn alert(dialog: Dialog, content: Rc<AlertContent>) -> AlertBuilder {

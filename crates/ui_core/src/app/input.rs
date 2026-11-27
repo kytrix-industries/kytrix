@@ -10,7 +10,7 @@ use crate::{
     },
     interaction::{
         ActionCtx, DragInfo, DragPhase, DragSession, DragState, InputThresholds, PendingDrag,
-        PressRecord, ScrollHandle, drag as drag_util, focus, overlay as overlay_util, scroll,
+        PressRecord, ScrollHandle, drag as drag_util, focus, scroll,
     },
     layout::hit_test::HitResult,
     math::{LogicalPoint, LogicalPx, px},
@@ -33,15 +33,9 @@ pub(crate) fn dispatch_action(
     if !matches!(
         action,
         Action::FocusNext | Action::FocusPrev | Action::Dismiss
-    ) {
-        let scope = app.modal_scope(window);
-        let in_scope = app
-            .windows
-            .get(&window)
-            .is_some_and(|target| focus::in_scope(target.tree(), node, scope));
-        if !in_scope {
-            return false;
-        }
+    ) && !crate::app::focus::in_input_scope(app, window, node)
+    {
+        return false;
     }
     app.dispatch_action_with_hit(window, node, action, source, None, Modifiers::empty())
 }
@@ -96,7 +90,7 @@ pub(crate) fn dispatch_action_with_hit(
             app.focus_prev(window);
             true
         }
-        Action::Dismiss => app.dismiss_overlay(window),
+        Action::Dismiss => crate::popup::dismiss::escape(app, window),
         Action::Custom(_) => false,
     }
 }
@@ -221,30 +215,24 @@ pub(crate) fn on_pointer_down(
     {
         return false;
     }
+    if crate::popup::dismiss::on_pointer_down(app, window, position)
+        == crate::popup::dismiss::PressRouting::Consume
+    {
+        if let Some(target) = app.windows.get_mut(&window) {
+            let pointer = target.pointer_mut();
+            pointer.press = None;
+            pointer.pending_drag = None;
+            pointer.suppress_release = true;
+        }
+        return true;
+    }
     crate::text_edit::cancel_pointer_press(app, window);
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
-    let outside = app.windows.get(&window).and_then(|target| {
-        let tree = target.tree();
-        overlay_util::outside_click_target(tree, tree.root(), hit.map(|result| result.node))
-    });
-    if let Some((node, _)) = outside {
-        if let Some(target) = app.windows.get_mut(&window) {
-            target.pointer_mut().press = None;
-            target.pointer_mut().pending_drag = None;
-        }
-        let _ = app.remove_node(window, node);
+    if crate::app::focus::scope_active(app, window)
+        && !hit.is_some_and(|result| crate::app::focus::in_input_scope(app, window, result.node))
+    {
         return false;
-    }
-    if let Some(scope) = app.modal_scope(window) {
-        let inside = app.windows.get(&window).is_some_and(|target| {
-            hit.is_some_and(|result| {
-                overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
-            })
-        });
-        if !inside {
-            return false;
-        }
     }
     if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
@@ -436,8 +424,19 @@ pub(crate) fn on_pointer_up(
     timestamp: Instant,
     outcome: &mut InputOutcome,
 ) -> bool {
+    let suppressed = app
+        .windows
+        .get_mut(&window)
+        .is_some_and(|target| std::mem::take(&mut target.pointer_mut().suppress_release));
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
+    if suppressed {
+        if let Some(target) = app.windows.get_mut(&window) {
+            target.pointer_mut().press = None;
+            target.pointer_mut().pending_drag = None;
+        }
+        return true;
+    }
     if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
         pointer.modifiers = modifiers;
@@ -586,13 +585,10 @@ pub(crate) fn on_scroll(
     let Some(result) = hit else {
         return;
     };
-    if let Some(scope) = app.modal_scope(window) {
-        let inside = app.windows.get(&window).is_some_and(|target| {
-            overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
-        });
-        if !inside {
-            return;
-        }
+    if crate::app::focus::scope_active(app, window)
+        && !crate::app::focus::in_input_scope(app, window, result.node)
+    {
+        return;
     }
     let (delta_x, delta_y) = if modifiers.contains(Modifiers::SHIFT) {
         (delta.y, delta.x)
@@ -720,10 +716,9 @@ pub(crate) fn on_key(
     if !repeat {
         if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
             let focused = app.focused(window);
-            let scope = app.modal_scope(window);
             let activation = app.windows.get(&window).and_then(|target| {
                 focused
-                    .filter(|node| focus::in_scope(target.tree(), *node, scope))
+                    .filter(|node| crate::app::focus::in_input_scope(app, window, *node))
                     .and_then(|node| focus::action_target(target.tree(), node))
             });
             if let Some((node, action)) = activation {
@@ -795,16 +790,20 @@ pub(crate) fn on_key(
             let Some(node) = node else {
                 return false;
             };
-            if app.dispatch_action_with_hit(
+            let handled = app.dispatch_action_with_hit(
                 window,
                 node,
                 action.clone(),
                 ActionSource::Key,
                 None,
                 modifiers,
-            ) {
-                outcome.action = Some(action);
+            );
+            if handled {
+                outcome.action = Some(action.clone());
                 outcome.target = Some(node);
+            }
+            if handled && action == Action::Dismiss {
+                return true;
             }
             return false;
         }
@@ -903,6 +902,7 @@ pub(crate) fn on_window_focus_lost(app: &mut App, window: WindowId) {
     app.held_keys.remove(&window);
     app.consumed_keys.remove(&window);
     crate::text_edit::cancel_composition_on_focus_loss(app, window);
+    crate::popup::dismiss::window_deactivated(app, window);
     if app
         .windows
         .get_mut(&window)
@@ -944,6 +944,7 @@ pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
         let pointer = target.pointer_mut();
         pointer.press = None;
         pointer.pending_drag = None;
+        pointer.suppress_release = false;
         pointer.cursor = Cursor::Default;
     }
     update_hover(app, window, None);
@@ -972,9 +973,8 @@ fn update_hover(app: &mut App, window: WindowId, mut next: Option<NodeId>) {
             return;
         };
         let tree = target.tree();
-        let scope = overlay_util::focus_scope_root(tree, tree.root());
         next = next.filter(|node| {
-            tree.get(*node).is_ok() && overlay_util::in_modal_scope(tree, *node, scope)
+            tree.get(*node).is_ok() && crate::app::focus::in_input_scope(app, window, *node)
         });
         let previous = target
             .pointer()
@@ -1025,14 +1025,6 @@ fn update_hover(app: &mut App, window: WindowId, mut next: Option<NodeId>) {
         },
     );
     app.request_frame();
-}
-
-pub(crate) fn revalidate_hover(app: &mut App, window: WindowId) {
-    let next = app
-        .windows
-        .get(&window)
-        .and_then(|target| target.pointer().hovered);
-    update_hover(app, window, next);
 }
 
 pub(crate) fn cleanup_removed_pointer_state(
@@ -1105,8 +1097,7 @@ pub(crate) fn cleanup_removed_pointer_state(
 fn update_cursor(app: &mut App, window: WindowId, hit: Option<HitResult>) {
     let cursor = app.windows.get(&window).map_or(Cursor::Default, |target| {
         let tree = target.tree();
-        let scope = overlay_util::focus_scope_root(tree, tree.root());
-        let hit = hit.filter(|result| overlay_util::in_modal_scope(tree, result.node, scope));
+        let hit = hit.filter(|result| crate::app::focus::in_input_scope(app, window, result.node));
         let editable = hit.is_some_and(|result| {
             tree.editable(result.node)
                 .is_some_and(|editable| !editable.spec().disabled)

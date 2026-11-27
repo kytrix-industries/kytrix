@@ -1,7 +1,7 @@
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
-use super::{LayoutBox, Node, NodeKind, NodeSpec, NodeTree, layout::LayoutStats};
+use super::{HitFocusSkip, LayoutBox, Node, NodeKind, NodeSpec, NodeTree, layout::LayoutStats};
 use crate::{
     error::EngineError,
     event::Action,
@@ -72,6 +72,8 @@ pub(crate) fn new() -> NodeTree {
         clip_keys: vec![None],
         baked_screen_bounds: vec![None],
         painted_extents: vec![None],
+        popup_transforms: vec![None],
+        popup_pointer_transparent: vec![false],
         subtree_bounds: vec![LogicalRect::default()],
         a11y_slots: vec![None],
         images_need_refresh: false,
@@ -85,7 +87,6 @@ pub(crate) fn new() -> NodeTree {
         moved_nodes: DirtySet::new(),
         scroll_containers: Vec::new(),
         virtual_containers: Vec::new(),
-        overlay_containers: Vec::new(),
         text_dirty: crate::node::tree::content::TextDirtyQueue::new(),
         text_layout_dirty: crate::node::tree::content::TextDirtyQueue::new(),
         removed_lanes: Vec::new(),
@@ -110,6 +111,9 @@ pub(crate) fn new() -> NodeTree {
         paint_full_frames: 0,
         paint_incremental_frames: 0,
         dirty_scratch: Vec::new(),
+        paint_tail: SmallVec::new(),
+        order_dirty: false,
+        popup_root: None,
         #[cfg(feature = "test-support")]
         scanned: std::cell::RefCell::new(ahash::HashSet::default()),
         bound_nodes: 0,
@@ -166,6 +170,28 @@ pub(crate) fn insert_child(
     spec: NodeSpec,
 ) -> Result<NodeId, EngineError> {
     tree.get(parent)?;
+    let id = insert_prepared(tree, parent, spec);
+    if let Some(editable) = tree.editable(id)
+        && let Err(detail) = editable.spec().validate()
+    {
+        let _ = remove(tree, id);
+        return Err(EngineError::TextEditSpecInvalid { node: id, detail });
+    }
+    Ok(id)
+}
+
+pub(crate) fn install_popup_root(tree: &mut NodeTree) -> NodeId {
+    let parent = tree.root;
+    let spec = NodeSpec::new(NodeKind::Box, super::popup_root_style(), None)
+        .with_hit_focus_skip(HitFocusSkip::Container)
+        .with_debug_id("popup-root");
+    let id = insert_prepared(tree, parent, spec);
+    pin_tail_child(tree, id);
+    tree.popup_root = Some(id);
+    id
+}
+
+fn insert_prepared(tree: &mut NodeTree, parent: NodeId, spec: NodeSpec) -> NodeId {
     let NodeSpec {
         kind,
         style,
@@ -183,15 +209,21 @@ pub(crate) fn insert_child(
         a11y,
         bind_a11y,
         tab_stop,
+        hit_focus_skip,
     } = spec;
     let bound = bind_style.is_some() || bind_text.is_some() || bind_a11y.is_some();
-    let interaction = (action.is_some() || drag.is_some() || focus_ring.is_some()).then(|| {
-        let mut slot = NodeInteraction::new();
-        slot.action = action;
-        slot.drag = drag;
-        slot.focus_ring = focus_ring;
-        Box::new(slot)
-    });
+    let interaction = (action.is_some()
+        || drag.is_some()
+        || focus_ring.is_some()
+        || hit_focus_skip != HitFocusSkip::None)
+        .then(|| {
+            let mut slot = NodeInteraction::new();
+            slot.action = action;
+            slot.drag = drag;
+            slot.focus_ring = focus_ring;
+            slot.hit_focus_skip = hit_focus_skip;
+            Box::new(slot)
+        });
     let id = tree.arena.insert_with(move |id| Node {
         id,
         parent: None,
@@ -222,12 +254,6 @@ pub(crate) fn insert_child(
         lane_offset: LogicalPoint::ZERO,
         paint_opacity: 1.0,
     });
-    if let Some(spec) = &editable
-        && let Err(detail) = spec.validate()
-    {
-        let _ = tree.arena.remove(id);
-        return Err(EngineError::TextEditSpecInvalid { node: id, detail });
-    }
     if tree
         .arena
         .get(id)
@@ -293,6 +319,10 @@ pub(crate) fn insert_child(
             .resize_with(index + 1, LogicalRect::default);
     }
     tree.subtree_bounds[index] = LogicalRect::default();
+    if tree.popup_transforms.len() <= index {
+        tree.popup_transforms.resize_with(index + 1, || None);
+    }
+
     if tree.a11y_slots.len() <= index {
         tree.a11y_slots.resize_with(index + 1, || None);
     }
@@ -309,8 +339,9 @@ pub(crate) fn insert_child(
     if let Some(node) = tree.arena.get_mut(id) {
         node.parent = Some(parent);
     }
+    let position = child_insert_position(tree, parent);
     if let Some(node) = tree.arena.get_mut(parent) {
-        node.children.push(id);
+        node.children.insert(position, id);
     }
     match tree.arena.get(id).map(Node::kind) {
         Some(NodeKind::Geometry(geometry)) => tree.bind_geometry_node(*geometry, id),
@@ -322,7 +353,7 @@ pub(crate) fn insert_child(
         _ => {}
     }
     tree.mark_structure(parent);
-    Ok(id)
+    id
 }
 
 pub(crate) fn append_child(
@@ -351,8 +382,9 @@ pub(crate) fn append_child(
     if let Some(node) = tree.arena.get_mut(child) {
         node.parent = Some(parent);
     }
+    let position = child_insert_position(tree, parent);
     if let Some(node) = tree.arena.get_mut(parent) {
-        node.children.push(child);
+        node.children.insert(position, child);
     }
     if !tree.scroll_containers.is_empty()
         && tree
@@ -364,6 +396,114 @@ pub(crate) fn append_child(
     }
     tree.mark_structure(parent);
     Ok(())
+}
+
+fn child_insert_position(tree: &NodeTree, parent: NodeId) -> usize {
+    let Some(parent_node) = tree.arena.get(parent) else {
+        return 0;
+    };
+    if parent != tree.root() || tree.paint_tail.is_empty() {
+        return parent_node.children.len();
+    }
+    let mut position = parent_node.children.len();
+    while position > 0
+        && tree
+            .paint_tail
+            .iter()
+            .any(|tail| *tail == parent_node.children[position - 1])
+    {
+        position -= 1;
+    }
+    position
+}
+
+pub(crate) fn pin_tail_child(tree: &mut NodeTree, node: NodeId) {
+    debug_assert!(
+        tree.get(node)
+            .is_ok_and(|target| target.parent() == Some(tree.root)),
+        "only root children can be pinned to the paint tail"
+    );
+    if !tree.paint_tail.contains(&node) {
+        tree.paint_tail.push(node);
+    }
+    if let Some(root) = tree.arena.get_mut(tree.root) {
+        root.children.retain(|existing| *existing != node);
+        root.children.push(node);
+    }
+    tree.mark_structure(tree.root);
+    tree.mark_order_dirty();
+    tree.mark_a11y(tree.root);
+    let _ = tree.mark_paint_without_damage(tree.root);
+}
+
+pub(crate) fn reorder_children(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    order: &[NodeId],
+) -> Result<(), EngineError> {
+    let current = tree.get(parent)?.children().to_vec();
+    if order.len() != current.len() {
+        return Err(EngineError::NodeSpecInvalid {
+            parent,
+            detail: SmolStr::new_static(
+                "reorder_children requires a full permutation of the parent's children",
+            ),
+        });
+    }
+    let mut seen: Vec<NodeId> = Vec::with_capacity(order.len());
+    for child in order {
+        if !current.contains(child) || seen.contains(child) {
+            return Err(EngineError::NodeSpecInvalid {
+                parent,
+                detail: SmolStr::new_static(
+                    "reorder_children requires a full permutation of the parent's children",
+                ),
+            });
+        }
+        seen.push(*child);
+    }
+    if current == order {
+        return Ok(());
+    }
+    let mut damage = LogicalRect::default();
+    let mut nodes: Vec<NodeId> = Vec::with_capacity(current.len());
+    for child in &current {
+        damage = damage.union(tree.subtree_bounds(*child));
+        nodes.clear();
+        tree.for_each_subtree(*child, |node| nodes.push(node));
+        for node in &nodes {
+            if let Some(extent) = tree.painted_extent(*node) {
+                damage = damage.union(extent.layout_bounds());
+            }
+        }
+    }
+    if let Some(node) = tree.arena.get_mut(parent) {
+        node.damage = node.damage.union(damage);
+        node.children.clear();
+        node.children.extend_from_slice(order);
+    }
+    if order.iter().any(|child| !tree.is_out_of_flow(*child)) {
+        tree.invalidate_layout(parent);
+    }
+    tree.mark_order_dirty();
+    mark_order_a11y(tree, parent);
+    let _ = tree.mark_paint_without_damage(parent);
+    Ok(())
+}
+
+fn mark_order_a11y(tree: &mut NodeTree, parent: NodeId) {
+    tree.mark_a11y(parent);
+    if tree.hit_focus_skip(parent) != HitFocusSkip::Container {
+        return;
+    }
+    let mut cursor = tree.get(parent).ok().and_then(|node| node.parent());
+    while let Some(current) = cursor {
+        tree.mark_a11y(current);
+        if tree.hit_focus_skip(current) != HitFocusSkip::Container {
+            return;
+        }
+        cursor = tree.get(current).ok().and_then(|node| node.parent());
+    }
 }
 
 pub(crate) fn remove(
@@ -462,6 +602,13 @@ pub(crate) fn remove(
         if let Some(slot) = tree.scroll_slot_of.get_mut(index) {
             *slot = 0;
         }
+
+        if let Some(slot) = tree.popup_transforms.get_mut(index) {
+            *slot = None;
+        }
+        if let Some(slot) = tree.popup_pointer_transparent.get_mut(index) {
+            *slot = false;
+        }
         if let Some(slot) = tree.a11y_slots.get_mut(index) {
             *slot = None;
         }
@@ -514,14 +661,14 @@ pub(crate) fn remove(
     if !tree.virtual_containers.is_empty() {
         tree.virtual_containers.retain(|id| !removed.contains(id));
     }
-    if !tree.overlay_containers.is_empty() {
-        tree.overlay_containers.retain(|id| !removed.contains(id));
-    }
     if !tree.image_nodes.is_empty() {
         tree.image_nodes.retain(|id| !removed.contains(id));
     }
     if !tree.canvas_nodes.is_empty() {
         tree.canvas_nodes.retain(|id| !removed.contains(id));
+    }
+    if !tree.paint_tail.is_empty() {
+        tree.paint_tail.retain(|id| !removed.contains(id));
     }
     tree.dirty_bind.shrink_stale();
     tree.dirty_layout.shrink_stale();
@@ -578,6 +725,7 @@ impl NodeSpec {
             a11y: None,
             bind_a11y: None,
             tab_stop: true,
+            hit_focus_skip: HitFocusSkip::None,
         }
     }
 
@@ -596,6 +744,11 @@ impl NodeSpec {
 
     pub(crate) fn with_tab_stop(mut self, tab_stop: bool) -> Self {
         self.tab_stop = tab_stop;
+        self
+    }
+
+    pub(crate) fn with_hit_focus_skip(mut self, hit_focus_skip: HitFocusSkip) -> Self {
+        self.hit_focus_skip = hit_focus_skip;
         self
     }
 

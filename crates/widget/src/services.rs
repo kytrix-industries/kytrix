@@ -7,10 +7,7 @@ use kytrix_service_provider::service::connector::KytrixServiceConnector;
 use market_participants_connector::connector::MarketParticipantsConnector;
 use tokio::runtime::Handle;
 use ui_core::{app::App, node::signal::Signal};
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
+use ui_kit::theme::handle::ThemeHandle;
 
 use crate::frame::FrameRouter;
 
@@ -25,9 +22,7 @@ pub struct WidgetServices {
     pub open_url: Rc<dyn Fn(&str)>,
     pub sound: Rc<dyn Fn(&'static str) -> Option<Bytes>>,
     pub reduce_motion: Signal<bool>,
-    pub layer: Rc<Layer>,
     pub frame_router: Rc<FrameRouter>,
-    pub animation_router: Rc<AnimationRouter>,
     pub runtime: Handle,
 }
 
@@ -47,18 +42,14 @@ impl WidgetServices {
         runtime: Handle,
         translate: Translate,
         theme: ThemeHandle,
-        layer: Rc<Layer>,
         frame_router: Rc<FrameRouter>,
-        animation_router: Rc<AnimationRouter>,
     ) -> WidgetServicesBuilder<'_> {
         WidgetServicesBuilder {
             app,
             runtime,
             translate,
             theme,
-            layer,
             frame_router,
-            animation_router,
             language: LanguageCode::En,
             config: Config::default(),
             catalog_generation: 0,
@@ -76,9 +67,7 @@ pub struct WidgetServicesBuilder<'a> {
     runtime: Handle,
     translate: Translate,
     theme: ThemeHandle,
-    layer: Rc<Layer>,
     frame_router: Rc<FrameRouter>,
-    animation_router: Rc<AnimationRouter>,
     language: LanguageCode,
     config: Config,
     catalog_generation: u64,
@@ -148,9 +137,7 @@ impl WidgetServicesBuilder<'_> {
             runtime,
             translate,
             theme,
-            layer,
             frame_router,
-            animation_router,
             language,
             config,
             catalog_generation,
@@ -173,9 +160,7 @@ impl WidgetServicesBuilder<'_> {
             open_url,
             sound,
             reduce_motion: app.signal_scoped(scope, reduce_motion),
-            layer,
             frame_router,
-            animation_router,
             runtime,
         }
     }
@@ -192,21 +177,16 @@ mod tests {
     use ui_core::{
         app::App,
         error::EngineError,
-        math::{LogicalPoint, px},
+        math::px,
         node::{
             builder::NodeBuilder,
             id::NodeId,
             signal::{Signal, SignalScope},
         },
+        popup::{Anchor, PlacementSpec, PopupId, PopupSpec, PopupTier},
         text::TextStyle,
     };
-    use ui_kit::{
-        kit::{
-            layer::{Band, Layer},
-            overlay::{Anchor, AnimationRouter, Overlay, OverlayOptions},
-        },
-        theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle},
-    };
+    use ui_kit::theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle};
 
     use super::WidgetServices;
     use crate::{
@@ -225,14 +205,7 @@ mod tests {
 
     type Opened = Rc<RefCell<Vec<String>>>;
 
-    fn compose() -> (
-        App,
-        WidgetServices,
-        Opened,
-        Rc<Layer>,
-        Rc<FrameRouter>,
-        Rc<AnimationRouter>,
-    ) {
+    fn compose() -> (App, WidgetServices, Opened, Rc<FrameRouter>) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("the test runtime builds");
@@ -251,10 +224,8 @@ mod tests {
             ),
             LanguageCode::En,
         );
-        let layer = Rc::new(Layer::new());
         let frame_router =
             Rc::new(FrameRouter::new(&mut app).expect("the fresh frame slot is free"));
-        let animation_router = Rc::new(AnimationRouter::new());
 
         let opened: Opened = Rc::new(RefCell::new(Vec::new()));
         let record = Rc::clone(&opened);
@@ -263,19 +234,17 @@ mod tests {
             runtime.handle().clone(),
             translate,
             theme,
-            Rc::clone(&layer),
             Rc::clone(&frame_router),
-            Rc::clone(&animation_router),
         )
         .open_url(move |url| record.borrow_mut().push(url.to_owned()))
         .build();
 
-        (app, services, opened, layer, frame_router, animation_router)
+        (app, services, opened, frame_router)
     }
 
     #[test]
     fn services_compose_without_a_gui_context() {
-        let (app, services, opened, layer, frame_router, animation_router) = compose();
+        let (app, services, opened, frame_router) = compose();
 
         assert_eq!(t_smol!(services.translate, "common.close"), "Close");
         assert_eq!(*app.read(&services.language), LanguageCode::En);
@@ -308,24 +277,12 @@ mod tests {
             "reduced motion starts off unless the application mirrors a setting"
         );
         assert!(
-            Rc::ptr_eq(&services.layer, &layer),
-            "the aggregate carries the composition root's one layer stack"
-        );
-        assert!(
             Rc::ptr_eq(&services.frame_router, &frame_router),
             "the aggregate carries the composition root's one frame router"
         );
         assert!(
-            Rc::ptr_eq(&services.animation_router, &animation_router),
-            "the aggregate carries the composition root's one animation router"
-        );
-        assert!(
             frame_router.installed(),
             "the composition root's router owns the application's frame hook"
-        );
-        assert!(
-            !animation_router.installed(),
-            "the completion callback is installed by the first overlay, not by composing"
         );
 
         (services.open_url)("https://example.com/market");
@@ -350,10 +307,8 @@ mod tests {
             ),
             LanguageCode::ZhCn,
         );
-        let layer = Rc::new(Layer::new());
         let frame_router =
             Rc::new(FrameRouter::new(&mut app).expect("the fresh frame slot is free"));
-        let animation_router = Rc::new(AnimationRouter::new());
         let opened: Opened = Rc::new(RefCell::new(Vec::new()));
         let record = Rc::clone(&opened);
         let mut config = Config::default();
@@ -365,9 +320,7 @@ mod tests {
             runtime.handle().clone(),
             translate,
             theme,
-            Rc::clone(&layer),
             Rc::clone(&frame_router),
-            Rc::clone(&animation_router),
         )
         .language(LanguageCode::ZhCn)
         .config(config)
@@ -406,134 +359,103 @@ mod tests {
         assert_eq!(opened.borrow().as_slice(), ["https://example.com/news"]);
     }
 
-    fn build_overlay(harness: &mut WidgetTestApp, key: &str) -> Overlay {
+    fn open_popup(harness: &mut WidgetTestApp, key: &str, tier: PopupTier) -> PopupId {
         harness.with_cx(|cx| {
-            let theme = cx.theme().clone();
-            let layer = cx.layer().clone();
-            let animation = cx.animation().clone();
-            Overlay::new(
-                cx.app_mut(),
-                theme,
-                layer,
-                animation,
-                key,
-                OverlayOptions::default(),
-            )
+            let root = cx.tree().root();
+            let trigger = NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:trigger"))
+                .build(cx.tree_mut(), root)
+                .expect("the anchor node builds");
+            let window = cx.window();
+            let mut spec = PopupSpec::new(Anchor::Node { node: trigger }, PlacementSpec::default());
+            spec.tier = tier;
+            let key = key.to_owned();
+            cx.app_mut()
+                .open_popup(
+                    window,
+                    spec,
+                    move |app, window, node| {
+                        let Some(target) = app.window_mut(window) else {
+                            return Err(EngineError::UnknownWindow { window });
+                        };
+                        NodeBuilder::boxed()
+                            .id(format_smolstr!("{key}:content"))
+                            .build(target.tree_mut(), node)
+                            .map(|_| ())
+                    },
+                    None,
+                )
+                .expect("the popup opens")
         })
     }
 
-    fn open_overlay(harness: &mut WidgetTestApp, overlay: &Overlay) -> bool {
-        harness
-            .with_cx(|cx| {
-                let window = cx.window();
-                let origin = Anchor::point(LogicalPoint::new(px(40.0), px(40.0)));
-                overlay.open(cx.app_mut(), window, origin, |tree, panel| {
-                    NodeBuilder::boxed().build(tree, panel).map(|_| ())
-                })
-            })
-            .expect("the overlay opens")
-    }
-
     #[test]
-    fn an_overlay_opened_through_the_widget_context_registers_in_the_layer_stack() {
+    fn a_popup_opened_through_the_widget_context_registers_in_the_window_stack() {
         let mut harness = WidgetTestApp::new();
-        let overlay = build_overlay(&mut harness, "test.menu");
+        let id = open_popup(&mut harness, "test.menu", PopupTier::Auto);
 
-        assert!(open_overlay(&mut harness, &overlay));
-        let node = overlay.overlay_node().expect("the overlay is open");
+        let stack = harness
+            .app()
+            .popup_stack(harness.window())
+            .expect("the window owns a popup stack");
         assert_eq!(
-            harness.layer().len(harness.window()),
+            stack.entries.len(),
             1,
-            "the overlay registered in the host's layer stack"
+            "the popup registered in the window's stack"
         );
+        assert_eq!(stack.entries[0].id, id);
         assert!(
-            harness.layer().contains_node(harness.window(), node),
-            "the host's stack knows the node the overlay built"
+            harness.tree().get(stack.entries[0].node).is_ok(),
+            "the stack names the content node the widget context built"
         );
 
-        harness.with_cx(|cx| overlay.close_now(cx.app_mut()));
+        harness
+            .with_cx(|cx| cx.app_mut().close_popup(id))
+            .expect("the popup is open");
         assert!(
-            harness.layer().is_empty(harness.window()),
-            "closing the overlay unregistered it from the same stack"
+            harness
+                .app()
+                .popup_stack(harness.window())
+                .expect("the window owns a popup stack")
+                .entries
+                .is_empty(),
+            "closing the popup unregistered it from the same stack"
         );
+        assert!(harness.app().popup_rect(id).is_none());
     }
 
     #[test]
-    fn the_animation_router_handed_to_a_widget_owns_the_completion_slot() {
+    fn the_widget_context_exposes_the_hosts_frame_router_and_window() {
         let mut harness = WidgetTestApp::new();
-        assert!(
-            !harness.animation().installed(),
-            "composing the host installs nothing; the first kit component does"
-        );
-
-        let overlay = build_overlay(&mut harness, "test.tooltip");
-
-        assert!(
-            harness.animation().installed(),
-            "the overlay installed the host's one animation router, not a private one"
-        );
-        assert!(open_overlay(&mut harness, &overlay));
-        harness.with_cx(|cx| overlay.close_now(cx.app_mut()));
-        assert_eq!(
-            overlay.overlay_node(),
-            None,
-            "the overlay released its nodes"
-        );
-    }
-
-    #[test]
-    fn the_widget_context_queries_the_layer_stack_it_was_handed() {
-        let mut harness = WidgetTestApp::new();
-        let host_layer = harness.layer() as *const Layer;
         let host_router = harness.router() as *const FrameRouter;
-        let host_animation = harness.animation() as *const AnimationRouter;
-        let menu = build_overlay(&mut harness, "test.menu");
-        let tooltip = build_overlay(&mut harness, "test.tooltip");
-
         harness.with_cx(|cx| {
-            assert_eq!(
-                cx.layer() as *const Layer,
-                host_layer,
-                "the context exposes the host's stack, not a copy"
-            );
             assert_eq!(
                 cx.frame_router() as *const FrameRouter,
                 host_router,
                 "the context exposes the host's frame router"
             );
-            assert_eq!(
-                cx.animation() as *const AnimationRouter,
-                host_animation,
-                "the context exposes the host's animation router"
-            );
         });
 
-        assert!(open_overlay(&mut harness, &menu));
-        assert!(open_overlay(&mut harness, &tooltip));
-        let (bands, top) = harness.with_cx(|cx| {
-            let bands: Vec<Band> = cx
-                .layer()
-                .entries(cx.window())
-                .into_iter()
-                .map(|entry| entry.band)
-                .collect();
-            (bands, cx.layer().top(cx.window()).map(|entry| entry.node()))
-        });
+        let menu = open_popup(&mut harness, "test.menu", PopupTier::Auto);
+        let tooltip = open_popup(&mut harness, "test.tooltip", PopupTier::Hint);
+        let stack = harness
+            .app()
+            .popup_stack(harness.window())
+            .expect("the window owns a popup stack");
         assert_eq!(
-            bands,
-            [Band::Popup, Band::Popup],
-            "both overlays are in the popup band, listed bottom-up"
-        );
-        assert_eq!(
-            top,
-            tooltip.overlay_node(),
-            "the layer query names the most recently registered overlay"
+            stack
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            [menu, tooltip],
+            "both popups are listed bottom-up in the window the context was handed"
         );
     }
 
     #[test]
     fn reduced_motion_is_a_signal_the_application_owns() {
-        let (mut app, services, _opened, _layer, _frame_router, _animation_router) = compose();
+        let (mut app, services, _opened, _frame_router) = compose();
 
         assert!(app.write(&services.reduce_motion, true));
         assert!(*app.read(&services.reduce_motion));
@@ -546,7 +468,7 @@ mod tests {
 
     #[test]
     fn switching_the_language_updates_the_signal_and_the_translator_together() {
-        let (mut app, services, _opened, _layer, _frame_router, _animation_router) = compose();
+        let (mut app, services, _opened, _frame_router) = compose();
 
         assert_eq!(t_smol!(services.translate, "common.close"), "Close");
         assert!(services.translate.set_language(LanguageCode::ZhCn));
@@ -566,7 +488,7 @@ mod tests {
 
     #[test]
     fn a_settings_change_reaches_the_widget_through_the_signal() {
-        let (mut app, services, _opened, _layer, _frame_router, _animation_router) = compose();
+        let (mut app, services, _opened, _frame_router) = compose();
         let mut config = (*app.read(&services.config)).clone();
         config.data_time_zone =
             app_config::time_zone::DataTimeZone::from_hours(8).expect("UTC+8 is offered");
@@ -582,7 +504,7 @@ mod tests {
 
     #[test]
     fn the_services_signals_live_in_one_scope() {
-        let (mut app, services, _opened, _layer, _frame_router, _animation_router) = compose();
+        let (mut app, services, _opened, _frame_router) = compose();
         let scope: SignalScope = app.signal_scope();
         let signal = app.signal_scoped(scope, 1_u8);
 
@@ -595,7 +517,7 @@ mod tests {
 
     #[test]
     fn the_services_carry_the_runtime_the_widget_spawns_on() {
-        let (_app, services, _opened, _layer, _frame_router, _animation_router) = compose();
+        let (_app, services, _opened, _frame_router) = compose();
         let handle: &Handle = &services.runtime;
         assert!(handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread);
     }

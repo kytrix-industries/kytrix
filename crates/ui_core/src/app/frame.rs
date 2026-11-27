@@ -56,9 +56,9 @@ pub(crate) fn frame(
     #[cfg(feature = "hud")]
     app.prepare_debug_hud(window);
     app.normalize_scroll_offsets(window);
-    app.resolve_overlay_placements(window);
     let wake = app.take_wake_request();
     app.tick_animations(window);
+    crate::popup::animation::tick(app, window);
     let needs_frame = app
         .windows
         .get(&window)
@@ -125,7 +125,7 @@ pub(crate) fn frame(
     };
     app.repaint_text_if_atlas_changed();
     app.refresh_images(window);
-    let layout = match app.windows.get_mut(&window).map(Window::layout_if_dirty) {
+    let mut layout = match app.windows.get_mut(&window).map(Window::layout_if_dirty) {
         Some(Ok(report)) => report,
         Some(Err(error)) => {
             app.abort_frame(window, ticket);
@@ -193,6 +193,24 @@ pub(crate) fn frame(
     if resolution.evicted || resolution.pending {
         app.request_frame();
     }
+    let settle = match crate::popup::settle::settle(app, window, layout.is_some()) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            app.abort_frame(window, ticket);
+            return Some(Err(error));
+        }
+    };
+    let settlement = match settle {
+        Some(settlement) => settlement,
+        None => crate::popup::SettleOutcome {
+            rounds: 0,
+            layout: None,
+            text_layout: None,
+            unsettled: false,
+        },
+    };
+    merge_layout_report(&mut layout, settlement.layout);
+    merge_text_layout_report(&mut text_layout, settlement.text_layout);
     crate::text_edit::ensure_visible(app, window);
     crate::text_edit::sync_blink(app, window);
     crate::text_edit::sync_ime_cursor_area(app, window);
@@ -255,6 +273,8 @@ pub(crate) fn frame(
             compositor_inbox_latency: None,
             encode_on_compositor: false,
             scroll_offset_frames: 0,
+            popup_settle_rounds: settlement.rounds,
+            popup_unsettled: settlement.unsettled,
             a11y_only_frames: target.a11y_only_frames(),
         };
         let Some(target) = app.windows.get_mut(&window) else {
@@ -365,6 +385,43 @@ pub(crate) fn frame(
         target.reset_atlas_deferrals();
     }
     Some(Ok(outcome))
+}
+
+fn merge_layout_report(
+    target: &mut Option<crate::layout::LayoutReport>,
+    extra: Option<crate::layout::LayoutReport>,
+) {
+    let Some(extra) = extra else {
+        return;
+    };
+    match target {
+        Some(target) => {
+            target.laid_out += extra.laid_out;
+            target.moved += extra.moved;
+            target.cache_hits += extra.cache_hits;
+            target.cache_misses += extra.cache_misses;
+            target.bounds_updated += extra.bounds_updated;
+        }
+        None => *target = Some(extra),
+    }
+}
+
+fn merge_text_layout_report(
+    target: &mut crate::text::TextLayoutReport,
+    extra: Option<crate::text::TextLayoutReport>,
+) {
+    let Some(extra) = extra else {
+        return;
+    };
+    target.laid += extra.laid;
+    target.reused += extra.reused;
+    target.reruns += extra.reruns;
+    target.rasterized += extra.rasterized;
+    target.tiles_reused += extra.tiles_reused;
+    target.atlas_rebuilds += extra.atlas_rebuilds;
+    target.atlas_evictions += extra.atlas_evictions;
+    target.skipped_glyphs += extra.skipped_glyphs;
+    target.skipped_color_glyphs += extra.skipped_color_glyphs;
 }
 
 pub(crate) fn abort_frame(app: &mut App, window: WindowId, ticket: FrameTicket) {

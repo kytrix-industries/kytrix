@@ -697,13 +697,7 @@ impl CredentialsRow {
                     cancel_dialog.close(app);
                 })
         })
-        .build(
-            app,
-            host.theme_handle(),
-            host.layer(),
-            host.animation(),
-            key,
-        )
+        .build(app, host.theme_handle(), key)
     }
 
     fn button_wrapper(
@@ -850,13 +844,7 @@ impl CredentialsEditor {
 
                 Ok(())
             })
-            .build(
-                app,
-                host.theme_handle(),
-                host.layer(),
-                host.animation(),
-                key,
-            );
+            .build(app, host.theme_handle(), key);
         editor.inner.borrow_mut().dialog = Some(dialog);
 
         editor

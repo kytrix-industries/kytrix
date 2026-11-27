@@ -1,84 +1,134 @@
 use super::App;
 use crate::{
     error::EngineError,
-    interaction::{focus, overlay as overlay_util, scroll},
+    interaction::{focus, scroll},
     math::LogicalRect,
     node::id::NodeId,
+    popup::focus as popup_focus,
     window::{Window, WindowId},
 };
 
 #[must_use]
 pub(crate) fn focused(app: &App, window: WindowId) -> Option<NodeId> {
     let target = app.windows.get(&window)?;
-    let node = target.focus().focused()?;
-    let tree = target.tree();
-    if tree.get(node).is_err() {
-        return None;
+    if target.popups().focus_owner().is_some() {
+        return popup_focus::effective_focus(app, window);
     }
-    let scope = overlay_util::focus_scope_root(tree, tree.root());
-    focus::in_scope(tree, node, scope).then_some(node)
+    let node = target.focus().focused()?;
+    target.tree().get(node).is_ok().then_some(node)
 }
 
 #[must_use]
 pub(crate) fn focus_scope(app: &App, window: WindowId) -> Option<NodeId> {
     let target = app.windows.get(&window)?;
+    let modal = target.popups().topmost_modal()?;
+    target.popups().entry(modal).ok().map(|entry| entry.node)
+}
+
+#[must_use]
+pub(crate) fn in_input_scope(app: &App, window: WindowId, node: NodeId) -> bool {
+    let Some(target) = app.windows.get(&window) else {
+        return false;
+    };
     let tree = target.tree();
-    overlay_util::focus_scope_root(tree, tree.root())
+    match target.popups().topmost_modal() {
+        Some(modal) => target.popups().node_in_popup_scope(tree, node, modal),
+        None => true,
+    }
+}
+
+#[must_use]
+pub(crate) fn scope_active(app: &App, window: WindowId) -> bool {
+    app.windows
+        .get(&window)
+        .is_some_and(|target| target.popups().topmost_modal().is_some())
 }
 
 #[must_use]
 pub(crate) fn hovered(app: &App, window: WindowId) -> Option<NodeId> {
     let target = app.windows.get(&window)?;
     let node = target.pointer().hovered?;
-    let tree = target.tree();
-    if tree.get(node).is_err() {
-        return None;
+    in_input_scope(app, window, node).then_some(node)
+}
+
+pub(crate) fn apply_effective_focus(
+    app: &mut App,
+    window: WindowId,
+    previous: Option<NodeId>,
+    next: Option<NodeId>,
+) {
+    if previous == next {
+        return;
     }
-    let scope = overlay_util::focus_scope_root(tree, tree.root());
-    overlay_util::in_modal_scope(tree, node, scope).then_some(node)
+    {
+        let Some(target) = app.windows.get_mut(&window) else {
+            return;
+        };
+        for changed in [previous, next].into_iter().flatten() {
+            crate::text_edit::apply_focus(target.tree_mut(), changed, Some(changed) == next);
+            let has_ring = target.tree().focus_ring(changed).is_some();
+            target.tree_mut().mark_a11y(changed);
+            if has_ring {
+                target.tree_mut().mark_paint(changed);
+            }
+        }
+        let mut ring_damage = LogicalRect::default();
+        for changed in [previous, next].into_iter().flatten() {
+            if let Some(ring) = target.tree().focus_ring(changed)
+                && let Some(screen) = target.tree().node_screen_rect(changed)
+            {
+                ring_damage = ring_damage.union(screen.outset(ring.offset + ring.width));
+            }
+        }
+        if !ring_damage.is_empty() {
+            target.request_damage(ring_damage);
+        }
+    }
+    if let Some(previous) = previous {
+        let _ = crate::text_edit::cancel_composition(app, window, previous);
+    }
+    crate::text_edit::cancel_pointer_press(app, window);
+    crate::text_edit::note_focus_change(app, window);
+    app.request_frame();
 }
 
 pub(crate) fn validate_focus(app: &mut App, window: WindowId) {
-    let repair = {
+    {
         let Some(target) = app.windows.get(&window) else {
             return;
         };
-        let tree = target.tree();
-        let scope = overlay_util::focus_scope_root(tree, tree.root());
-        let first_in_scope =
-            || scope.and_then(|scope| focus::next_focusable(tree, None, false, Some(scope)));
-        match target.focus().focused() {
-            None => first_in_scope().map(Some),
-            Some(node) if tree.get(node).is_err() => Some(None),
-            Some(node) if scope.is_some() && !focus::in_scope(tree, node, scope) => {
-                first_in_scope().map(Some)
-            }
-            Some(_) => None,
+        if target.popups().focus_owner().is_some() {
+            popup_focus::validate_owner(app, window);
+            return;
         }
-    };
-    match repair {
-        Some(None) => {
-            if let Some(target) = app.windows.get_mut(&window) {
-                target.focus_mut().set(None);
-            }
-        }
-        Some(Some(next)) => {
-            app.set_focus(window, Some(next));
-        }
-        None => {}
+    }
+    let stale = app.windows.get(&window).is_some_and(|target| {
+        target
+            .focus()
+            .focused()
+            .is_some_and(|node| target.tree().get(node).is_err())
+    });
+    if stale && let Some(target) = app.windows.get_mut(&window) {
+        target.focus_mut().set(None);
     }
 }
 
 pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -> bool {
-    let scope = focus_scope(app, window);
+    if app
+        .windows
+        .get(&window)
+        .is_some_and(|target| target.popups().focus_owner().is_some())
+    {
+        return popup_focus::set_owner_focus(app, window, node);
+    }
+    let previous = focused(app, window);
     {
         let Some(target) = app.windows.get_mut(&window) else {
             return false;
         };
         if let Some(node) = node
-            && !focus::focusable_in_scope(target.tree(), node, scope)
-            && !(focus::editable_focusable(target.tree(), node)
-                && focus::in_scope(target.tree(), node, scope))
+            && !focus::focusable(target.tree(), node)
+            && !focus::editable_focusable(target.tree(), node)
         {
             return false;
         }
@@ -104,24 +154,15 @@ pub(crate) fn set_focus(app: &mut App, window: WindowId, node: Option<NodeId>) -
             }
         }
     }
+    if let Some(previous) = previous
+        && Some(previous) != node
+    {
+        let _ = crate::text_edit::cancel_composition(app, window, previous);
+    }
     crate::text_edit::cancel_pointer_press(app, window);
     crate::text_edit::note_focus_change(app, window);
     app.request_frame();
     true
-}
-
-pub(crate) fn restore_focus(app: &mut App, window: WindowId, opener: Option<NodeId>) -> bool {
-    let Some(opener) = opener else {
-        return false;
-    };
-    let alive = app
-        .windows
-        .get(&window)
-        .is_some_and(|target| target.tree().get(opener).is_ok());
-    if !alive {
-        return false;
-    }
-    app.set_focus(window, Some(opener))
 }
 
 pub(crate) fn set_ime_cursor_area(
@@ -188,10 +229,17 @@ pub(crate) fn ime_cursor_area(
 
 pub(crate) fn focus_next(app: &mut App, window: WindowId) -> Option<NodeId> {
     app.validate_focus(window);
-    let scope = focus_scope(app, window);
-    let next = app.windows.get(&window).and_then(|target| {
-        focus::next_focusable(target.tree(), target.focus().focused(), false, scope)
-    });
+    let next = if app
+        .windows
+        .get(&window)
+        .is_some_and(|target| target.popups().focus_owner().is_some())
+    {
+        popup_focus::next_in_popup_scope(app, window, app.focused(window), false)
+    } else {
+        app.windows.get(&window).and_then(|target| {
+            focus::next_focusable(target.tree(), target.focus().focused(), false)
+        })
+    };
     if app.set_focus(window, next) {
         next
     } else {
@@ -201,10 +249,17 @@ pub(crate) fn focus_next(app: &mut App, window: WindowId) -> Option<NodeId> {
 
 pub(crate) fn focus_prev(app: &mut App, window: WindowId) -> Option<NodeId> {
     app.validate_focus(window);
-    let scope = focus_scope(app, window);
-    let next = app.windows.get(&window).and_then(|target| {
-        focus::next_focusable(target.tree(), target.focus().focused(), true, scope)
-    });
+    let next = if app
+        .windows
+        .get(&window)
+        .is_some_and(|target| target.popups().focus_owner().is_some())
+    {
+        popup_focus::next_in_popup_scope(app, window, app.focused(window), true)
+    } else {
+        app.windows
+            .get(&window)
+            .and_then(|target| focus::next_focusable(target.tree(), target.focus().focused(), true))
+    };
     if app.set_focus(window, next) {
         next
     } else {

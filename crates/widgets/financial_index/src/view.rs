@@ -1985,6 +1985,25 @@ mod tests {
         test_support::{self, ACCOUNT, FakeSource, event, selected, topic},
     };
 
+    fn popup_total(harness: &WidgetTestApp) -> usize {
+        harness
+            .app()
+            .popup_stack(harness.window())
+            .map_or(0, |stack| stack.entries.len())
+    }
+    fn popup_count(harness: &WidgetTestApp) -> usize {
+        harness
+            .app()
+            .popup_stack(harness.window())
+            .map_or(0, |stack| {
+                stack
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.tier != ui_core::popup::PopupTier::Scrim)
+                    .count()
+            })
+    }
+
     fn settings(account: Option<&str>) -> Config {
         let mut config = Config::default();
         config.account = account.map(|user_id| AccountConfig {
@@ -4045,7 +4064,12 @@ mod tests {
             "the released pane left its header handler behind"
         );
         assert!(!harness.app().has_action_handler(&mode_action));
-        assert!(harness.layer().is_empty(harness.window()));
+        assert_eq!(popup_count(&harness), 0);
+        assert_eq!(
+            popup_total(&harness),
+            0,
+            "releasing the pane leaves no popup entry behind"
+        );
         assert!(
             harness.node_count() < live_before,
             "the content the pane built is removed"

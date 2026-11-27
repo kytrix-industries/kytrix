@@ -14,10 +14,7 @@ use kytrix_service_provider::{
 use smol_str::SmolStr;
 use tokio::sync::watch;
 use ui_core::app::App;
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
+use ui_kit::theme::handle::ThemeHandle;
 use widget::{frame::FrameRouter, services::WidgetServices};
 use zeroize::Zeroizing;
 
@@ -212,17 +209,7 @@ impl ProfileHost {
     }
 
     #[must_use]
-    pub fn layer(&self) -> &Layer {
-        &self.services.layer
-    }
-
-    #[must_use]
     pub fn router(&self) -> &FrameRouter {
         &self.services.frame_router
-    }
-
-    #[must_use]
-    pub fn animation(&self) -> AnimationRouter {
-        (*self.services.animation_router).clone()
     }
 }

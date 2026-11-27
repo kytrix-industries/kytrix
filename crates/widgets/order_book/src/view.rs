@@ -1730,11 +1730,9 @@ impl OrderBookWidget {
             .label(t_smol!(self.translate, spec.aria_key))
             .placeholder(spec.placeholder);
         let key = cx.unique_key(spec.key_suffix);
-        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
-        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
         let kind = spec.kind;
-        let select = Select::new(cx.app_mut(), theme, layer, router, key, options).on_change(
-            move |app, chosen| {
+        let select =
+            Select::new(cx.app_mut(), theme, key, options).on_change(move |app, chosen| {
                 let Some(id) = chosen.first() else {
                     return;
                 };
@@ -1747,8 +1745,7 @@ impl OrderBookWidget {
                 if let Some(request) = request {
                     hand_over_header_request(requests, request, app, window);
                 }
-            },
-        );
+            });
         select
             .set_items(cx.app_mut(), spec.items)
             .unwrap_or_else(|error| {

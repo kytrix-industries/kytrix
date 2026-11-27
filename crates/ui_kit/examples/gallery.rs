@@ -48,11 +48,10 @@ use ui_kit::{
         empty_state::EmptyState,
         icon::{IconKind, IconSpec},
         input::{self, InputNode, InputSpec, InputState},
-        layer::{Band, Layer},
         list::{List, ListOptions, SelectionMode},
         markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
         menu::{Menu, MenuAction, MenuEntry, MenuOptions, MenuSubmenu},
-        overlay::{Anchor, AnimationRouter, Overlay, OverlayOptions},
+        popup_panel::{PanelWidth, PopupPanel, PopupPanelOptions, PopupSurface},
         progress::Progress,
         scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
         select::{Select, SelectItem, SelectOptions},
@@ -132,10 +131,12 @@ struct Flags {
     start_light: bool,
     auto_close: Option<u64>,
     probe: bool,
-    dump_overlay: bool,
+    debug_stack: bool,
     pixel_check: bool,
     scroll_to: Option<f32>,
 }
+
+const GALLERY_USAGE: &str = "gallery: usage: [--auto-demo] [--idle-check] [--theme-check] [--start-light] [--auto-close=<secs>] [--probe] [--debug-stack] [--pixel-check] [--scroll-to=<px>] [--help]; --auto-close is only a watchdog floor (>=30s) under --debug-stack, which exits 0/3 by itself when its final round completes";
 
 fn parse_flags() -> Flags {
     let mut flags = Flags::default();
@@ -149,17 +150,35 @@ fn parse_flags() -> Flags {
         } else if arg == "--start-light" {
             flags.start_light = true;
         } else if let Some(value) = arg.strip_prefix("--auto-close=") {
-            flags.auto_close = value.parse::<u64>().ok();
+            let Ok(seconds) = value.parse::<u64>() else {
+                println!("gallery: invalid --auto-close value {value:?}: expected integer seconds");
+                println!("{GALLERY_USAGE}");
+                std::process::exit(2);
+            };
+            flags.auto_close = Some(seconds);
         } else if arg == "--probe" {
             flags.probe = true;
-        } else if arg == "--dump-overlay" {
-            flags.dump_overlay = true;
+        } else if arg == "--debug-stack" {
+            flags.debug_stack = true;
         } else if arg == "--pixel-check" {
             flags.pixel_check = true;
         } else if let Some(value) = arg.strip_prefix("--scroll-to=") {
-            flags.scroll_to = value.parse::<f32>().ok();
+            let Ok(offset) = value.parse::<f32>() else {
+                println!("gallery: invalid --scroll-to value {value:?}: expected pixel offset");
+                println!("{GALLERY_USAGE}");
+                std::process::exit(2);
+            };
+            flags.scroll_to = Some(offset);
+        } else if arg == "--help" {
+            println!("{GALLERY_USAGE}");
+            std::process::exit(0);
+        } else if arg == "--dump-overlay" {
+            println!("gallery: --dump-overlay was renamed; use --debug-stack");
+            std::process::exit(2);
         } else {
-            println!("gallery: ignoring unknown argument {arg}");
+            println!("gallery: unknown argument {arg}");
+            println!("{GALLERY_USAGE}");
+            std::process::exit(2);
         }
     }
     flags
@@ -181,22 +200,334 @@ struct ThemeCheckReport {
 }
 
 #[derive(Debug, Default)]
-struct OverlayCheckReport {
+struct DebugStackReport {
     menu: Option<(usize, f32, f32)>,
     picker_open: bool,
     picker_panel_children: Option<usize>,
+    menu_first: Option<LogicalRect>,
+    menu_stable: Option<LogicalRect>,
+    menu_frames: u32,
+    picker_first: Option<LogicalRect>,
+    picker_stable: Option<LogicalRect>,
+    picker_frames: u32,
+    completed: bool,
+    failures: Vec<SmolStr>,
 }
 
-impl OverlayCheckReport {
+impl DebugStackReport {
+    fn check(&mut self, ok: bool, label: &'static str, detail: SmolStr) {
+        if ok {
+            return;
+        }
+        println!("gallery: overlay-check FAIL {label}: {detail}");
+        self.failures.push(format_smolstr!("{label}: {detail}"));
+    }
+
+    fn menu_metrics_ok(&self) -> bool {
+        self.menu
+            .is_some_and(|(children, content, thumb)| children > 0 && content > 0.0 && thumb > 0.0)
+    }
+
     fn pass(&self) -> bool {
-        let menu_ok = self
-            .menu
-            .is_some_and(|(children, content, thumb)| children > 0 && content > 0.0 && thumb > 0.0);
-        menu_ok
-            && self.picker_open
-            && self
-                .picker_panel_children
-                .is_some_and(|children| children > 0)
+        self.completed && self.failures.is_empty()
+    }
+
+    fn reset_attempt(&mut self) {
+        self.menu = None;
+        self.picker_open = false;
+        self.picker_panel_children = None;
+        self.menu_first = None;
+        self.menu_stable = None;
+        self.menu_frames = 0;
+        self.picker_first = None;
+        self.picker_stable = None;
+        self.picker_frames = 0;
+        self.completed = false;
+        self.failures.clear();
+    }
+}
+
+#[derive(Clone)]
+struct OverlayCheck {
+    window: WindowId,
+    menu: Menu,
+    color_picker: ColorPicker,
+    nodes: Rc<Vec<(SmolStr, NodeId)>>,
+    report: Rc<RefCell<DebugStackReport>>,
+    generation: Rc<Cell<u32>>,
+    retries: Rc<Cell<u32>>,
+}
+
+impl OverlayCheck {
+    fn new(
+        window: WindowId,
+        menu: Menu,
+        color_picker: ColorPicker,
+        nodes: Vec<(SmolStr, NodeId)>,
+        report: Rc<RefCell<DebugStackReport>>,
+    ) -> Self {
+        Self {
+            window,
+            menu,
+            color_picker,
+            nodes: Rc::new(nodes),
+            report,
+            generation: Rc::new(Cell::new(0)),
+            retries: Rc::new(Cell::new(0)),
+        }
+    }
+
+    fn start(&self, app: &mut App) {
+        self.report.borrow_mut().reset_attempt();
+        self.open_menu(app);
+        self.schedule(app, 0);
+    }
+
+    fn open_menu(&self, app: &mut App) {
+        let anchor = self
+            .nodes
+            .iter()
+            .find(|(name, _)| name == "menu")
+            .map(|(_, node)| *node)
+            .and_then(|node| {
+                app.window(self.window)
+                    .and_then(|target| target.node_screen_rect(node))
+            });
+        let opened = match anchor {
+            Some(rect) => {
+                println!("gallery: overlay-check menu anchored at {rect:?}");
+                self.menu
+                    .open(app, self.window, ui_core::popup::Anchor::WindowRect(rect))
+            }
+            None => Ok(false),
+        };
+        println!("gallery: overlay-check menu.open -> {opened:?}");
+        self.report.borrow_mut().check(
+            matches!(opened, Ok(true)),
+            "menu-open",
+            format_smolstr!("menu.open -> {opened:?}"),
+        );
+        dump_popup_stack(app, self.window, "menu-open");
+        app.handle().wake();
+    }
+
+    fn schedule(&self, app: &mut App, start: u32) {
+        let generation = self.generation.get();
+        for round in start..=5 {
+            let this = self.clone();
+            let delay = Duration::from_millis(u64::from(600 * (round + 1)));
+            let _ = app.after(self.window, delay, move |app| {
+                if this.generation.get() != generation {
+                    return;
+                }
+                this.round(app, round);
+            });
+        }
+    }
+
+    fn retry(&self, app: &mut App, reason: &'static str) {
+        let retries = self.retries.get();
+        if retries >= 2 {
+            self.report.borrow_mut().check(
+                false,
+                "environment-dismiss",
+                format_smolstr!("环境 dismiss 重试超过上限：{reason}"),
+            );
+            self.finish(app);
+            return;
+        }
+        self.retries.set(retries + 1);
+        self.generation.set(self.generation.get() + 1);
+        println!(
+            "gallery: overlay-check retry {}（环境 dismiss：{reason}）",
+            retries + 1
+        );
+        self.report.borrow_mut().reset_attempt();
+        let _ = self.menu.close_now(app);
+        let _ = self.color_picker.close(app);
+        app.handle().wake();
+        let this = self.clone();
+        let generation = self.generation.get();
+        let _ = app.after(self.window, Duration::from_millis(300), move |app| {
+            if this.generation.get() != generation {
+                return;
+            }
+            this.open_menu(app);
+            this.schedule(app, 0);
+        });
+    }
+
+    fn round(&self, app: &mut App, round: u32) {
+        let window = self.window;
+        let frame = app
+            .window(window)
+            .map(|target| target.frame_index().get())
+            .unwrap_or(0);
+        match round {
+            0 => {
+                if !self.menu.is_open(app) {
+                    self.retry(app, "菜单在阶段 0 采样前消失");
+                    return;
+                }
+                let metrics = menu_metrics(app, window);
+                println!(
+                    "gallery: overlay-check menu round={round} frame={frame} metrics={metrics:?}"
+                );
+                let entries = stack_entries(app, window);
+                let mut state = self.report.borrow_mut();
+                record_menu_metrics(&mut state, metrics);
+                let metrics_ok = state.menu_metrics_ok();
+                let menu_detail = format_smolstr!("菜单度量无效：{:?}", state.menu);
+                state.check(metrics_ok, "menu-metrics", menu_detail);
+                state.check(
+                    entries.len() == 1,
+                    "menu-stack-size",
+                    format_smolstr!("菜单打开后 popup 栈应有 1 条，实际 {}", entries.len()),
+                );
+                state.check(
+                    entries
+                        .first()
+                        .is_some_and(|entry| entry.tier == ui_core::popup::PopupTier::Auto),
+                    "menu-stack-tier",
+                    format_smolstr!("菜单必须是 Auto tier：{entries:?}"),
+                );
+                drop(state);
+                dump_popup_stack(app, window, "menu");
+            }
+            1 => {
+                if !self.menu.is_open(app) {
+                    self.retry(app, "菜单在阶段 1 关闭前消失");
+                    return;
+                }
+                let metrics = menu_metrics(app, window);
+                let (first, stable) = {
+                    let mut state = self.report.borrow_mut();
+                    record_menu_metrics(&mut state, metrics);
+                    (state.menu_first, state.menu_stable)
+                };
+                self.report.borrow_mut().check(
+                    first.is_some() && first == stable,
+                    "menu-first-visible-rect",
+                    format_smolstr!("菜单首可见帧 {first:?} != 稳定帧 {stable:?}"),
+                );
+                let closed = self.menu.close(app);
+                println!("gallery: overlay-check menu.close -> {closed}");
+                self.report.borrow_mut().check(
+                    closed,
+                    "menu-close-call",
+                    SmolStr::new_static("menu.close 必须接受关闭"),
+                );
+            }
+            2 => {
+                record_stack_empty(app, window, &self.report, "menu-close");
+                let opened = match self.color_picker.open(app, window) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        println!("gallery: overlay-check color-picker.open FAIL {error}");
+                        false
+                    }
+                };
+                println!("gallery: overlay-check color-picker.open -> {opened}");
+                self.report.borrow_mut().check(
+                    opened,
+                    "picker-open",
+                    SmolStr::new_static("color-picker 必须打开"),
+                );
+                dump_popup_stack(app, window, "picker-open");
+            }
+            3 => {
+                if !self.color_picker.is_open(app) {
+                    self.retry(app, "取色器在阶段 3 采样前消失");
+                    return;
+                }
+                let (is_open, children) = picker_metrics(app, window, &self.color_picker);
+                let (first, stable) = {
+                    let mut state = self.report.borrow_mut();
+                    record_picker_metrics(&mut state, is_open, children);
+                    (state.picker_first, state.picker_stable)
+                };
+                let mut state = self.report.borrow_mut();
+                state.check(
+                    first.is_some() && first == stable,
+                    "picker-first-visible-rect",
+                    format_smolstr!("取色器首可见帧 {first:?} != 稳定帧 {stable:?}"),
+                );
+                let entries = stack_entries(app, window);
+                state.check(
+                    entries.len() == 1,
+                    "picker-stack-size",
+                    format_smolstr!("取色器打开后 popup 栈应有 1 条，实际 {}", entries.len()),
+                );
+                state.check(
+                    is_open && children.is_some_and(|count| count > 0),
+                    "picker-metrics",
+                    format_smolstr!("is_open={is_open} content_children={children:?}"),
+                );
+                drop(state);
+                dump_popup_stack(app, window, "picker");
+            }
+            4 => {
+                if !self.color_picker.is_open(app) {
+                    self.retry(app, "取色器在阶段 4 关闭前消失");
+                    return;
+                }
+                let (is_open, children) = picker_metrics(app, window, &self.color_picker);
+                record_picker_metrics(&mut self.report.borrow_mut(), is_open, children);
+                let closed = self.color_picker.close(app);
+                println!("gallery: overlay-check color-picker.close -> {closed}");
+                self.report.borrow_mut().check(
+                    closed,
+                    "picker-close-call",
+                    SmolStr::new_static("color-picker.close 必须接受关闭"),
+                );
+            }
+            _ => self.finish(app),
+        }
+        app.handle().wake();
+    }
+
+    fn finish(&self, app: &mut App) {
+        let window = self.window;
+        let frame = app
+            .window(window)
+            .map(|target| target.frame_index().get())
+            .unwrap_or(0);
+        record_stack_empty(app, window, &self.report, "picker-close");
+        let entries = stack_entries(app, window);
+        let (menu_frames, picker_frames) = {
+            let state = self.report.borrow();
+            (state.menu_frames, state.picker_frames)
+        };
+        let mut state = self.report.borrow_mut();
+        state.check(
+            entries.is_empty(),
+            "debug-stack-final",
+            format_smolstr!("结束时 popup 栈必须为空：{entries:?}"),
+        );
+        state.check(
+            menu_frames > 0 && picker_frames > 0,
+            "debug-stack-frames",
+            format_smolstr!(
+                "采样帧必须覆盖菜单/取色器打开：menu={menu_frames} picker={picker_frames}"
+            ),
+        );
+        state.completed = true;
+        let passed = state.pass();
+        println!(
+            "gallery: overlay-check final frame={frame} menu_frames={menu_frames} picker_frames={picker_frames} entries={} retries={} {}",
+            entries.len(),
+            self.retries.get(),
+            if passed { "PASS" } else { "FAIL" }
+        );
+        if !passed {
+            println!("gallery: overlay-check detail {:?}", state.failures);
+        }
+        drop(state);
+        dump_popup_stack(app, window, "final");
+        println!(
+            "gallery: overlay-check complete -> closing window (process exits 0/3 from the report)"
+        );
+        app.close_window(window);
     }
 }
 
@@ -510,13 +841,13 @@ struct Gallery {
     markdown: Rc<RefCell<MarkdownNode>>,
     theme_icons: Vec<NodeId>,
     theme_check: Rc<RefCell<ThemeCheckReport>>,
-    overlay_check: Rc<RefCell<OverlayCheckReport>>,
+    debug_stack: Rc<RefCell<DebugStackReport>>,
     dropdown: Dropdown,
     select: Select,
     menu: Menu,
     context_menu: ContextMenu,
     tooltip: Tooltip,
-    overlay: Overlay,
+    overlay: PopupPanel,
     dialog: Dialog,
     alert_dialog: Dialog,
     color_picker: ColorPicker,
@@ -534,8 +865,6 @@ impl Gallery {
             Appearance::Dark
         };
         let theme = ThemeHandle::new(app, start_appearance);
-        let layer = Layer::new();
-        let router = AnimationRouter::new();
         let initial = theme.theme_for(start_appearance);
         let canvas = initial.role(Role::SurfaceCanvas);
         let fg = initial.role(Role::FgDefault);
@@ -1330,22 +1659,17 @@ impl Gallery {
             window,
             content,
             12,
-            "⑫ 浮层（Overlay / Tooltip / Dropdown / Select / Menu / ContextMenu）",
+            "⑫ 浮层（PopupPanel / Tooltip / Dropdown / Select / Menu / ContextMenu）",
             H_OVERLAYS,
             &theme,
         );
         let overlay_row = row(app, window, s12, 10.0);
 
-        let overlay = Overlay::new(
+        let overlay = PopupPanel::new(
             app,
             theme.clone(),
-            layer.clone(),
-            router.clone(),
             "gallery.overlay",
-            OverlayOptions {
-                band: Band::Popup,
-                ..OverlayOptions::default()
-            },
+            PopupPanelOptions::new(PopupSurface::menu(), PanelWidth::Auto),
         );
         let overlay_action = Action::Custom(SmolStr::new_static("gallery.overlay.open"));
         let _overlay_trigger = demo_trigger(
@@ -1353,7 +1677,7 @@ impl Gallery {
             window,
             overlay_row,
             &theme,
-            "打开 Overlay",
+            "打开 Popup",
             overlay_action.clone(),
         );
         app.on_action(overlay_action, {
@@ -1363,11 +1687,17 @@ impl Gallery {
                 let node = ctx.node();
                 let window = ctx.window();
                 let app = ctx.app_mut();
-                let anchor = Anchor::node(node);
                 let theme = panel_theme.clone();
-                let opened = overlay.open(app, window, anchor, move |tree, panel| {
+                let spec = ui_core::popup::PopupSpec::new(
+                    popup_anchor(node),
+                    ui_core::popup::PlacementSpec::default(),
+                );
+                let opened = overlay.open(app, window, spec, move |app, window, body| {
+                    let Some(target) = app.window_mut(window) else {
+                        return Err(ui_core::error::EngineError::UnknownWindow { window });
+                    };
                     NodeBuilder::text(
-                        "Overlay 面板（12 向 placement + flip/clamp + 淡入淡出）",
+                        "Popup 面板（12 向 placement + flip/clamp + 淡入淡出）",
                         text_style(12.0, 400, Color::WHITE),
                     )
                     .style(StyleBuilder::new().padding(px(8.0)).build())
@@ -1375,11 +1705,11 @@ impl Gallery {
                         foreground: Some(theme.role(cx, Role::FgDefault)),
                         ..StylePatch::default()
                     })
-                    .build(tree, panel)?;
+                    .build(target.tree_mut(), body)?;
                     Ok(())
                 });
                 if opened.is_ok() {
-                    log_line(app, &log, "overlay: 打开（锚点=触发节点）");
+                    log_line(app, &log, "popup: 打开（锚点=触发节点）");
                 }
             }
         });
@@ -1387,8 +1717,6 @@ impl Gallery {
         let tooltip = Tooltip::new(
             app,
             theme.clone(),
-            layer.clone(),
-            router.clone(),
             "gallery.tooltip",
             TooltipOptions::default(),
         );
@@ -1409,8 +1737,6 @@ impl Gallery {
         let dropdown = Dropdown::new(
             app,
             theme.clone(),
-            layer.clone(),
-            router.clone(),
             "gallery.dropdown",
             DropdownOptions::default(),
         )
@@ -1430,8 +1756,6 @@ impl Gallery {
         let select = Select::new(
             app,
             theme.clone(),
-            layer.clone(),
-            router.clone(),
             "gallery.select",
             SelectOptions::default().multiple(true).clearable(true),
         )
@@ -1453,8 +1777,6 @@ impl Gallery {
         let menu = Menu::new(
             app,
             theme.clone(),
-            layer.clone(),
-            router.clone(),
             "gallery.menu",
             [
                 MenuEntry::Group(SmolStr::new_static("编辑")),
@@ -1492,7 +1814,7 @@ impl Gallery {
                 let node = ctx.node();
                 let window = ctx.window();
                 let app = ctx.app_mut();
-                let opened = menu.open(app, window, Anchor::node(node));
+                let opened = menu.open(app, window, popup_anchor(node));
                 if opened.is_ok() {
                     log_line(app, &log, "menu: 打开（↑↓ / Enter / Esc / 子菜单 →）");
                 }
@@ -1502,8 +1824,6 @@ impl Gallery {
         let context_menu = ContextMenu::new(
             app,
             theme.clone(),
-            layer.clone(),
-            router.clone(),
             "gallery.context-menu",
             [
                 MenuEntry::Action(MenuAction::new("inspect", "查看")),
@@ -1533,14 +1853,8 @@ impl Gallery {
                 let app = ctx.app_mut();
                 let point = app
                     .window(window)
-                    .and_then(|target| target.tree().get(node).ok())
-                    .map(|node| {
-                        let bounds = node.layout().bounds;
-                        LogicalPoint::new(
-                            bounds.origin.x + 24.0,
-                            bounds.origin.y + bounds.size.height + 6.0,
-                        )
-                    })
+                    .and_then(|target| target.node_screen_rect(node))
+                    .map(|bounds| LogicalPoint::new(bounds.origin.x + 24.0, bounds.max().y + 6.0))
                     .unwrap_or(LogicalPoint::new(px(420.0), px(600.0)));
                 let opened = context_menu.open(app, window, point);
                 if opened.is_ok() {
@@ -1584,13 +1898,7 @@ impl Gallery {
             .on_close({
                 move |close, app| log_line(app, &log, format_smolstr!("dialog: 关闭 {close:?}"))
             })
-            .build(
-                app,
-                theme.clone(),
-                layer.clone(),
-                router.clone(),
-                "gallery.dialog",
-            );
+            .build(app, theme.clone(), "gallery.dialog");
         let dialog_button = Button::new(app, theme.clone(), "gallery.dialog.open")
             .primary()
             .with_unified_size(UnifiedSize::Medium)
@@ -1615,13 +1923,7 @@ impl Gallery {
                 .ok_action(move |_value, app| log_line(app, &log, "alert: 确认删除"))
                 .cancel_action(move |app| log_line(app, &log, "alert: 取消"))
         })
-        .build(
-            app,
-            theme.clone(),
-            layer.clone(),
-            router.clone(),
-            "gallery.alert",
-        );
+        .build(app, theme.clone(), "gallery.alert");
         let alert_button = Button::new(app, theme.clone(), "gallery.alert.open")
             .danger()
             .with_unified_size(UnifiedSize::Medium)
@@ -1651,8 +1953,6 @@ impl Gallery {
         let color_picker = ColorPicker::new(
             app,
             theme.clone(),
-            layer,
-            router,
             "gallery.color-picker",
             Color::from_rgba8([0x4C, 0x9A, 0xFF, 0xFF]),
             UnifiedSize::Medium,
@@ -1757,7 +2057,7 @@ impl Gallery {
             markdown: Rc::new(RefCell::new(markdown)),
             theme_icons,
             theme_check: Rc::new(RefCell::new(ThemeCheckReport::default())),
-            overlay_check: Rc::new(RefCell::new(OverlayCheckReport::default())),
+            debug_stack: Rc::new(RefCell::new(DebugStackReport::default())),
             dropdown,
             select,
             menu,
@@ -1845,100 +2145,27 @@ impl Gallery {
                 });
             });
         }
-        if self.flags.dump_overlay {
+        if self.flags.debug_stack {
             let viewport = self.viewport;
             let menu = self.menu.clone();
             let color_picker = self.color_picker.clone();
             let nodes = self.probe_nodes.clone();
-            let report = self.overlay_check.clone();
+            let report = self.debug_stack.clone();
             let _ = app.after(window, Duration::from_millis(600), move |app| {
                 if let Some(handle) = app.scroll_handle(window, viewport) {
                     let _ = app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(3_150.0)));
                 }
-                print_probe_rects(app, window, &nodes, "overlay ");
+                print_probe_rects(app, window, &nodes, "debug-stack ");
                 app.handle().wake();
-                let menu = menu.clone();
-                let color_picker = color_picker.clone();
-                let report = report.clone();
+                let check = OverlayCheck::new(
+                    window,
+                    menu.clone(),
+                    color_picker.clone(),
+                    nodes.clone(),
+                    report.clone(),
+                );
                 let _ = app.after(window, Duration::from_millis(300), move |app| {
-                    if let Some((_, anchor)) = nodes.iter().find(|(name, _)| name == "menu") {
-                        let opened = menu.open(app, window, Anchor::node(*anchor));
-                        println!("gallery: overlay-probe menu.open -> {opened:?}");
-                    }
-                    app.handle().wake();
-                    for round in 0..5_u32 {
-                        let menu = menu.clone();
-                        let color_picker = color_picker.clone();
-                        let report = report.clone();
-                        let delay = Duration::from_millis(u64::from(600 * (round + 1)));
-                        let step = move |app: &mut App| {
-                            let frame = app
-                                .window(window)
-                                .map(|target| target.frame_index().get())
-                                .unwrap_or(0);
-                            match round {
-                                0 | 1 => {
-                                    let metrics = menu_metrics(app, window);
-                                    println!(
-                                        "gallery: overlay-check menu round={round} frame={frame} metrics={metrics:?}"
-                                    );
-                                    record_menu_metrics(&report, metrics);
-                                    dump_overlay_nodes(app, window, &["gallery.menu:panel"]);
-                                    if round == 1 {
-                                        let closed = menu.close(app);
-                                        let opened = match color_picker.open(app, window) {
-                                            Ok(opened) => opened,
-                                            Err(error) => {
-                                                println!(
-                                                    "gallery: overlay-check color-picker.open FAIL {error}"
-                                                );
-                                                false
-                                            }
-                                        };
-                                        println!(
-                                            "gallery: overlay-check menu.close -> {closed}; color-picker.open -> {opened}"
-                                        );
-                                    }
-                                }
-                                2 | 3 => {
-                                    let (is_open, children) =
-                                        picker_metrics(app, window, &color_picker);
-                                    println!(
-                                        "gallery: overlay-check picker round={round} frame={frame} is_open={is_open} content_children={children:?}"
-                                    );
-                                    record_picker_metrics(&report, is_open, children);
-                                    dump_overlay_nodes(app, window, &["gallery.color-picker"]);
-                                }
-                                _ => {
-                                    let (is_open, children) =
-                                        picker_metrics(app, window, &color_picker);
-                                    record_picker_metrics(&report, is_open, children);
-                                    let passed = report.borrow().pass();
-                                    println!(
-                                        "gallery: overlay-check final round={round} frame={frame} {}",
-                                        if passed { "PASS" } else { "FAIL" }
-                                    );
-                                    if !passed {
-                                        println!(
-                                            "gallery: overlay-check detail {:?}",
-                                            report.borrow()
-                                        );
-                                    }
-                                    let _ = color_picker.close(app);
-                                    dump_overlay_nodes(
-                                        app,
-                                        window,
-                                        &["gallery.menu:panel", "gallery.color-picker"],
-                                    );
-                                }
-                            }
-                            app.handle().wake();
-                        };
-                        if let Err(error) = app.after(window, delay, move |app| step(app)) {
-                            println!("gallery: overlay-probe timer failed: {error}");
-                            break;
-                        }
-                    }
+                    check.start(app);
                 });
             });
         }
@@ -2022,9 +2249,32 @@ impl Gallery {
         }
         if let Some(seconds) = self.flags.auto_close
             && !self.flags.idle_check
+            && !self.flags.debug_stack
         {
             let _ = app.after(window, Duration::from_secs(seconds), move |app| {
                 println!("gallery: auto-close after {seconds}s");
+                app.close_window(window);
+                app.handle().wake();
+            });
+        }
+        if self.flags.debug_stack {
+            let seconds = self.flags.auto_close.map_or(30, |seconds| seconds.max(30));
+            let report = self.debug_stack.clone();
+            let _ = app.after(window, Duration::from_secs(seconds), move |app| {
+                println!(
+                    "gallery: overlay-check watchdog after {seconds}s (automation did not finish)"
+                );
+                let mut report = report.borrow_mut();
+                if !report.completed {
+                    report.check(
+                        false,
+                        "watchdog-timeout",
+                        format_smolstr!(
+                            "--debug-stack automation did not finish within {seconds}s"
+                        ),
+                    );
+                }
+                drop(report);
                 app.close_window(window);
                 app.handle().wake();
             });
@@ -2131,6 +2381,35 @@ impl Gallery {
         let _ = self.dialog.sync(app);
         let _ = self.alert_dialog.sync(app);
         let _ = self.color_picker.sync(app);
+        if self.flags.debug_stack {
+            self.capture_debug_stack(app);
+        }
+    }
+
+    fn capture_debug_stack(&self, app: &App) {
+        let mut report = self.debug_stack.borrow_mut();
+        if let Some(node) = self.menu.popup_node()
+            && let Some(entry) = stack_entries(app, self.window)
+                .into_iter()
+                .find(|entry| entry.node == node)
+            && entry.state == ui_core::popup::PopupState::Open
+            && !entry.hit_rect.is_empty()
+        {
+            report.menu_frames += 1;
+            report.menu_first.get_or_insert(entry.hit_rect);
+            report.menu_stable = Some(entry.hit_rect);
+        }
+        if let Some(node) = self.color_picker.popup_node()
+            && let Some(entry) = stack_entries(app, self.window)
+                .into_iter()
+                .find(|entry| entry.node == node)
+            && entry.state == ui_core::popup::PopupState::Open
+            && !entry.hit_rect.is_empty()
+        {
+            report.picker_frames += 1;
+            report.picker_first.get_or_insert(entry.hit_rect);
+            report.picker_stable = Some(entry.hit_rect);
+        }
     }
 
     fn start_theme_check(&self, app: &mut App, window: WindowId) {
@@ -2428,6 +2707,10 @@ fn make_button(
     button
 }
 
+fn popup_anchor(node: NodeId) -> ui_core::popup::Anchor {
+    ui_core::popup::Anchor::Node { node }
+}
+
 fn demo_trigger(
     app: &mut App,
     window: WindowId,
@@ -2651,50 +2934,73 @@ fn print_input_probe(app: &App, window: WindowId, inputs: &[InputNode], prefix: 
     }
 }
 
-fn dump_overlay_nodes(app: &mut App, window: WindowId, prefixes: &[&str]) {
-    let Some(target) = app.window(window) else {
-        println!("gallery: overlay-dump window missing");
+fn stack_entries(app: &App, window: WindowId) -> Vec<ui_core::popup::PopupSnapshotEntry> {
+    app.popup_stack(window)
+        .map_or_else(Vec::new, |stack| stack.entries)
+}
+
+fn record_stack_empty(
+    app: &App,
+    window: WindowId,
+    report: &Rc<RefCell<DebugStackReport>>,
+    label: &'static str,
+) {
+    let entries = stack_entries(app, window);
+    report.borrow_mut().check(
+        entries.is_empty(),
+        label,
+        format_smolstr!(
+            "关闭后 popup 栈仍有 {} 条（不得残留）：{entries:?}",
+            entries.len()
+        ),
+    );
+}
+
+fn dump_popup_stack(app: &App, window: WindowId, label: &str) {
+    let Some(stack) = app.popup_stack(window) else {
+        println!("gallery: debug-stack {label} window={window:?} <missing window>");
         return;
     };
-    let tree = target.tree();
-    let root = tree.root();
-    let mut stack: Vec<(NodeId, usize)> = vec![(root, 0)];
-    while let Some((node, depth)) = stack.pop() {
-        let Ok(entry) = tree.get(node) else {
-            continue;
-        };
-        let id = tree.debug_id(node).unwrap_or("<no-id>");
-        if prefixes.iter().any(|prefix| id.starts_with(prefix)) {
-            let bounds = entry.layout().bounds;
-            let children = entry.children().len();
-            let scroll = app
-                .scroll_handle(window, node)
-                .and_then(|handle| app.scroll_state(&handle));
-            let scroll = scroll.map_or_else(
-                || SmolStr::new_static("-"),
-                |state| {
-                    format_smolstr!(
-                        "offset={:.1} content={:.1}x{:.1} viewport={:.1}x{:.1}",
-                        state.offset.y,
-                        state.content.width,
-                        state.content.height,
-                        state.viewport.width,
-                        state.viewport.height
-                    )
-                },
-            );
-            println!(
-                "gallery: overlay-dump {indent}{id} rect=({:.1},{:.1} {:.1}x{:.1}) children={children} scroll={scroll}",
-                bounds.origin.x,
-                bounds.origin.y,
-                bounds.size.width,
-                bounds.size.height,
-                indent = "  ".repeat(depth)
-            );
-        }
-        for child in entry.children().iter().rev() {
-            stack.push((*child, depth + 1));
-        }
+    println!(
+        "gallery: debug-stack {label} window={window:?} root={:?} entries={} z_order={:?}",
+        stack.root,
+        stack.entries.len(),
+        stack
+            .entries
+            .iter()
+            .map(|entry| entry.z)
+            .collect::<Vec<_>>()
+    );
+    for entry in &stack.entries {
+        let a11y_rect = app
+            .popup_rect(entry.id)
+            .map_or(entry.hit_rect, |rect| rect.a11y);
+        println!(
+            "gallery: debug-stack   id={:?} tier={:?} parent={:?} z={} state={:?} hit=({:.1},{:.1} {:.1}x{:.1}) paint=({:.1},{:.1} {:.1}x{:.1}) a11y=({:.1},{:.1} {:.1}x{:.1}) owner_modal={:?} focus={:?} node={:?} paint_offset=({:.1},{:.1}) constrained={:?}",
+            entry.id,
+            entry.tier,
+            entry.parent,
+            entry.z,
+            entry.state,
+            entry.hit_rect.origin.x,
+            entry.hit_rect.origin.y,
+            entry.hit_rect.size.width,
+            entry.hit_rect.size.height,
+            entry.paint_rect.origin.x,
+            entry.paint_rect.origin.y,
+            entry.paint_rect.size.width,
+            entry.paint_rect.size.height,
+            a11y_rect.origin.x,
+            a11y_rect.origin.y,
+            a11y_rect.size.width,
+            a11y_rect.size.height,
+            entry.owner_modal,
+            entry.focus,
+            entry.node,
+            entry.paint_offset.x,
+            entry.paint_offset.y,
+            entry.constrained_size,
+        );
     }
 }
 
@@ -2738,14 +3044,10 @@ fn picker_metrics(app: &App, window: WindowId, picker: &ColorPicker) -> (bool, O
     (open, children)
 }
 
-fn record_menu_metrics(
-    report: &Rc<RefCell<OverlayCheckReport>>,
-    metrics: Option<(usize, f32, f32)>,
-) {
+fn record_menu_metrics(report: &mut DebugStackReport, metrics: Option<(usize, f32, f32)>) {
     let Some(metrics) = metrics else {
         return;
     };
-    let mut report = report.borrow_mut();
     report.menu = Some(match report.menu {
         Some((children, content, thumb)) => (
             children.max(metrics.0),
@@ -2756,12 +3058,7 @@ fn record_menu_metrics(
     });
 }
 
-fn record_picker_metrics(
-    report: &Rc<RefCell<OverlayCheckReport>>,
-    is_open: bool,
-    children: Option<usize>,
-) {
-    let mut report = report.borrow_mut();
+fn record_picker_metrics(report: &mut DebugStackReport, is_open: bool, children: Option<usize>) {
     report.picker_open |= is_open;
     if children.is_some_and(|count| count > 0) {
         report.picker_panel_children = children;
@@ -2791,6 +3088,8 @@ struct PixelCheckReport {
     seen: Vec<(&'static str, u32)>,
     damage_full_frames: u32,
     sampled_frames: u32,
+    open_animation_frames: u32,
+    close_animation_frames: [u32; 2],
     first_visible: Option<LogicalRect>,
     stable: Option<LogicalRect>,
     moved: Option<LogicalRect>,
@@ -2830,7 +3129,7 @@ impl PixelCheckRun {
     ) {
         let popup = pixel_check_popup(app, picker);
         if self.report.first_visible.is_none()
-            && picker.overlay().revealed(app.app())
+            && picker.popup_state(app.app()) == Some(ui_core::popup::PopupState::Open)
             && popup.is_some_and(|rect| !rect.is_empty())
         {
             self.report.first_visible = popup;
@@ -2988,7 +3287,7 @@ impl PixelCheckRun {
 }
 
 fn pixel_check_popup(app: &TestApp, picker: &ColorPicker) -> Option<LogicalRect> {
-    let node = picker.overlay().panel_node()?;
+    let node = picker.panel_node()?;
     app.probe().bounds(node)
 }
 
@@ -3138,7 +3437,7 @@ fn pixel_check_close(
     let mut closed = false;
     for _ in 0..PIXEL_CHECK_SETTLE_LIMIT {
         pixel_check_tick(app, picker, pixels, run, stage, false);
-        if picker.overlay().overlay_node().is_none() {
+        if picker.popup_node().is_none() {
             closed = true;
             break;
         }
@@ -3199,13 +3498,9 @@ fn pixel_check_scene(app: &mut TestApp) -> ColorPicker {
             .build(tree, root)
             .expect("内容卡");
     }
-    let layer = Layer::new();
-    let router = AnimationRouter::new();
     let picker = ColorPicker::new(
         app.app_mut(),
         theme,
-        layer,
-        router,
         "gallery.pixel-check",
         Color::WHITE,
         UnifiedSize::Medium,
@@ -3266,11 +3561,16 @@ fn run_pixel_check() -> bool {
          (exit 0 = PASS, exit 3 = FAIL); residue judgement = old-popup region pixel-by-pixel \
          against the pre-open baseline with a coverage floor (compared >= {PIXEL_CHECK_MIN_COMPARED_PERMILLE} permille of the \
          fixture device pixels) and a negative self-check that corrupts >= 2 scattered detected pixels; \
-         real-window pixel readback/screenshot is P3 (--dump-overlay only asserts rects)"
+         real-window pixel readback/screenshot is P3 (--debug-stack only dumps popup_stack rects); \
+         sampled frame count follows the engine popup animation constants (open 120 ms / close 90 ms), \
+         every rendered frame is sampled; sampled-animation-floor requires >= 4 open-animation samples \
+         and >= 3 samples for each of the two close animations (close#1/close#2) so a shorter animation \
+         cannot silently shrink coverage"
     );
     println!(
-        "gallery: pixel-check migration note: this gate binds kit::overlay/ColorPicker APIs that \
-         P1-11 deletes; P1-12 must port it (registered in design §8 §11)"
+        "gallery: pixel-check scene: ColorPicker runs on PopupPanel/engine popup \
+         (panel_node/popup_node/popup_state + PopupState); the gate drives the live popup stack, \
+         --debug-stack dumps the same stack for windows"
     );
     let _guard = ui_core::test_support::snapshot::gpu_guard();
     let mut app = TestApp::new();
@@ -3337,7 +3637,9 @@ fn run_pixel_check() -> bool {
     };
     run.report
         .record(opened, "open", SmolStr::new_static("open: 面板必须打开"));
+    let sampled_before_open = run.report.sampled_frames;
     let settled = pixel_check_settle(&mut app, &picker, &mut pixels, &mut run, "open", true);
+    run.report.open_animation_frames = run.report.sampled_frames - sampled_before_open;
     run.report.record(
         settled,
         "open-settle",
@@ -3398,7 +3700,9 @@ fn run_pixel_check() -> bool {
     let closed = picker.close(app.app_mut());
     run.report
         .record(closed, "close", SmolStr::new_static("close: 面板必须关闭"));
+    let sampled_before_close = run.report.sampled_frames;
     pixel_check_close(&mut app, &picker, &mut pixels, &mut run, "close");
+    run.report.close_animation_frames[0] = run.report.sampled_frames - sampled_before_close;
     pixel_check_move_trigger(&mut app, &picker, PIXEL_CHECK_TRIGGER_A);
     let restored = pixel_check_settle(
         &mut app,
@@ -3447,15 +3751,46 @@ fn run_pixel_check() -> bool {
         "reopen-close",
         SmolStr::new_static("reopen-close: 面板必须关闭"),
     );
+    let sampled_before_reopen_close = run.report.sampled_frames;
     pixel_check_close(&mut app, &picker, &mut pixels, &mut run, "reopen-close");
+    run.report.close_animation_frames[1] = run.report.sampled_frames - sampled_before_reopen_close;
     run.assert_restored("reopen-close");
+
+    let open_samples = run.report.open_animation_frames;
+    let close_first_samples = run.report.close_animation_frames[0];
+    let close_second_samples = run.report.close_animation_frames[1];
+    run.report.record(
+        open_samples >= 4,
+        "sampled-animation-floor",
+        format_smolstr!(
+            "open 动画采样帧 {open_samples} < 4（引擎 POPUP_OPEN_DURATION=120 ms；动画常量变化不得让采样静默缩水）"
+        ),
+    );
+    run.report.record(
+        close_first_samples >= 3,
+        "sampled-animation-floor",
+        format_smolstr!(
+            "close#1 动画采样帧 {close_first_samples} < 3（引擎 POPUP_CLOSE_DURATION=90 ms；单次关闭动画消失不得被累计采样掩盖）"
+        ),
+    );
+    run.report.record(
+        close_second_samples >= 3,
+        "sampled-animation-floor",
+        format_smolstr!(
+            "close#2 动画采样帧 {close_second_samples} < 3（引擎 POPUP_CLOSE_DURATION=90 ms；单次关闭动画消失不得被累计采样掩盖）"
+        ),
+    );
 
     let report = run.report;
     let passed = report.failures == 0;
     println!(
-        "gallery: pixel-check checks={} sampled_frames={} damage_full_frames={} first_visible={:?} stable={:?} moved={:?}",
+        "gallery: pixel-check checks={} sampled_frames={} open_animation_frames={} close_animation_frames={}+{}={} damage_full_frames={} first_visible={:?} stable={:?} moved={:?}",
         report.checks,
         report.sampled_frames,
+        report.open_animation_frames,
+        close_first_samples,
+        close_second_samples,
+        close_first_samples + close_second_samples,
         report.damage_full_frames,
         report.first_visible,
         report.stable,
@@ -3493,6 +3828,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "gallery: window {:?} created ({}×{} logical), 15 sections",
         gallery.window, WINDOW_W, WINDOW_H
+    );
+    println!(
+        "gallery: gates: --pixel-check = headless pixel gate (exit 0/3); --debug-stack = real-window popup stack/rect gate (exit 0/3 when its final round completes; --auto-close only raises its >=30s watchdog, covers the removed --dump-overlay)"
     );
     gallery.install(&mut app);
     Application::new().run(app)?;
@@ -3534,15 +3872,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    if gallery.flags.dump_overlay {
-        let report = gallery.overlay_check.borrow();
+    if gallery.flags.debug_stack {
+        let report = gallery.debug_stack.borrow();
         if report.pass() {
             println!(
-                "gallery: overlay-check PASS (menu={:?} picker_open={} picker_children={:?})",
-                report.menu, report.picker_open, report.picker_panel_children
+                "gallery: overlay-check PASS (menu={:?} menu_frames={} picker_open={} picker_frames={} picker_children={:?})",
+                report.menu,
+                report.menu_frames,
+                report.picker_open,
+                report.picker_frames,
+                report.picker_panel_children
             );
         } else {
-            println!("gallery: overlay-check FAIL ({report:?})");
+            println!(
+                "gallery: overlay-check FAIL ({} failure(s)): {:?}",
+                report.failures.len(),
+                report.failures
+            );
             failed = true;
         }
     }

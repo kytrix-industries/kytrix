@@ -4,15 +4,14 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    math::{LogicalPoint, LogicalPx, px},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::id::NodeId,
+    popup::{Alignment, Anchor, DismissReason, PlacementSpec, PopupError, ShiftPolicy, Side},
     window::WindowId,
 };
 
 use crate::kit::{
-    layer::{Band, Layer},
-    menu::{Menu, MenuEntry, MenuMode, MenuOptions},
-    overlay::{Anchor, AnimationRouter, OverlayError, Placement},
+    menu::{Menu, MenuEntry, MenuOptions},
     size::UnifiedSize,
 };
 
@@ -21,15 +20,6 @@ pub enum MenuAnchor {
     #[default]
     TopLeft,
     BottomLeft,
-}
-
-impl MenuAnchor {
-    fn placement(self) -> Placement {
-        match self {
-            Self::TopLeft => Placement::BOTTOM_START,
-            Self::BottomLeft => Placement::TOP_START,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,19 +75,14 @@ pub struct ContextMenu {
 }
 
 struct ContextMenuInner {
-    key: SmolStr,
-    layer: Layer,
     menu: RefCell<Menu>,
     on_item_click: RefCell<Option<Rc<dyn Fn(&mut App, SmolStr)>>>,
-    window: RefCell<Option<WindowId>>,
 }
 
 impl ContextMenu {
     pub fn new(
         app: &mut App,
         theme: crate::theme::handle::ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         key: impl Into<SmolStr>,
         entries: impl IntoIterator<Item = MenuEntry>,
         options: ContextMenuOptions,
@@ -106,27 +91,18 @@ impl ContextMenu {
         let menu = Menu::new(
             app,
             theme,
-            layer.clone(),
-            router,
             format_smolstr!("{key}:menu"),
             entries,
             menu_options(&options),
-        );
+        )
+        .closing_on_scroll();
         let inner = Rc::new(ContextMenuInner {
-            key,
-            layer,
             menu: RefCell::new(menu),
             on_item_click: RefCell::new(None),
-            window: RefCell::new(None),
         });
         let context_menu = Self { inner };
         context_menu.install_handlers();
         context_menu
-    }
-
-    #[must_use]
-    pub fn key(&self) -> &str {
-        &self.inner.key
     }
 
     #[must_use]
@@ -137,6 +113,11 @@ impl ContextMenu {
     #[must_use]
     pub fn panel_node(&self) -> Option<NodeId> {
         self.inner.menu.borrow().panel_node()
+    }
+
+    #[must_use]
+    pub fn popup_node(&self) -> Option<NodeId> {
+        self.inner.menu.borrow().popup_node()
     }
 
     #[must_use]
@@ -162,13 +143,8 @@ impl ContextMenu {
         app: &mut App,
         window: WindowId,
         point: LogicalPoint,
-    ) -> Result<bool, OverlayError> {
-        self.close_peers(app, window);
-        *self.inner.window.borrow_mut() = Some(window);
-        self.inner
-            .menu
-            .borrow()
-            .open(app, window, Anchor::point(point))
+    ) -> Result<bool, PopupError> {
+        self.open_at(app, window, point, None)
     }
 
     pub fn open_at(
@@ -177,13 +153,12 @@ impl ContextMenu {
         window: WindowId,
         point: LogicalPoint,
         highlighted: Option<&str>,
-    ) -> Result<bool, OverlayError> {
-        self.close_peers(app, window);
-        *self.inner.window.borrow_mut() = Some(window);
+    ) -> Result<bool, PopupError> {
+        let anchor = Anchor::WindowRect(LogicalRect::from_origin_size(point, LogicalSize::ZERO));
         self.inner
             .menu
             .borrow()
-            .open_at(app, window, Anchor::point(point), highlighted)
+            .open_at(app, window, anchor, highlighted)
     }
 
     pub fn close(&self, app: &mut App) -> bool {
@@ -199,7 +174,7 @@ impl ContextMenu {
         self
     }
 
-    pub fn on_close(self, callback: impl Fn(&mut App) + 'static) -> Self {
+    pub fn on_close(self, callback: impl Fn(&mut App, DismissReason) + 'static) -> Self {
         let menu = self.inner.menu.borrow().clone().on_close(callback);
         *self.inner.menu.borrow_mut() = menu;
         self
@@ -231,44 +206,38 @@ impl ContextMenu {
             });
         *self.inner.menu.borrow_mut() = menu;
     }
-
-    fn close_peers(&self, app: &mut App, window: WindowId) {
-        let own = self.inner.menu.borrow().overlay_node();
-        while let Some(top) = self.inner.layer.top_of(window, Band::ContextMenu) {
-            if Some(top.node()) == own {
-                break;
-            }
-            if !self
-                .inner
-                .layer
-                .close_top_of(app, window, Band::ContextMenu)
-            {
-                break;
-            }
-        }
-    }
 }
 
 fn menu_options(options: &ContextMenuOptions) -> MenuOptions {
+    let placement = match options.anchor {
+        MenuAnchor::TopLeft => PlacementSpec {
+            side: Side::Bottom,
+            align: Alignment::Start,
+            gap: LogicalPx::ZERO,
+            shift: ShiftPolicy::None,
+            ..PlacementSpec::default()
+        },
+        MenuAnchor::BottomLeft => PlacementSpec {
+            side: Side::Top,
+            align: Alignment::Start,
+            gap: LogicalPx::ZERO,
+            shift: ShiftPolicy::None,
+            ..PlacementSpec::default()
+        },
+    };
     MenuOptions {
         size: options.size,
         width: options.width,
         max_height: options.max_height,
-        mode: MenuMode::Menu,
-        placement: options.anchor.placement(),
-        gap: LogicalPx::ZERO,
-        band: Band::ContextMenu,
+        placement,
         label: options.label.clone(),
-        submenu_delay: std::time::Duration::from_millis(150),
+        ..MenuOptions::default()
     }
 }
 
 impl fmt::Debug for ContextMenu {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ContextMenu")
-            .field("key", &self.inner.key)
-            .finish()
+        formatter.debug_struct("ContextMenu").finish()
     }
 }
 
@@ -288,6 +257,7 @@ mod tests {
         math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::style_builder::StyleBuilder,
+        popup::{PopupId, PopupSnapshotEntry, PopupState},
         test_support::app::TestApp,
         window::WindowId,
     };
@@ -295,10 +265,8 @@ mod tests {
     use super::{ContextMenu, ContextMenuOptions, MenuAnchor, MenuEntry};
     use crate::{
         kit::{
-            layer::{Band, Layer},
             menu::{MenuAction, MenuSubmenu},
-            overlay::AnimationRouter,
-            test_support::{a11y_snapshot_without_oracle, overlay_wrapper},
+            test_support::a11y_snapshot_without_oracle,
         },
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
@@ -307,8 +275,6 @@ mod tests {
         app: TestApp,
         window: WindowId,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         reported: Rc<RefCell<Vec<SmolStr>>>,
         closes: Rc<Cell<usize>>,
         background_clicks: Rc<Cell<usize>>,
@@ -322,6 +288,10 @@ mod tests {
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
             let clicks = Rc::new(Cell::new(0));
             let sink = clicks.clone();
+            app.app_mut().on_action(
+                Action::Custom(SmolStr::new_static("background.click")),
+                move |_| sink.set(sink.get() + 1),
+            );
             NodeBuilder::boxed()
                 .id("background")
                 .layout_override(LogicalRect::new(px(600.0), px(500.0), px(80.0), px(40.0)))
@@ -331,16 +301,10 @@ mod tests {
                     root,
                 )
                 .expect("背景节点");
-            app.app_mut().on_action(
-                Action::Custom(SmolStr::new_static("background.click")),
-                move |_| sink.set(sink.get() + 1),
-            );
             Self {
                 app,
                 window,
                 theme,
-                layer: Layer::new(),
-                router: AnimationRouter::new(),
                 reported: Rc::new(RefCell::new(Vec::new())),
                 closes: Rc::new(Cell::new(0)),
                 background_clicks: clicks,
@@ -361,14 +325,12 @@ mod tests {
             ContextMenu::new(
                 self.app.app_mut(),
                 self.theme.clone(),
-                self.layer.clone(),
-                self.router.clone(),
                 "context",
                 entries,
                 options,
             )
             .on_item_click(move |_, id| reported.borrow_mut().push(id))
-            .on_close(move |_| closes.set(closes.get() + 1))
+            .on_close(move |_, _| closes.set(closes.get() + 1))
         }
 
         fn open(&mut self, menu: &ContextMenu, at: LogicalPoint) -> bool {
@@ -389,6 +351,12 @@ mod tests {
             let _ = self.app.drain().expect("帧");
             let _ = menu.sync(self.app.app_mut());
             let _ = self.app.drain().expect("帧");
+        }
+
+        fn drain(&mut self, menu: &ContextMenu) -> ui_core::test_support::record::FrameRecord {
+            let record = self.app.drain().expect("帧").clone();
+            let _ = menu.sync(self.app.app_mut());
+            record
         }
 
         fn click(&mut self, menu: &ContextMenu, at: LogicalPoint) {
@@ -451,9 +419,27 @@ mod tests {
             self.settle(menu);
         }
 
-        fn root_children(&self) -> Vec<NodeId> {
-            let tree = self.app.app().window(self.window).expect("窗口").tree();
-            tree.get(tree.root()).expect("root").children().to_vec()
+        fn stack(&self) -> Vec<PopupSnapshotEntry> {
+            self.app
+                .app()
+                .popup_stack(self.window)
+                .expect("浮层栈")
+                .entries
+        }
+
+        fn root_entry(&self, menu: &ContextMenu) -> PopupSnapshotEntry {
+            let node = menu.popup_node().expect("浮层内容节点");
+            self.stack()
+                .into_iter()
+                .find(|entry| entry.node == node)
+                .expect("根菜单在栈里")
+        }
+
+        fn submenu_entry(&self, root: PopupId) -> PopupSnapshotEntry {
+            self.stack()
+                .into_iter()
+                .find(|entry| entry.parent == Some(root))
+                .expect("子菜单在栈里")
         }
     }
 
@@ -469,6 +455,16 @@ mod tests {
             width: px(200.0),
             ..ContextMenuOptions::default()
         }
+    }
+
+    fn entries_with_submenu() -> Vec<MenuEntry> {
+        vec![
+            MenuEntry::Action(MenuAction::new("copy", "复制")),
+            MenuEntry::Submenu(MenuSubmenu::new(
+                "更多",
+                [MenuEntry::Action(MenuAction::new("inner", "内部"))],
+            )),
+        ]
     }
 
     #[test]
@@ -496,6 +492,28 @@ mod tests {
         assert!(
             (panel.max().y - point.y).abs().value() < 0.5,
             "左下角锚点：底边在点上（实际 {panel:?} / 点 {point:?}）"
+        );
+    }
+
+    #[test]
+    fn the_first_visible_frame_already_has_the_settled_rect() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(options());
+        let point = LogicalPoint::new(px(300.0), px(200.0));
+        let opened = menu
+            .open(harness.app.app_mut(), harness.window, point)
+            .expect("打开");
+        assert!(opened);
+        let _ = menu.sync(harness.app.app_mut());
+        harness.drain(&menu);
+        let first_entry = harness.root_entry(&menu);
+        assert_eq!(first_entry.state, PopupState::Open, "首帧即 Open");
+        let first = first_entry.hit_rect;
+        harness.settle(&menu);
+        assert_eq!(
+            first,
+            harness.root_entry(&menu).hit_rect,
+            "首帧 rect 等于稳定帧"
         );
     }
 
@@ -530,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn a_press_outside_closes_the_menu_and_does_not_reach_the_page() {
+    fn a_press_outside_closes_the_menu_and_replays_the_press_to_the_page() {
         let mut harness = Harness::new();
         let menu = harness.menu(options());
         harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
@@ -538,8 +556,8 @@ mod tests {
         assert!(!menu.is_open(harness.app.app()), "外部按下关闭菜单");
         assert_eq!(
             harness.background_clicks.get(),
-            0,
-            "浮层吞掉这次按下（旧 backdrop 的 BlockMouse 语义）"
+            1,
+            "D14：Auto 根外部按下按 Replay 重派给下层命中控件"
         );
     }
 
@@ -567,12 +585,12 @@ mod tests {
         harness.open(&first, LogicalPoint::new(px(300.0), px(200.0)));
         assert!(first.is_open(harness.app.app()));
         harness.open(&second, LogicalPoint::new(px(400.0), px(300.0)));
-        harness.settle(&first);
         assert!(
             !first.is_open(harness.app.app()),
-            "同层带至多一个（旧 Layer 语义）"
+            "Auto 根替换：后开的右键菜单关闭前一个"
         );
         assert!(second.is_open(harness.app.app()));
+        assert_eq!(harness.stack().len(), 1);
     }
 
     #[test]
@@ -580,7 +598,8 @@ mod tests {
         let mut harness = Harness::new();
         let menu = harness.menu_with(entries_with_submenu(), options());
         harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
-        let root_panel = menu.panel_node().expect("根面板");
+        let root_node = menu.popup_node().expect("根浮层节点");
+        let root_id = harness.root_entry(&menu).id;
         let at = harness.row_center(1);
         harness.hover(&menu, at);
         assert!(
@@ -589,7 +608,7 @@ mod tests {
                 .is_some(),
             "悬停打开子菜单"
         );
-        assert_eq!(harness.layer.len(harness.window), 2, "根菜单 + 子菜单两层");
+        assert_eq!(harness.stack().len(), 2, "根菜单 + 子菜单两层");
 
         harness.open(&menu, LogicalPoint::new(px(200.0), px(150.0)));
         assert!(
@@ -599,31 +618,12 @@ mod tests {
             "自身重开时旧子菜单被关掉"
         );
         assert_eq!(
-            menu.panel_node(),
-            Some(root_panel),
+            menu.popup_node(),
+            Some(root_node),
             "自己的根被保留（只换锚点，不重建面板）"
         );
-        let top = harness
-            .layer
-            .top_of(harness.window, Band::ContextMenu)
-            .expect("根菜单仍在层带里");
-        let tree = harness
-            .app
-            .app()
-            .window(harness.window)
-            .expect("窗口")
-            .tree();
-        let mut cursor = Some(root_panel);
-        let mut top_is_root = false;
-        while let Some(node) = cursor {
-            if node == top.node() {
-                top_is_root = true;
-                break;
-            }
-            cursor = tree.get(node).ok().and_then(|node| node.parent());
-        }
-        assert!(top_is_root, "层带顶部是自己的根浮层（而非旧子菜单）");
-        assert_eq!(harness.layer.len(harness.window), 1, "层带只剩根菜单一层");
+        assert_eq!(harness.root_entry(&menu).id, root_id, "根 PopupId 不变");
+        assert_eq!(harness.stack().len(), 1, "栈只剩根菜单一层");
     }
 
     #[test]
@@ -656,8 +656,7 @@ mod tests {
         let _ = harness.app.drain().expect("帧");
         harness.app.assert_a11y_contract();
         let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
-        let panel = menu.panel_node().expect("面板");
-        let wrapper = overlay_wrapper(harness.app.app(), harness.window, panel);
+        let wrapper = menu.popup_node().expect("浮层内容节点");
         let record = snapshot.node_for(wrapper).expect("包装节点在 a11y 树里");
         assert_eq!(record.role, A11yRole::Menu);
         assert_eq!(
@@ -671,14 +670,32 @@ mod tests {
         );
     }
 
-    fn entries_with_submenu() -> Vec<MenuEntry> {
-        vec![
-            MenuEntry::Action(MenuAction::new("copy", "复制")),
-            MenuEntry::Submenu(MenuSubmenu::new(
-                "更多",
-                [MenuEntry::Action(MenuAction::new("inner", "内部"))],
-            )),
-        ]
+    #[test]
+    fn a_submenu_stacks_above_the_root_and_escape_closes_it_first() {
+        let mut harness = Harness::new();
+        let menu = harness.menu_with(entries_with_submenu(), options());
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
+        let root_id = harness.root_entry(&menu).id;
+        let root_z = harness.root_entry(&menu).z;
+
+        let at = harness.row_center(1);
+        harness.hover(&menu, at);
+        let submenu = harness.submenu_entry(root_id);
+        assert!(submenu.z > root_z, "子菜单 z 在父之上");
+        assert_eq!(submenu.parent, Some(root_id), "子菜单 parent 指向父菜单");
+
+        harness.key(&menu, KeyCode::Escape);
+        assert!(menu.is_open(harness.app.app()), "Esc 先关子菜单");
+        assert_eq!(harness.stack().len(), 1, "子菜单已关闭，根菜单仍在栈里");
+        assert!(
+            harness
+                .find("context:menu:sub:1:panel:list:row:0")
+                .is_none(),
+            "子菜单节点已卸载"
+        );
+        harness.key(&menu, KeyCode::Escape);
+        assert!(!menu.is_open(harness.app.app()), "第二次 Esc 关父菜单");
+        assert_eq!(harness.closes.get(), 1, "根菜单只上报一次关闭");
     }
 
     fn scroll_page(harness: &mut Harness) -> ui_core::interaction::ScrollHandle {
@@ -729,10 +746,6 @@ mod tests {
             Modifiers::empty(),
         ));
         harness.settle(menu);
-        for _ in 0..8 {
-            harness.app.advance(Duration::from_millis(40));
-            let _ = harness.app.drain().expect("帧");
-        }
     }
 
     fn page_offset(harness: &Harness, handle: &ui_core::interaction::ScrollHandle) -> f32 {
@@ -748,101 +761,47 @@ mod tests {
     }
 
     #[test]
-    fn a_submenu_keeps_the_context_menu_band_and_escape_closes_it_first() {
-        let mut harness = Harness::new();
-        let menu = harness.menu_with(entries_with_submenu(), options());
-        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
-        let root_panel = menu.panel_node().expect("根面板");
-        let root_wrapper = overlay_wrapper(harness.app.app(), harness.window, root_panel);
-        let before = harness.root_children();
-        assert_eq!(
-            before.iter().filter(|node| **node == root_wrapper).count(),
-            1,
-            "根浮层是 root 的直接子节点"
-        );
-
-        let at = harness.row_center(1);
-        harness.hover(&menu, at);
-        let children = harness.root_children();
-        let submenu_row = harness
-            .find("context:menu:sub:1:panel:list:row:0")
-            .unwrap_or_else(|| {
-                let tree = harness
-                    .app
-                    .app()
-                    .window(harness.window)
-                    .expect("窗口")
-                    .tree();
-                let ids: Vec<String> = tree
-                    .get(tree.root())
-                    .expect("root")
-                    .children()
-                    .iter()
-                    .map(|node| format!("{:?}", tree.debug_id(*node)))
-                    .collect();
-                panic!("子菜单行未挂载；root children = {ids:?}");
-            });
-        let submenu_wrapper = overlay_wrapper(harness.app.app(), harness.window, submenu_row);
-        let root_index = children.iter().position(|node| *node == root_wrapper);
-        let submenu_index = children.iter().position(|node| *node == submenu_wrapper);
-        assert!(
-            submenu_index > root_index,
-            "子菜单在父面板之后排序（z 序在上）：root {root_index:?} / submenu {submenu_index:?}"
-        );
-
-        let top = harness
-            .layer
-            .top_of(harness.window, Band::ContextMenu)
-            .expect("层带里有菜单");
-        let tree = harness
-            .app
-            .app()
-            .window(harness.window)
-            .expect("窗口")
-            .tree();
-        let mut cursor = Some(submenu_row);
-        let mut top_is_submenu = false;
-        while let Some(node) = cursor {
-            if node == top.node() {
-                top_is_submenu = true;
-                break;
-            }
-            cursor = tree.get(node).ok().and_then(|node| node.parent());
-        }
-        assert!(top_is_submenu, "层带顶部是子菜单面板（而非父菜单）");
-
-        harness.key(&menu, KeyCode::Escape);
-        assert!(menu.is_open(harness.app.app()), "Esc 先关子菜单");
-        assert!(
-            harness
-                .find("context:menu:sub:1:panel:list:row:0")
-                .is_none(),
-            "子菜单已关闭"
-        );
-        harness.key(&menu, KeyCode::Escape);
-        assert!(!menu.is_open(harness.app.app()), "第二次 Esc 关父菜单");
-        assert_eq!(harness.closes.get(), 1, "根菜单只上报一次关闭");
-    }
-
-    #[test]
-    fn the_page_does_not_scroll_under_an_open_context_menu() {
+    fn scrolling_the_page_closes_the_open_context_menu() {
         let mut harness = Harness::new();
         let page = scroll_page(&mut harness);
         let menu = harness.menu(options());
         harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
 
         wheel(&mut harness, &menu, LogicalPoint::new(px(700.0), px(500.0)));
-        assert_eq!(page_offset(&harness, &page), 0.0, "面板外滚轮不滚页面");
-        let on_panel = harness.row_center(0);
-        wheel(&mut harness, &menu, on_panel);
-        assert_eq!(page_offset(&harness, &page), 0.0, "面板上滚轮不滚页面");
-
-        harness.key(&menu, KeyCode::Escape);
-        wheel(&mut harness, &menu, LogicalPoint::new(px(700.0), px(500.0)));
         assert!(
             page_offset(&harness, &page) > 50.0,
-            "无浮层时页面可滚：{}",
-            page_offset(&harness, &page)
+            "Auto 非模态右键菜单不吞背景滚动（旧 modal 行为已按设计变更）"
         );
+        assert!(
+            !menu.is_open(harness.app.app()),
+            "背景滚动必须关闭右键菜单整链（设计 §4.7 矩阵）"
+        );
+        assert_eq!(harness.closes.get(), 1, "关闭只上报一次");
+    }
+
+    #[test]
+    fn opening_and_closing_the_context_menu_never_forces_a_full_repaint() {
+        let mut harness = Harness::new();
+        let menu = harness.menu(options());
+        harness.open(&menu, LogicalPoint::new(px(300.0), px(200.0)));
+        let id = harness.root_entry(&menu).id;
+        for _ in 0..4 {
+            let record = harness.drain(&menu);
+            assert!(!record.damage_full, "打开右键菜单不得全量重绘");
+        }
+        assert!(menu.close(harness.app.app_mut()));
+        for _ in 0..12 {
+            harness.app.advance(Duration::from_millis(16));
+            let record = harness.drain(&menu);
+            assert!(!record.damage_full, "关闭右键菜单不得全量重绘");
+            if harness.app.app().popup_rect(id).is_none() {
+                break;
+            }
+        }
+        assert!(
+            harness.app.app().popup_rect(id).is_none(),
+            "关闭动画结束后节点卸载"
+        );
+        assert_eq!(harness.closes.get(), 1);
     }
 }

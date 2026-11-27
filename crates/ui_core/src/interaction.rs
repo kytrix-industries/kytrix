@@ -1,18 +1,16 @@
 pub mod animation;
 pub mod drag;
 pub mod focus;
-pub mod overlay;
 pub mod scroll;
 pub mod virtual_list;
 
 use std::time::{Duration, Instant};
 
 use crate::{
-    a11y::A11yOverride,
     app::App,
     event::{Action, ActionSource, Modifiers, PointerButton},
     layout::hit_test::HitResult,
-    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
+    math::{LogicalPoint, LogicalPx, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{color::Color, style::Cursor},
     window::WindowId,
@@ -126,6 +124,7 @@ pub(crate) struct PointerState {
     pub last_hit: Option<HitResult>,
     pub modifiers: Modifiers,
     pub text_edit: Option<crate::text_edit::TextPointerPress>,
+    pub suppress_release: bool,
 }
 
 impl PointerState {
@@ -140,6 +139,7 @@ impl PointerState {
             last_hit: None,
             modifiers: Modifiers::empty(),
             text_edit: None,
+            suppress_release: false,
         }
     }
 
@@ -319,82 +319,6 @@ impl std::fmt::Debug for VirtualSlot {
             .field("mounted", &self.mounted)
             .finish()
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OverlayDismiss {
-    OutsideClick,
-    Explicit,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnchorSide {
-    Below,
-    Above,
-    Left,
-    Right,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum OverlayPlacement {
-    Point(LogicalPoint),
-    Anchor {
-        node: NodeId,
-        side: AnchorSide,
-        gap: f32,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct OverlayOptions {
-    pub placement: OverlayPlacement,
-    pub dismiss: OverlayDismiss,
-    pub trap_focus: bool,
-    pub restore_focus: bool,
-    pub a11y: A11yOverride,
-}
-
-impl Default for OverlayOptions {
-    fn default() -> Self {
-        Self {
-            placement: OverlayPlacement::Point(LogicalPoint::ZERO),
-            dismiss: OverlayDismiss::OutsideClick,
-            trap_focus: false,
-            restore_focus: false,
-            a11y: A11yOverride::default(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Overlay {
-    window: WindowId,
-    node: NodeId,
-}
-
-impl Overlay {
-    pub(crate) fn new(window: WindowId, node: NodeId) -> Self {
-        Self { window, node }
-    }
-
-    #[must_use]
-    pub fn window(&self) -> WindowId {
-        self.window
-    }
-
-    #[must_use]
-    pub fn node(&self) -> NodeId {
-        self.node
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct OverlaySlot {
-    pub dismiss: OverlayDismiss,
-    pub placement: OverlayPlacement,
-    pub trap_focus: bool,
-    pub opener: Option<NodeId>,
-    pub restore_focus: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -596,8 +520,8 @@ pub(crate) struct NodeInteraction {
     pub press_focus_target: Option<NodeId>,
     pub scroll: Option<ScrollSlot>,
     pub virtual_list: Option<VirtualSlot>,
-    pub overlay: Option<OverlaySlot>,
     pub focus_ring: Option<crate::paint::style::FocusRing>,
+    pub hit_focus_skip: crate::node::tree::HitFocusSkip,
 }
 
 impl NodeInteraction {
@@ -608,8 +532,8 @@ impl NodeInteraction {
             press_focus_target: None,
             scroll: None,
             virtual_list: None,
-            overlay: None,
             focus_ring: None,
+            hit_focus_skip: crate::node::tree::HitFocusSkip::None,
         }
     }
 }
@@ -622,35 +546,9 @@ impl std::fmt::Debug for NodeInteraction {
             .field("press_focus_target", &self.press_focus_target)
             .field("scroll", &self.scroll)
             .field("virtual_list", &self.virtual_list)
-            .field("overlay", &self.overlay)
             .field("focus_ring", &self.focus_ring)
+            .field("hit_focus_skip", &self.hit_focus_skip)
             .finish()
-    }
-}
-
-pub(crate) fn resolve_placement(
-    tree: &crate::node::tree::NodeTree,
-    placement: OverlayPlacement,
-    size: crate::math::LogicalSize,
-) -> LogicalPoint {
-    match placement {
-        OverlayPlacement::Point(origin) => origin,
-        OverlayPlacement::Anchor { node, side, gap } => {
-            let bounds = tree.get(node).map_or_else(
-                |_| LogicalRect::default(),
-                |target| scroll::to_screen(tree, node, target.layout().bounds),
-            );
-            match side {
-                AnchorSide::Below => LogicalPoint::new(bounds.origin.x, bounds.max().y + gap),
-                AnchorSide::Above => {
-                    LogicalPoint::new(bounds.origin.x, bounds.origin.y - gap - size.height)
-                }
-                AnchorSide::Left => {
-                    LogicalPoint::new(bounds.origin.x - gap - size.width, bounds.origin.y)
-                }
-                AnchorSide::Right => LogicalPoint::new(bounds.max().x + gap, bounds.origin.y),
-            }
-        }
     }
 }
 

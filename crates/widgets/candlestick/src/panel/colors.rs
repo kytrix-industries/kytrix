@@ -118,19 +118,9 @@ impl FieldPicker {
         suffix: &str,
     ) -> Result<Self, EngineError> {
         let theme: ThemeHandle = cx.theme().clone();
-        let layer = cx.layer().clone();
-        let router = cx.animation().clone();
         let key = cx.unique_key(suffix);
         let color = Color::from(field.color);
-        let picker = ColorPicker::new(
-            cx.app_mut(),
-            theme,
-            layer,
-            router,
-            key,
-            color,
-            UnifiedSize::Small,
-        );
+        let picker = ColorPicker::new(cx.app_mut(), theme, key, color, UnifiedSize::Small);
         picker.set_labels(cx.app_mut(), labels.clone());
         let color_key = field.key();
         let window: WindowId = cx.window();

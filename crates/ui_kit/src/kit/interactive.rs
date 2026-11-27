@@ -20,6 +20,7 @@ use ui_core::{
         style::{Cursor, StylePatch},
         style_builder::{PaintBuilder, StyleBuilder},
     },
+    popup::HasPopup,
     window::WindowId,
 };
 
@@ -67,6 +68,7 @@ pub struct Interactive {
     label: Option<SmolStr>,
     a11y_label_signal: Option<Signal<SmolStr>>,
     a11y_expanded: Option<Signal<bool>>,
+    a11y_has_popup: Option<HasPopup>,
     a11y_role: A11yRole,
     checked: Option<Signal<bool>>,
     a11y_set: Option<(usize, usize)>,
@@ -135,6 +137,7 @@ impl Interactive {
             label: None,
             a11y_label_signal: None,
             a11y_expanded: None,
+            a11y_has_popup: None,
             a11y_role: A11yRole::Button,
             checked: None,
             a11y_set: None,
@@ -216,6 +219,12 @@ impl Interactive {
     #[must_use]
     pub fn a11y_expanded(mut self, expanded: Signal<bool>) -> Self {
         self.a11y_expanded = Some(expanded);
+        self
+    }
+
+    #[must_use]
+    pub fn a11y_has_popup(mut self, has_popup: HasPopup) -> Self {
+        self.a11y_has_popup = Some(has_popup);
         self
     }
 
@@ -392,6 +401,7 @@ impl Interactive {
         let a11y_label = self.label.clone();
         let a11y_label_signal = self.a11y_label_signal;
         let a11y_expanded = self.a11y_expanded;
+        let a11y_has_popup = self.a11y_has_popup;
         let a11y_role = self.a11y_role;
         let checked = self.checked;
         let a11y_set = self.a11y_set;
@@ -461,6 +471,7 @@ impl Interactive {
                     None => a11y_label.clone(),
                 },
                 expanded: a11y_expanded.map(|signal| *cx.read(&signal)),
+                has_popup: a11y_has_popup,
                 disabled: Some(*cx.read(&disabled) || *cx.read(&loading)),
                 busy: Some(*cx.read(&loading)),
                 selected: Some(*cx.read(&selected)),

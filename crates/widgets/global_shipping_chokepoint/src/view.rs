@@ -719,8 +719,6 @@ impl GlobalShippingChokepointWidget {
         let translate = cx.translate().clone();
         let key = cx.unique_key(FILTER_KEY_SUFFIX);
         let theme = cx.theme().clone();
-        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
-        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
         let options = SelectOptions::default()
             .size(UnifiedSize::Small)
             .label(t_smol!(
@@ -729,8 +727,8 @@ impl GlobalShippingChokepointWidget {
             ))
             .placeholder(self.filter_trigger_text(&translate));
         let window = cx.window();
-        let select = Select::new(cx.app_mut(), theme, layer, router, key, options).on_change(
-            move |app, chosen| {
+        let select =
+            Select::new(cx.app_mut(), theme, key, options).on_change(move |app, chosen| {
                 let Some(id) = chosen.first() else {
                     return;
                 };
@@ -739,8 +737,7 @@ impl GlobalShippingChokepointWidget {
                 };
                 app.write(&requests, Some(HeaderRequest::Filter(filter)));
                 let _ = app.request_repaint(window);
-            },
-        );
+            });
         select
             .set_items(cx.app_mut(), self.filter_items(&translate))
             .unwrap_or_else(|error| {

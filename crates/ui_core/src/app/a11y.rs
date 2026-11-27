@@ -12,7 +12,9 @@ pub(crate) fn on_a11y_action(
     action: crate::a11y::A11yAction,
     handler: impl FnMut(&mut crate::a11y::A11yActionCtx<'_>) + 'static,
 ) -> bool {
-    if action == crate::a11y::A11yAction::Click {
+    if action == crate::a11y::A11yAction::Click
+        || action == crate::a11y::A11yAction::Custom(crate::a11y::DISMISS_CUSTOM_ACTION_ID)
+    {
         return false;
     }
     app.a11y_handlers.insert(action, Box::new(handler));

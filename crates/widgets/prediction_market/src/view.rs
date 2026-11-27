@@ -25,8 +25,6 @@ use ui_kit::{
     kit::{
         button::Button,
         empty_state::EmptyState,
-        layer::Layer,
-        overlay::AnimationRouter,
         select::{Select, SelectItem, SelectOptions},
         size::{UnifiedSizable, UnifiedSize},
     },
@@ -2186,23 +2184,15 @@ impl PredictionMarketWidget {
         on_change: impl Fn(&mut App, WindowId, &str) + 'static,
     ) -> Result<Select, EngineError> {
         let key = cx.unique_key(suffix);
-        let layer = Layer::clone(cx.layer());
-        let router = AnimationRouter::clone(cx.animation());
         let window = cx.window();
-        let select = Select::new(
-            cx.app_mut(),
-            self.theme.clone(),
-            layer,
-            router,
-            key,
-            options,
-        )
-        .on_change(move |app, chosen| {
-            let Some(id) = chosen.first() else {
-                return;
-            };
-            on_change(app, window, id.as_str());
-        });
+        let select = Select::new(cx.app_mut(), self.theme.clone(), key, options).on_change(
+            move |app, chosen| {
+                let Some(id) = chosen.first() else {
+                    return;
+                };
+                on_change(app, window, id.as_str());
+            },
+        );
         select
             .set_items(cx.app_mut(), items)
             .unwrap_or_else(|error| {

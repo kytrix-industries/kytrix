@@ -17,8 +17,6 @@ use ui_kit::{
         brand::{Brand, BrandKind},
         button::Button,
         icon::{IconKind, IconSpec},
-        layer::Layer,
-        overlay::{AnimationRouter, Placement},
         size::{UnifiedSizable, UnifiedSize},
         tooltip::{Tooltip, TooltipContent, TooltipOptions},
     },
@@ -107,8 +105,6 @@ impl MenuContent {
             theme: host.theme().clone(),
             translate: host.translate().clone(),
             language: host.language(app),
-            layer: host.layer().clone(),
-            animation: host.animation(),
             signals,
         };
         let root = build.root(app, panel)?;
@@ -134,13 +130,8 @@ impl MenuContent {
         let address_hint = Tooltip::new(
             app,
             build.theme.clone(),
-            build.layer.clone(),
-            build.animation.clone(),
             format_smolstr!("{key}:address-hint"),
-            TooltipOptions {
-                placement: Placement::BOTTOM,
-                ..TooltipOptions::default()
-            },
+            TooltipOptions::default(),
         );
         address_hint.attach(app, window, address);
         address_hint.set_content(Some(TooltipContent::new(account.wallet_address().clone())));
@@ -183,8 +174,6 @@ struct ContentBuild<'a> {
     theme: ThemeHandle,
     translate: Translate,
     language: LanguageCode,
-    layer: Layer,
-    animation: AnimationRouter,
     signals: &'a MenuSignals,
 }
 

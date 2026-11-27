@@ -504,13 +504,7 @@ impl ProxyEditor {
             .width(FORM_WIDTH.value())
             .fade(false)
             .close_label(close_label)
-            .build(
-                app,
-                theme,
-                host.layer(),
-                host.animation(),
-                format_smolstr!("{key}.editor"),
-            );
+            .build(app, theme, format_smolstr!("{key}.editor"));
         dialog.open(app, window)?;
         *handle.borrow_mut() = Some(dialog.clone());
 
@@ -762,8 +756,6 @@ impl FormBuild<'_> {
         let select = Select::new(
             app,
             self.theme.clone(),
-            self.host.layer(),
-            self.host.animation(),
             format_smolstr!("{}.authorization", self.key),
             SelectOptions::default()
                 .width(FORM_WIDTH)
@@ -804,8 +796,6 @@ impl FormBuild<'_> {
         let select = Select::new(
             app,
             self.theme.clone(),
-            self.host.layer(),
-            self.host.animation(),
             format_smolstr!("{}.dns-mode", self.key),
             SelectOptions::default()
                 .width(FORM_WIDTH)

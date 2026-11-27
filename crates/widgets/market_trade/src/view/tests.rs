@@ -1561,7 +1561,11 @@ fn a_confirmation_should_hand_the_choice_to_the_next_sync() {
     );
     fixture.drain();
     assert!(
-        !fixture.harness.app().overlays(window).is_empty(),
+        fixture
+            .harness
+            .app()
+            .popup_stack(window)
+            .is_some_and(|stack| !stack.entries.is_empty()),
         "the control opened the selector it hosts"
     );
 

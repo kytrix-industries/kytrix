@@ -25,6 +25,10 @@ use ui_core::{
         style::{Cursor, StylePatch},
         style_builder::{PaintBuilder, StyleBuilder},
     },
+    popup::{
+        Anchor, DismissPolicy, EscapePolicy, FocusPolicy, OutsidePress, PlacementSpec, PopupA11y,
+        PopupAnimation, PopupError, PopupSpec, PopupState, PopupTier, RestoreFocus,
+    },
     text::{TextAlign, TextStyle},
     window::WindowId,
 };
@@ -32,10 +36,8 @@ use ui_core::{
 use crate::{
     kit::{
         input::{self as kit_input, InputNode, InputSpec, InputState},
-        layer::{Band, Layer},
-        overlay::{
-            Alignment, Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayError,
-            OverlayOptions, OverlaySurface, Placement, Side,
+        popup_panel::{
+            AnchorChange, AnchorWatch, PanelWidth, PopupPanel, PopupPanelOptions, PopupSurface,
         },
         size::UnifiedSize,
     },
@@ -78,6 +80,20 @@ const CONTROL_RADIUS: f32 = 4.0;
 const RING_WIDTH: f32 = 2.0;
 const RING_INSET: f32 = 1.0;
 const CHECKER_CELL: f32 = 4.0;
+
+const PICKER_DISMISS: DismissPolicy = DismissPolicy::Chain {
+    outside: OutsidePress::Replay,
+    escape: EscapePolicy::CloseTopmost,
+    anchor_lost: true,
+    focus_lost: true,
+};
+
+fn picker_surface() -> PopupSurface {
+    PopupSurface {
+        padding: PANEL_PADDING,
+        ..PopupSurface::menu()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Hsla {
@@ -530,7 +546,7 @@ struct PaletteView {
 
 struct SliderView {
     root: NodeId,
-    tracks: [TrackView; 4],
+    tracks: Vec<TrackView>,
     thumb_fill: Color,
     thumb_border: Color,
 }
@@ -624,7 +640,7 @@ struct Inner {
     key: SmolStr,
     theme: ThemeHandle,
     scope: SignalScope,
-    overlay: Overlay,
+    popup: PopupPanel,
     actions: Actions,
     size: UnifiedSize,
     color: Signal<Color>,
@@ -640,9 +656,10 @@ struct Inner {
     confirm_hovered: Signal<bool>,
     change: RefCell<Option<Rc<dyn Fn(&mut App, Color)>>>,
     open_callback: RefCell<Option<Rc<dyn Fn(&mut App)>>>,
+    close_callback: RefCell<Option<Rc<dyn Fn(&mut App)>>>,
     trigger: RefCell<Option<TriggerView>>,
     panel: RefCell<Option<Panel>>,
-    was_open: Cell<bool>,
+    watch: RefCell<AnchorWatch>,
     last_hex_text: RefCell<SmolStr>,
     last_hex_focus: Cell<bool>,
     last_trigger_color: Cell<Option<Color>>,
@@ -656,8 +673,6 @@ impl ColorPicker {
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         key: impl Into<SmolStr>,
         initial_color: Color,
         size: UnifiedSize,
@@ -687,36 +702,17 @@ impl ColorPicker {
             }),
         };
         let labels = ColorPickerLabels::default();
-        let overlay = Overlay::new(
+        let popup = PopupPanel::new(
             app,
             theme.clone(),
-            layer,
-            router,
             format_smolstr!("{key}:overlay"),
-            OverlayOptions {
-                placement: Placement::new(Side::Bottom, Alignment::Start),
-                gap: px(4.0),
-                margin: px(4.0),
-                flip: true,
-                dismiss: DismissPolicy::OutsideClick,
-                modal: false,
-                restore_focus: true,
-                band: Band::Popup,
-                slot: crate::kit::layer::LayerSlot::Exclusive,
-                surface: OverlaySurface {
-                    padding: PANEL_PADDING,
-                    ..OverlaySurface::menu()
-                },
-                scrim: None,
-                a11y: OverlayA11y::dialog(labels.panel.clone()),
-                fade: true,
-            },
+            PopupPanelOptions::new(picker_surface(), PanelWidth::Auto),
         );
         let inner = Rc::new(Inner {
             key,
             theme,
             scope,
-            overlay,
+            popup,
             actions,
             size,
             color: app.signal_scoped(scope, initial_color),
@@ -733,9 +729,10 @@ impl ColorPicker {
             confirm_hovered: app.signal_scoped(scope, false),
             change: RefCell::new(None),
             open_callback: RefCell::new(None),
+            close_callback: RefCell::new(None),
             trigger: RefCell::new(None),
             panel: RefCell::new(None),
-            was_open: Cell::new(false),
+            watch: RefCell::new(AnchorWatch::default()),
             last_hex_text: RefCell::new(hex_string(initial_color)),
             last_hex_focus: Cell::new(false),
             last_trigger_color: Cell::new(None),
@@ -743,6 +740,13 @@ impl ColorPicker {
             last_color: Cell::new(initial_color),
             appearance: Rc::new(Cell::new(Appearance::Light)),
             last_appearance: Cell::new(Appearance::Light),
+        });
+        let weak = Rc::downgrade(&inner);
+        inner.popup.on_close(move |app, _reason| {
+            if let Some(inner) = weak.upgrade() {
+                let picker = ColorPicker { inner };
+                picker.reset_after_close(app);
+            }
         });
         Self { inner }
     }
@@ -794,23 +798,23 @@ impl ColorPicker {
 
     #[must_use]
     pub fn is_open(&self, app: &App) -> bool {
-        self.inner.overlay.is_open(app)
+        self.inner.popup.is_open(app)
     }
 
     #[must_use]
     pub fn open_state(&self) -> Signal<bool> {
-        self.inner.overlay.open_state()
+        self.inner.popup.open_state()
     }
 
-    pub fn open(&self, app: &mut App, window: WindowId) -> Result<bool, OverlayError> {
-        if self.inner.overlay.is_open(app) {
+    pub fn open(&self, app: &mut App, window: WindowId) -> Result<bool, PopupError> {
+        if self.inner.popup.is_open(app) {
             return Ok(false);
         }
         self.open_panel(app, window)
     }
 
     pub fn close(&self, app: &mut App) -> bool {
-        self.inner.overlay.close(app)
+        self.inner.popup.close(app)
     }
 
     #[must_use]
@@ -819,10 +823,24 @@ impl ColorPicker {
     }
 
     #[must_use]
-    pub fn overlay(&self) -> &Overlay {
-        &self.inner.overlay
+    pub fn panel_node(&self) -> Option<NodeId> {
+        self.inner.popup.panel_node()
     }
 
+    #[must_use]
+    pub fn popup_node(&self) -> Option<NodeId> {
+        self.inner.popup.popup_node()
+    }
+
+    #[must_use]
+    pub fn popup_state(&self, app: &App) -> Option<PopupState> {
+        self.inner.popup.state(app)
+    }
+
+    #[must_use]
+    pub fn is_closing(&self, app: &App) -> bool {
+        self.inner.popup.is_closing(app)
+    }
     pub fn on_change(&self, callback: impl Fn(&mut App, Color) + 'static) {
         *self.inner.change.borrow_mut() = Some(Rc::new(callback));
     }
@@ -831,8 +849,26 @@ impl ColorPicker {
         *self.inner.open_callback.borrow_mut() = Some(Rc::new(callback));
     }
 
+    pub fn on_close(&self, callback: impl Fn(&mut App) + 'static) {
+        *self.inner.close_callback.borrow_mut() = Some(Rc::new(callback));
+    }
+
     pub fn set_labels(&self, app: &mut App, labels: ColorPickerLabels) -> bool {
-        app.write(&self.inner.labels, labels)
+        let label = labels.panel.clone();
+        if !app.write(&self.inner.labels, labels) {
+            return false;
+        }
+        if self.inner.popup.is_open(app) {
+            let _ = self.inner.popup.set_a11y(
+                app,
+                PopupA11y {
+                    role: Some(A11yRole::Dialog),
+                    label: Some(label),
+                    ..PopupA11y::default()
+                },
+            );
+        }
+        true
     }
 
     pub fn set_active_tab(&self, app: &mut App, tab: ColorPickerTab) -> bool {
@@ -883,7 +919,7 @@ impl ColorPicker {
         paint.corner_radius = [px(TRIGGER_RADIUS); 4];
 
         let theme = inner.theme.clone();
-        let open = inner.overlay.open_state();
+        let open = inner.popup.open_state();
         let hovered = inner.trigger_hovered;
         let focused = inner.trigger_focused;
         let appearance = inner.appearance.clone();
@@ -965,8 +1001,8 @@ impl ColorPicker {
 
     pub fn sync(&self, app: &mut App) -> Result<bool, EngineError> {
         let inner = &self.inner;
-        let mut changed = inner.overlay.sync(app);
-        let open = inner.overlay.is_open(app);
+        let mut changed = inner.popup.sync(app);
+        let open = inner.popup.is_open(app);
 
         let current = *app.read(&inner.color);
         if current != inner.last_color.get() {
@@ -978,19 +1014,14 @@ impl ColorPicker {
             changed = true;
         }
 
-        if inner.was_open.get() != open {
-            inner.was_open.set(open);
-            changed = true;
-            if !open {
-                self.reset_after_close(app);
-            }
-        }
-
-        if open && inner.panel.borrow().is_some() {
-            let mut panel = inner.panel.take().expect("上面刚检查过面板存在");
+        if open && let Some(mut panel) = inner.panel.take() {
             let panel_changed = self.sync_panel(app, &mut panel)?;
             *inner.panel.borrow_mut() = Some(panel);
             changed |= panel_changed;
+        }
+
+        if open && self.sync_anchor(app) {
+            changed = true;
         }
 
         changed |= self.sync_trigger(app)?;
@@ -998,12 +1029,31 @@ impl ColorPicker {
         Ok(changed)
     }
 
+    fn sync_anchor(&self, app: &mut App) -> bool {
+        let inner = &self.inner;
+        let Some(id) = inner.popup.id() else {
+            return false;
+        };
+        let Some(window) = inner
+            .trigger
+            .borrow()
+            .as_ref()
+            .and_then(|view| view.node.window())
+        else {
+            return false;
+        };
+        if inner.watch.borrow_mut().observe(app, id, window) != AnchorChange::Lost {
+            return false;
+        }
+        inner.popup.close(app)
+    }
+
     pub fn release(&self, app: &mut App) -> usize {
         let inner = &self.inner;
         for action in self.action_list() {
             app.off_action(&action);
         }
-        inner.overlay.release(app);
+        inner.popup.release(app);
         if let Some(panel) = inner.panel.borrow_mut().take() {
             panel.input.release(app);
         }
@@ -1083,19 +1133,19 @@ impl ColorPicker {
             self.with_input(|input| self.store_hex(app, display, input));
         }
 
-        inner.overlay.close(app);
+        inner.popup.close(app);
     }
 
     fn on_trigger(&self, ctx: &mut ActionCtx<'_>) {
         let window = ctx.window();
         let app = ctx.app_mut();
-        if self.inner.overlay.is_open(app) {
-            self.inner.overlay.close(app);
+        if self.inner.popup.is_open(app) {
+            self.inner.popup.close(app);
             return;
         }
 
         if self.open_panel(app, window).is_err() {
-            self.inner.overlay.close_now(app);
+            self.inner.popup.close_now(app);
         }
     }
 
@@ -1311,34 +1361,35 @@ impl ColorPicker {
         body(panel.as_ref().map(|panel| &panel.input))
     }
 
-    fn open_panel(&self, app: &mut App, window: WindowId) -> Result<bool, OverlayError> {
+    fn open_panel(&self, app: &mut App, window: WindowId) -> Result<bool, PopupError> {
         let inner = &self.inner;
-        if inner.overlay.is_open(app) {
+        if inner.popup.is_open(app) {
             return Ok(false);
         }
         let Some(trigger) = inner.trigger.borrow().map(|view| view.node) else {
             return Ok(false);
         };
         let panel_label = app.read(&inner.labels).panel.clone();
-        inner.overlay.set_a11y(OverlayA11y::dialog(panel_label));
-        let opened = inner
-            .overlay
-            .open(app, window, Anchor::node(trigger), |_, _| Ok(()))?;
-        if !opened {
-            return Ok(false);
-        }
-        let Some(panel) = inner.overlay.panel_node() else {
-            inner.overlay.close_now(app);
-            return Ok(false);
+        let mut spec = PopupSpec::new(Anchor::Node { node: trigger }, PlacementSpec::default());
+        spec.tier = PopupTier::Auto;
+        spec.focus = FocusPolicy::Take {
+            restore: RestoreFocus::Previous,
         };
-        if let Err(error) = self.build_panel(app, window, panel) {
-            inner.overlay.close_now(app);
-            return Err(error.into());
-        }
-        if let Err(error) = inner.overlay.measure(app) {
-            inner.overlay.close_now(app);
-            return Err(error.into());
-        }
+        spec.dismiss = PICKER_DISMISS;
+        spec.opener = Some(trigger);
+        spec.animation = PopupAnimation::Fade;
+        spec.a11y = PopupA11y {
+            role: Some(A11yRole::Dialog),
+            label: Some(panel_label),
+            ..PopupA11y::default()
+        };
+        let picker = self.clone();
+        inner
+            .popup
+            .open(app, window, spec, move |app, window, body| {
+                picker.build_panel(app, window, body)
+            })?;
+        inner.watch.borrow_mut().reset();
         let callback = inner.open_callback.borrow().clone();
         if let Some(callback) = callback {
             callback(app);
@@ -1350,7 +1401,7 @@ impl ColorPicker {
         &self,
         app: &mut App,
         window: WindowId,
-        panel_node: NodeId,
+        body: NodeId,
     ) -> Result<(), EngineError> {
         let inner = &self.inner;
         let labels = app.read(&inner.labels).clone();
@@ -1382,7 +1433,7 @@ impl ColorPicker {
                     .overflow_hidden()
                     .build(),
             )
-            .build(tree, panel_node)?;
+            .build(tree, body)?;
 
         let tabs = NodeBuilder::boxed()
             .id(format_smolstr!("{}:panel.tabs", inner.key))
@@ -1646,7 +1697,6 @@ impl ColorPicker {
         }
         *inner.last_hex_text.borrow_mut() = hex;
         inner.last_hex_focus.set(false);
-        inner.was_open.set(true);
 
         Ok(())
     }
@@ -1902,11 +1952,9 @@ impl ColorPicker {
             });
         }
 
-        let array: [TrackView; 4] = tracks.try_into().expect("四条 HSL 通道各建一条滑条");
-
         Ok(SliderView {
             root,
-            tracks: array,
+            tracks,
             thumb_fill,
             thumb_border: Color::srgb(0.0, 0.0, 0.0, 0.35),
         })
@@ -2047,6 +2095,7 @@ impl ColorPicker {
             return false;
         }
         self.rebuild_body(app, panel);
+        let _ = self.inner.popup.request_measure(app);
 
         true
     }
@@ -2167,6 +2216,11 @@ impl ColorPicker {
         }
         inner.last_hex_focus.set(false);
         inner.last_trigger_color.set(None);
+        inner.watch.borrow_mut().reset();
+        let callback = inner.close_callback.borrow().clone();
+        if let Some(callback) = callback {
+            callback(app);
+        }
     }
 
     fn labels_text(&self, app: &App) -> ColorPickerLabels {
@@ -2892,7 +2946,7 @@ mod ui_tests {
             id::NodeId,
             tree::{NodeKind, NodeTree},
         },
-        paint::{canvas::Canvas, style::Clip},
+        paint::{canvas::Canvas, primitive::Primitive, style::Clip},
         test_support::app::TestApp,
     };
 
@@ -2901,7 +2955,7 @@ mod ui_tests {
         hsla_to_color, palette_index_at, rgba8,
     };
     use crate::{
-        kit::{layer::Layer, overlay::AnimationRouter, test_support::full_a11y},
+        kit::test_support::full_a11y,
         theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
     };
 
@@ -2927,13 +2981,9 @@ mod ui_tests {
         fn with_size(size: UnifiedSize) -> Self {
             let mut app = TestApp::new();
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-            let layer = Layer::new();
-            let router = AnimationRouter::new();
             let picker = ColorPicker::new(
                 app.app_mut(),
                 theme.clone(),
-                layer,
-                router,
                 "picker",
                 default_color(),
                 size,
@@ -3282,8 +3332,7 @@ mod ui_tests {
 
     #[test]
     fn the_panel_surface_should_use_the_old_double_layer_menu_recipe() {
-        let harness = Harness::new();
-        let surface = &harness.picker.overlay().options().surface;
+        let surface = &super::picker_surface();
         assert_eq!(surface.background, Role::SurfaceOverlay);
         assert_eq!(surface.corner_radius, px(4.0), "旧 rounded_sm");
         assert_eq!(surface.padding, super::PANEL_PADDING, "旧 p_2");
@@ -3314,15 +3363,12 @@ mod ui_tests {
         let _ = harness.app.drain().expect("打开帧");
         let _ = harness.picker.sync(harness.app.app_mut()).expect("sync");
         let _ = harness.app.drain().expect("首个可见帧");
-        assert!(
-            harness.picker.overlay().revealed(harness.app.app()),
-            "首个可见帧必须已经 reveal"
+        assert_eq!(
+            harness.picker.popup_state(harness.app.app()),
+            Some(ui_core::popup::PopupState::Open),
+            "首个可见帧必须已经 Open"
         );
-        let panel = harness
-            .picker
-            .overlay()
-            .panel_node()
-            .expect("面板节点已挂载");
+        let panel = harness.picker.panel_node().expect("面板节点已挂载");
         let first = harness.bounds(panel);
         harness.settle();
         let settled = harness.bounds(panel);
@@ -3352,12 +3398,6 @@ mod ui_tests {
         harness.open();
         assert!(harness.panel_open(), "按下触发器挂载面板");
         assert!(harness.palette().is_some(), "默认显示色板页");
-        let visual = harness
-            .picker
-            .overlay()
-            .overlay_node()
-            .map(|node| harness.app.probe().bounds(node));
-        let _ = visual;
     }
 
     fn clip_of(harness: &Harness, suffix: &str) -> Clip {
@@ -3451,14 +3491,116 @@ mod ui_tests {
     }
 
     #[test]
+    fn the_on_close_callback_fires_once_per_close() {
+        let mut harness = Harness::new();
+        let closes = Rc::new(Cell::new(0usize));
+        let sink = closes.clone();
+        harness.picker.on_close(move |_| sink.set(sink.get() + 1));
+        harness.open();
+        harness.settle();
+        assert_eq!(closes.get(), 0, "打开不触发 on_close");
+        assert!(harness.picker.close(harness.app.app_mut()));
+        harness.settle();
+        assert_eq!(closes.get(), 1, "每次完整关闭派发一次");
+        harness.open();
+        harness.settle();
+        harness.click_at(LogicalPoint::new(px(760.0), px(560.0)));
+        harness.settle();
+        assert_eq!(closes.get(), 2, "外部按下关闭同样派发");
+    }
+    #[test]
     fn pressing_outside_the_panel_should_close_it() {
         let mut harness = Harness::new();
         harness.open();
         assert!(harness.panel_open());
         harness.click_at(LogicalPoint::new(px(760.0), px(560.0)));
+        assert!(
+            harness.picker.is_closing(harness.app.app()),
+            "外部按下进入关闭事务（淡出期间不可命中）"
+        );
+        harness.settle();
         assert!(!harness.panel_open(), "面板外部按下关闭面板");
     }
 
+    #[test]
+    fn pressing_escape_closes_the_panel() {
+        let mut harness = Harness::new();
+        harness.open();
+        assert!(harness.panel_open());
+        harness.key(KeyCode::Escape);
+        assert!(
+            harness.picker.is_closing(harness.app.app()),
+            "Esc 只关取色器自身"
+        );
+        harness.settle();
+        assert!(!harness.panel_open());
+        assert!(harness.picker.popup_node().is_none(), "关闭后浮层卸载");
+    }
+
+    #[test]
+    fn opening_and_closing_the_panel_never_forces_a_full_repaint() {
+        let mut harness = Harness::new();
+        harness.pump_times(2);
+        harness.open();
+        for _ in 0..6 {
+            let record = harness.app.drain().expect("帧").clone();
+            assert!(!record.damage_full, "非模态取色器打开不得整帧重绘");
+            let _ = harness.picker.sync(harness.app.app_mut()).expect("sync");
+        }
+        harness.settle();
+        assert!(harness.picker.close(harness.app.app_mut()));
+        for _ in 0..20 {
+            harness.app.advance(Duration::from_millis(16));
+            let _ = harness.picker.sync(harness.app.app_mut()).expect("sync");
+            let record = harness.app.drain().expect("帧").clone();
+            assert!(!record.damage_full, "非模态取色器关闭不得整帧重绘");
+            if !harness.panel_open() {
+                break;
+            }
+        }
+        assert!(!harness.panel_open());
+    }
+
+    #[test]
+    fn the_panel_reopens_with_the_same_rect() {
+        let mut harness = Harness::new();
+        harness.open();
+        harness.settle();
+        let panel = harness.picker.panel_node().expect("面板");
+        let first = harness.bounds(panel);
+        assert!(harness.picker.close(harness.app.app_mut()));
+        harness.settle();
+        assert!(!harness.panel_open());
+        harness.open();
+        harness.settle();
+        let reopened = harness.picker.panel_node().expect("重开后的面板");
+        assert_eq!(
+            first,
+            harness.bounds(reopened),
+            "重开后 rect 必须与首次稳定 rect 一致"
+        );
+    }
+
+    #[test]
+    fn switching_tabs_resettles_the_panel() {
+        let mut harness = Harness::new();
+        harness.open();
+        harness.settle();
+        let before = harness.bounds(harness.picker.panel_node().expect("面板"));
+        harness.switch_to_hsla();
+        harness.pump_times(1);
+        let after = harness.bounds(harness.picker.panel_node().expect("面板"));
+        assert!(
+            (after.size.height - before.size.height).abs() > px(20.0),
+            "切换 tab 必须触发重新测量：{before:?} -> {after:?}"
+        );
+        harness.settle();
+        assert_eq!(
+            after,
+            harness.bounds(harness.picker.panel_node().expect("面板")),
+            "tab 切换后的首帧 rect 必须等于稳定帧"
+        );
+    }
     #[test]
     fn pressing_the_trigger_of_an_open_panel_should_close_it_without_reopening_it() {
         let mut harness = Harness::new();
@@ -3800,7 +3942,7 @@ mod ui_tests {
         harness.switch_to_hsla();
         harness.click_at(harness.track_point(0, 0.75));
         let edited = harness.picker.draft(harness.app.app()).expect("轨道编辑");
-        let open = harness.picker.overlay().open_state();
+        let open = harness.picker.open_state();
         assert!(
             !harness.app.app_mut().write(&open, true),
             "等值写短路（I3：不产生帧）"
@@ -4360,8 +4502,6 @@ mod ui_tests {
         let picker = ColorPicker::new(
             app.app_mut(),
             theme,
-            Layer::new(),
-            AnimationRouter::new(),
             "a11y",
             default_color(),
             UnifiedSize::Medium,
@@ -4420,7 +4560,7 @@ mod ui_tests {
             let _ = picker.sync(app.app_mut()).expect("sync");
         }
         let snapshot = full_a11y(&mut app);
-        let overlay_node = picker.overlay().overlay_node().expect("浮层节点");
+        let overlay_node = picker.popup_node().expect("浮层节点");
         assert_eq!(
             snapshot.node_for(overlay_node).expect("浮层 a11y").role,
             A11yRole::Dialog,
@@ -4549,5 +4689,50 @@ mod ui_tests {
         harness.pump_times(1);
         let canvas = harness.track_canvas(0).expect("色相画布");
         assert_eq!(harness.panel_painter(canvas).len(), super::TRACK_SLICES + 1);
+    }
+
+    #[test]
+    fn the_picker_panel_draws_its_shadow() {
+        let mut harness = Harness::new();
+        harness.open();
+        harness.settle();
+        let panel = harness.picker.panel_node().expect("面板");
+        let lane = harness.app.probe().lane_of(panel);
+        let window = harness.app.app().window(harness.window).expect("窗口");
+        let shadow = lane
+            .and_then(|lane| window.scene().lane_primitives(lane))
+            .and_then(|primitives| {
+                primitives.iter().find_map(|primitive| match primitive {
+                    Primitive::Shadow(shadow) => Some(*shadow),
+                    _ => None,
+                })
+            })
+            .expect("取色器面板阴影必须被绘制");
+        assert!(
+            shadow.blur > px(0.0) || shadow.offset != LogicalPoint::ZERO,
+            "取色器阴影必须带模糊或偏移"
+        );
+    }
+
+    #[test]
+    fn losing_the_trigger_node_closes_the_open_picker() {
+        let mut harness = Harness::new();
+        harness.open();
+        assert_eq!(
+            harness.picker.popup_state(harness.app.app()),
+            Some(ui_core::popup::PopupState::Open),
+            "取色器已打开"
+        );
+        let trigger = harness.picker.trigger_node().expect("触发器");
+        let _ = harness
+            .app
+            .app_mut()
+            .remove_node(harness.window, trigger)
+            .expect("删除触发器");
+        let _ = harness.pump();
+        assert!(
+            !harness.picker.is_open(harness.app.app()),
+            "锚点节点消失必须关闭取色器（设计 §4.7 矩阵）"
+        );
     }
 }

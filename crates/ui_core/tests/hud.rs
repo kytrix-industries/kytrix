@@ -3,7 +3,6 @@ use std::time::Duration;
 use ui_core::{
     error::EngineError,
     event::Action,
-    interaction::OverlayOptions,
     math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, tree::NodeKind},
     test_support::{app::TestApp, probe::Selector},
@@ -332,32 +331,6 @@ fn removing_the_subtree_is_detected_and_reinstall_recovers() {
 }
 
 #[test]
-fn hud_stays_above_overlays() {
-    let mut test = TestApp::new();
-    let window = test.window_id();
-    install(&mut test);
-    let _ = test.drain().expect("首帧");
-    let hud = test
-        .probe()
-        .by_selector(Selector::Id("debug-hud"))
-        .expect("HUD 根");
-    let _ = test
-        .app_mut()
-        .create_overlay(window, OverlayOptions::default())
-        .expect("overlay");
-    let root = test.app().window(window).expect("窗口").tree().root();
-    let children = test
-        .app()
-        .window(window)
-        .expect("窗口")
-        .tree()
-        .get(root)
-        .expect("root")
-        .children();
-    assert_eq!(children.last().copied(), Some(hud), "HUD 必须保持在最上层");
-}
-
-#[test]
 fn unknown_window_is_an_error_and_disable_is_idempotent() {
     let mut test = TestApp::new();
     let window = test.window_id();
@@ -377,4 +350,54 @@ fn unknown_window_is_an_error_and_disable_is_idempotent() {
     live.app_mut()
         .set_debug_hud(live_window, false)
         .expect("重复关闭是 no-op");
+}
+
+#[test]
+fn the_hud_stays_above_the_fixed_popup_root() {
+    let mut test = TestApp::new();
+    let window = test.window_id();
+    let root = test.app().window(window).expect("窗口").tree().root();
+    install(&mut test);
+    let mut spec = ui_core::popup::PopupSpec::new(
+        ui_core::popup::Anchor::WindowRect(LogicalRect::new(
+            px(10.0),
+            px(10.0),
+            px(40.0),
+            px(20.0),
+        )),
+        ui_core::popup::PlacementSpec::default(),
+    );
+    spec.tier = ui_core::popup::PopupTier::Auto;
+    test.app_mut()
+        .open_popup(
+            window,
+            spec,
+            |_app, _window, _node| Ok::<(), EngineError>(()),
+            None,
+        )
+        .expect("弹层");
+    let _ = test.drain().expect("布局帧");
+
+    let children = test
+        .app()
+        .window(window)
+        .expect("窗口")
+        .tree()
+        .get(root)
+        .expect("根")
+        .children()
+        .to_vec();
+    let popup_root = test
+        .probe()
+        .by_selector(Selector::Id("popup-root"))
+        .expect("popup root");
+    let hud = test
+        .probe()
+        .by_selector(Selector::Id("debug-hud"))
+        .expect("HUD 根");
+    assert_eq!(
+        &children[children.len() - 2..],
+        &[popup_root, hud],
+        "固定层顺序必须是 [内容..., popup_root, debug_hud]"
+    );
 }

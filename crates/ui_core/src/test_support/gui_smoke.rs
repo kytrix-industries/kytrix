@@ -5,15 +5,17 @@ use smol_str::SmolStr;
 use crate::{
     a11y::{A11yOverride, A11yRole, A11yTreeSnapshot},
     event::{Action, ActionSource, Event, ImeEvent, InputEvent, KeyCode, Modifiers, PointerButton},
-    interaction::{
-        DragPhase, OverlayDismiss, OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig,
-    },
+    interaction::{DragPhase, ScrollAxis, ScrollConfig},
     math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         color::Color,
         style::{Clip, FocusRing, PaintSpec, Style, StylePatch},
         style_builder::StyleBuilder,
+    },
+    popup::{
+        Anchor, DismissPolicy, FocusPolicy, InitialFocus, PlacementSpec, PopupAnimation, PopupSpec,
+        PopupTier, RestoreFocus,
     },
     test_support::{
         app::TestApp,
@@ -928,35 +930,44 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
         "焦点离开 C 后 C 的焦点环必须消失"
     );
 
-    let modal = app
-        .app_mut()
-        .create_overlay(
-            window,
-            OverlayOptions {
-                placement: OverlayPlacement::Point(LogicalPoint::new(px(180.0), px(150.0))),
-                dismiss: OverlayDismiss::Explicit,
-                trap_focus: true,
-                restore_focus: true,
-                a11y: crate::a11y::A11yOverride::default(),
-            },
-        )
-        .expect("打开模态浮层");
-    let panel = mount(
-        &mut app,
-        modal.node(),
-        NodeBuilder::boxed()
-            .style(absolute_style(LogicalRect::new(
-                px(0.0),
-                px(0.0),
-                px(300.0),
-                px(180.0),
-            )))
-            .paint(PaintSpec {
-                background: color(PANEL),
-                ..PaintSpec::default()
-            })
-            .id("modal.panel"),
+    let panel_slot = std::rc::Rc::new(std::cell::Cell::new(None));
+    let created_panel = panel_slot.clone();
+    let mut spec = PopupSpec::new(
+        Anchor::WindowRect(LogicalRect::new(px(180.0), px(150.0), px(0.0), px(0.0))),
+        PlacementSpec::default(),
     );
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::FirstFocusable,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: false,
+        escape: true,
+    };
+    spec.animation = PopupAnimation::None;
+    spec.opener = app.app().focused(window);
+    let _modal = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            move |app, window, content| {
+                let panel = NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(300.0), px(180.0)).build())
+                    .paint(PaintSpec {
+                        background: color(PANEL),
+                        ..PaintSpec::default()
+                    })
+                    .id("modal.panel")
+                    .build(app.window_mut(window).expect("窗口").tree_mut(), content)?;
+                created_panel.set(Some(panel));
+                Ok(())
+            },
+            None,
+        )
+        .expect("打开模态弹层");
+    let panel = panel_slot.get().expect("模态面板");
     let mut modal_buttons = Vec::new();
     for (slot, action, x) in [
         (2usize, Action::custom("smoke.modal.m1"), 20.0f32),
@@ -985,7 +996,13 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
         modal_buttons.push(node);
     }
     frame(&mut app);
-    assert_eq!(app.app().overlays(window).len(), 1, "浮层必须挂上");
+    assert_eq!(
+        app.app()
+            .popup_stack(window)
+            .map_or(0, |stack| stack.entries.len()),
+        1,
+        "浮层必须挂上"
+    );
 
     let modal_ids = [modal_buttons[0].index(), modal_buttons[1].index()];
     let mut seen = [false; 2];
@@ -1048,7 +1065,9 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
 
     key(&mut app, KeyCode::Escape, Modifiers::empty());
     assert!(
-        app.app().overlays(window).is_empty(),
+        app.app()
+            .popup_stack(window)
+            .is_none_or(|stack| stack.entries.is_empty()),
         "Esc（Action::Dismiss）必须关闭最上层浮层"
     );
     assert_eq!(
@@ -1085,7 +1104,9 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
             ),
             format!(
                 "Esc 后浮层数={}、焦点还原为 #{:?}、面板像素 {:?} → {:?}",
-                app.app().overlays(window).len(),
+                app.app()
+                    .popup_stack(window)
+                    .map_or(0, |stack| stack.entries.len()),
                 app.app().focused(window).map(|node| node.index()),
                 pixels::pixel(&modal_pixels, 330, 240),
                 pixels::pixel(&closed, 330, 240),

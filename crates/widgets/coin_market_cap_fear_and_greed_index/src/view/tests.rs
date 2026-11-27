@@ -45,6 +45,25 @@ fn harness() -> WidgetTestApp {
     WidgetTestApp::with_translate(product_translate(LanguageCode::En))
 }
 
+fn popup_total(harness: &WidgetTestApp) -> usize {
+    harness
+        .app()
+        .popup_stack(harness.window())
+        .map_or(0, |stack| stack.entries.len())
+}
+fn popup_count(harness: &WidgetTestApp) -> usize {
+    harness
+        .app()
+        .popup_stack(harness.window())
+        .map_or(0, |stack| {
+            stack
+                .entries
+                .iter()
+                .filter(|entry| entry.tier != ui_core::popup::PopupTier::Scrim)
+                .count()
+        })
+}
+
 fn current_config(harness: &WidgetTestApp) -> Config {
     let signal = harness.services().config;
     (*harness.app().read(&signal)).clone()
@@ -1772,7 +1791,8 @@ fn release_should_take_everything_down() {
     .expect("the header builds");
     frame(&mut harness, &mut pane);
     assert_eq!(harness.app().geometry().len(), 5);
-    assert_eq!(harness.layer().len(harness.window()), 0);
+    assert_eq!(popup_count(&harness), 0);
+    assert_eq!(popup_total(&harness), 0, "the header builds no popup entry");
     let action = pane
         .widget
         .header
@@ -1794,9 +1814,14 @@ fn release_should_take_everything_down() {
         "the canvas' meshes are given back to the process-wide store"
     );
     assert_eq!(
-        harness.layer().len(harness.window()),
+        popup_count(&harness),
         0,
-        "the tooltips' overlays are released"
+        "the tooltips' popups are released"
+    );
+    assert_eq!(
+        popup_total(&harness),
+        0,
+        "releasing the widget leaves no popup entry behind"
     );
     assert!(
         found(&harness, &pane, BODY_SELECTOR).is_none(),

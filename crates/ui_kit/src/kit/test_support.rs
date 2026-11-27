@@ -57,20 +57,6 @@ pub fn bounds(app: &TestApp, node: NodeId) -> Option<LogicalRect> {
     app.probe().bounds(node)
 }
 
-#[must_use]
-pub fn overlay_wrapper(app: &App, window: WindowId, panel: NodeId) -> NodeId {
-    let tree = app.window(window).expect("测试窗口必须存在").tree();
-    let root = tree.root();
-    let mut cursor = panel;
-    while let Some(parent) = tree.get(cursor).ok().and_then(|node| node.parent()) {
-        if parent == root {
-            return cursor;
-        }
-        cursor = parent;
-    }
-    panic!("浮层面板不在 root 子树下：{panel:?}");
-}
-
 pub fn assert_single_image(app: &TestApp) -> Image {
     let images = image_primitives(app);
     assert_eq!(images.len(), 1, "期望恰好一张图片，实际：{images:?}");

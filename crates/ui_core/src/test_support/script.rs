@@ -643,7 +643,7 @@ mod tests {
                 )
                 .expect("node");
         }
-        let nodes = app.app().window(window).expect("窗口").tree().len();
+        let engine_nodes = app.app().window(window).expect("窗口").tree().len() - 1;
 
         let mut script = FrameScript::new(app).with_a11y_capture(A11yCapture::Pump);
         for index in 0..4 {
@@ -672,10 +672,14 @@ mod tests {
             delivered += 1;
         }
         assert!(delivered >= 2, "3000 节点必须分批（实际 {delivered} 笔）");
-        assert_eq!(shadow.len(), nodes, "分批不得丢节点");
+        assert_eq!(
+            shadow.len(),
+            engine_nodes,
+            "分批不得丢节点（popup root 是 skip 容器，不生成 a11y 节点）"
+        );
         assert_eq!(
             script.app().a11y_shadow_summaries().len(),
-            nodes,
+            engine_nodes,
             "TestApp 的影子树与脚本里独立应用的影子树必须一致"
         );
         report.assert_a11y_contract_all();

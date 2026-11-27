@@ -50,6 +50,11 @@ path = "examples/acceptance/main.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "popup_behavior"
+path = "tests/popup_behavior.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "frame_record"
 path = "tests/frame_record.rs"
 required-features = ["test-support"]

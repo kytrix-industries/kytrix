@@ -43,6 +43,7 @@ use crate::{
         pass::PaintReport,
         scene::Scene,
     },
+    popup::PopupStack,
     render::{
         backend::Renderer, compose::WindowComposer, compositor::Plan, damage::DamageAccumulator,
         delta::SceneDelta, timer::FrameTimings,
@@ -239,6 +240,7 @@ pub struct Window {
     id: WindowId,
     options: WindowOptions,
     tree: NodeTree,
+    popups: PopupStack,
     scene: Scene,
     scale: DevicePixelRatio,
     surface: (u32, u32),
@@ -246,6 +248,7 @@ pub struct Window {
     #[cfg(target_os = "linux")]
     buffer_scale: i32,
     dpi_epoch: u32,
+    scroll_epoch: u64,
     canvas_text_pending_frames: u8,
     canvas_text_skip_frames: u8,
     frame_budget: frame_budget::FrameBudget,
@@ -315,11 +318,15 @@ impl Window {
         let scale = DevicePixelRatio::ONE;
         let surface = covering_surface(options.size, scale);
         let state = WindowState::for_decorations(options.decorations);
-        let tree = NodeTree::new();
+        let mut tree = NodeTree::new();
+        tree.bind_window(id);
+        let popup_root = tree.install_popup_root();
+        let popups = PopupStack::install(id, popup_root);
         Self {
             id,
             options,
             tree,
+            popups,
             scene: Scene::empty(),
             scale,
             surface,
@@ -327,6 +334,7 @@ impl Window {
             #[cfg(target_os = "linux")]
             buffer_scale: 1,
             dpi_epoch: 0,
+            scroll_epoch: 0,
             frame_budget: frame_budget::FrameBudget::default(),
             scheduler: FrameScheduler::new(),
             composer: Some(WindowComposer::new()),
@@ -435,6 +443,41 @@ impl Window {
 
     pub fn tree_mut(&mut self) -> &mut NodeTree {
         &mut self.tree
+    }
+
+    pub(crate) fn popups(&self) -> &PopupStack {
+        &self.popups
+    }
+
+    pub(crate) fn popups_mut(&mut self) -> &mut PopupStack {
+        &mut self.popups
+    }
+
+    pub(crate) fn popups_and_tree(&mut self) -> (&mut PopupStack, &mut NodeTree) {
+        (&mut self.popups, &mut self.tree)
+    }
+
+    #[must_use]
+    pub fn node_screen_rect(&self, node: NodeId) -> Option<LogicalRect> {
+        self.tree.node_screen_rect(node)
+    }
+
+    pub fn set_max_size(
+        &mut self,
+        node: NodeId,
+        max: crate::node::tree::MaxSize,
+    ) -> Result<(), EngineError> {
+        self.tree.set_max_size(node, max)?;
+        let popup = self
+            .popups
+            .order()
+            .iter()
+            .copied()
+            .find(|id| self.popups.entry(*id).is_ok_and(|entry| entry.node == node));
+        if let Some(id) = popup {
+            self.popups.forget_max_size(id);
+        }
+        Ok(())
     }
 
     pub fn set_canvas(
@@ -715,6 +758,13 @@ impl Window {
     pub fn size(&self) -> LogicalSize {
         surface::size(self)
     }
+    #[must_use]
+    pub fn scroll_epoch(&self) -> u64 {
+        self.scroll_epoch
+    }
+    pub(crate) fn bump_scroll_epoch(&mut self) {
+        self.scroll_epoch = self.scroll_epoch.wrapping_add(1);
+    }
     pub fn set_size(&mut self, size: LogicalSize) {
         surface::set_size(self, size)
     }
@@ -922,6 +972,11 @@ impl Window {
     #[must_use]
     pub fn focus(&self) -> &FocusScope {
         focus::focus(self)
+    }
+
+    #[must_use]
+    pub(crate) fn effective_focus(&self) -> Option<NodeId> {
+        focus::effective_focus(self)
     }
     pub(crate) fn focus_mut(&mut self) -> &mut FocusScope {
         focus::focus_mut(self)

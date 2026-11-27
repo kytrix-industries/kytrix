@@ -15,10 +15,7 @@ use ui_core::{
     },
     window::WindowId,
 };
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
+use ui_kit::theme::handle::ThemeHandle;
 
 use super::{frame::FrameRouter, services::WidgetServices};
 
@@ -124,16 +121,8 @@ impl<'a> WidgetCx<'a> {
         format_smolstr!("{suffix}@{}", self.scope.index())
     }
 
-    pub fn layer(&self) -> &Layer {
-        &self.services.layer
-    }
-
     pub fn frame_router(&self) -> &FrameRouter {
         &self.services.frame_router
-    }
-
-    pub fn animation(&self) -> &AnimationRouter {
-        &self.services.animation_router
     }
 
     pub fn signal<T: Clone + 'static>(&mut self, initial: T) -> Signal<T> {
@@ -312,12 +301,6 @@ mod tests {
         assert!(
             Rc::ptr_eq(&from_context, harness.services_rc()),
             "the handle is the composition root's instance, not a copy of it"
-        );
-
-        let layer = Rc::clone(&from_context.layer);
-        assert!(
-            std::ptr::eq(&*layer, harness.layer()),
-            "a host built over that handle shares the application's layer stack"
         );
     }
 

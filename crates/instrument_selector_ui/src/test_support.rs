@@ -19,13 +19,11 @@ use ui_core::{
         tree::{Node, NodeKind},
     },
     paint::style::StylePatch,
+    popup::PopupTier,
     test_support::app::TestApp,
     window::WindowId,
 };
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
+use ui_kit::theme::{appearance::Appearance, handle::ThemeHandle};
 use widget::{frame::FrameRouter, services::WidgetServices};
 
 use crate::{
@@ -91,25 +89,32 @@ pub(crate) struct Harness {
 
 impl Harness {
     pub(crate) fn new() -> Self {
+        Self::with_window(
+            ui_core::math::LogicalSize::new(px(1280.0), px(900.0)),
+            ui_core::math::DevicePixelRatio::ONE,
+        )
+    }
+
+    pub(crate) fn with_window(
+        size: ui_core::math::LogicalSize,
+        dpr: ui_core::math::DevicePixelRatio,
+    ) -> Self {
         let mut app = TestApp::with_options(ui_core::window::WindowOptions {
-            size: ui_core::math::LogicalSize::new(px(1280.0), px(900.0)),
+            size,
             ..ui_core::window::WindowOptions::default()
         });
+        app.set_dpr(dpr);
         let runtime = app.app().runtime_handle().clone();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let layer = Rc::new(Layer::new());
         let router =
             Rc::new(FrameRouter::new(app.app_mut()).expect("the test host owns the frame hook"));
-        let animation = Rc::new(AnimationRouter::new());
         let services = Rc::new(
             WidgetServices::builder(
                 app.app_mut(),
                 runtime,
                 translate(),
                 theme,
-                Rc::clone(&layer),
                 Rc::clone(&router),
-                Rc::clone(&animation),
             )
             .build(),
         );
@@ -145,16 +150,27 @@ impl Harness {
         Rc::clone(&self.services)
     }
 
-    pub(crate) fn layer(&self) -> &Layer {
-        &self.services.layer
-    }
-
     pub(crate) fn router(&self) -> &FrameRouter {
         &self.router
     }
 
+    pub(crate) fn popup_total(&self) -> usize {
+        self.app
+            .app()
+            .popup_stack(self.app.window_id())
+            .map_or(0, |stack| stack.entries.len())
+    }
     pub(crate) fn overlay_count(&self) -> usize {
-        self.app.app().overlays(self.app.window_id()).len()
+        self.app
+            .app()
+            .popup_stack(self.app.window_id())
+            .map_or(0, |stack| {
+                stack
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.tier != PopupTier::Scrim)
+                    .count()
+            })
     }
 
     pub(crate) fn app(&self) -> &App {

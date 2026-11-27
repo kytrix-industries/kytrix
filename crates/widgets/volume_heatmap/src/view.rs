@@ -947,10 +947,8 @@ impl VolumeHeatMapWidget {
         let window = cx.window();
         let key = cx.unique_key(VENUE_KEY_SUFFIX);
         let theme = cx.theme().clone();
-        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
-        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
-        let select = Select::new(cx.app_mut(), theme, layer, router, key, options).on_change(
-            move |app, chosen| {
+        let select =
+            Select::new(cx.app_mut(), theme, key, options).on_change(move |app, chosen| {
                 let Some(id) = chosen.first() else {
                     return;
                 };
@@ -959,8 +957,7 @@ impl VolumeHeatMapWidget {
                 };
                 app.write(&requests, Some(HeaderRequest::Venue(venue)));
                 let _ = app.request_repaint(window);
-            },
-        );
+            });
         let items = self.venue_items(&translate);
         select
             .set_items(cx.app_mut(), items)

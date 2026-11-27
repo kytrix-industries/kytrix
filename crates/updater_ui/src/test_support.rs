@@ -14,13 +14,11 @@ use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use ui_core::{
     math::{LogicalSize, px},
     node::{id::NodeId, tree::NodeTree},
+    popup::PopupTier,
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
 };
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
+use ui_kit::theme::{appearance::Appearance, handle::ThemeHandle};
 use url::Url;
 use widget::{frame::FrameRouter, services::WidgetServices};
 
@@ -63,7 +61,6 @@ pub(crate) struct Harness {
     pub app: TestApp,
     pub services: Rc<WidgetServices>,
     pub router: Rc<FrameRouter>,
-    pub layer: Rc<Layer>,
     runtime: tokio::runtime::Runtime,
     downloads: Rc<FakeDownloads>,
     updater: Option<Updater>,
@@ -81,19 +78,15 @@ impl Harness {
             .build()
             .expect("the test runtime builds");
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let layer = Rc::new(Layer::new());
         let router =
             Rc::new(FrameRouter::new(app.app_mut()).expect("the test host owns the frame hook"));
-        let animation = Rc::new(AnimationRouter::new());
         let services = Rc::new(
             WidgetServices::builder(
                 app.app_mut(),
                 runtime.handle().clone(),
                 translate(LanguageCode::En),
                 theme,
-                Rc::clone(&layer),
                 Rc::clone(&router),
-                Rc::clone(&animation),
             )
             .build(),
         );
@@ -101,12 +94,30 @@ impl Harness {
             app,
             services,
             router,
-            layer,
             runtime,
             downloads: FakeDownloads::new(),
             updater: None,
             indicator: None,
         }
+    }
+
+    pub(crate) fn popup_total(&self) -> usize {
+        self.app
+            .app()
+            .popup_stack(self.app.window_id())
+            .map_or(0, |stack| stack.entries.len())
+    }
+    pub(crate) fn popup_count(&self) -> usize {
+        self.app
+            .app()
+            .popup_stack(self.app.window_id())
+            .map_or(0, |stack| {
+                stack
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.tier != PopupTier::Scrim)
+                    .count()
+            })
     }
 
     pub(crate) fn install_updater(&mut self, endpoint: Option<Url>) -> Updater {

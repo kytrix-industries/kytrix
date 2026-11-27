@@ -1,14 +1,14 @@
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
-use super::{LayoutBox, NodeKind, NodeTree};
+use super::{LayoutBox, MaxSize, NodeKind, NodeTree};
 use crate::{
     error::EngineError,
     layout::{
         Axis, LayoutOverride, LayoutReport, MeasureFn,
         hit_test::{HitResult, hit_test as hit_test_layout},
     },
-    math::{LogicalEdges, LogicalPoint, LogicalPx, LogicalRect, px},
+    math::{LogicalEdges, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{
         dirty::{DirtyFlags, affects_parent, depends_on_children},
         id::NodeId,
@@ -75,6 +75,54 @@ pub(crate) fn set_layout_override(
     Ok(())
 }
 
+pub(crate) fn set_max_size(
+    tree: &mut NodeTree,
+    node: NodeId,
+    max: MaxSize,
+) -> Result<(), EngineError> {
+    let valid = max
+        .width
+        .is_none_or(|value| value.is_finite() && value >= LogicalPx::ZERO)
+        && max
+            .height
+            .is_none_or(|value| value.is_finite() && value >= LogicalPx::ZERO);
+    let previous = {
+        let Some(target) = tree.arena.get_mut(node) else {
+            return Err(EngineError::StaleNode { node });
+        };
+        if !valid {
+            return Err(EngineError::InvalidMaxSize {
+                node,
+                width: max.width,
+                height: max.height,
+            });
+        }
+        let width = max
+            .width
+            .map_or_else(taffy::style::LengthPercentageAuto::auto, |value| {
+                taffy::style::LengthPercentageAuto::length(value.value())
+            });
+        let height = max
+            .height
+            .map_or_else(taffy::style::LengthPercentageAuto::auto, |value| {
+                taffy::style::LengthPercentageAuto::length(value.value())
+            });
+        if target.style.inner().max_size.width == width
+            && target.style.inner().max_size.height == height
+        {
+            return Ok(());
+        }
+        let previous = target.layout().bounds;
+        target.style.max_width(width).max_height(height);
+        previous
+    };
+    tree.invalidate_layout(node);
+    if let Some(target) = tree.arena.get_mut(node) {
+        target.damage = target.damage.union(previous);
+    }
+    Ok(())
+}
+
 pub(crate) fn set_virtual_row(
     tree: &mut NodeTree,
     node: NodeId,
@@ -95,6 +143,19 @@ pub(crate) fn set_virtual_row(
         )
         .width(taffy::style::Dimension::auto())
         .height(taffy::style::Dimension::length(height.value()));
+    tree.invalidate_layout(node)
+}
+
+pub(crate) fn set_absolute_size(tree: &mut NodeTree, node: NodeId, size: LogicalSize) -> bool {
+    let Some(target) = tree.arena.get_mut(node) else {
+        return false;
+    };
+    let width = taffy::style::Dimension::length(size.width.value());
+    let height = taffy::style::Dimension::length(size.height.value());
+    if target.style.inner().size.width == width && target.style.inner().size.height == height {
+        return false;
+    }
+    target.style.width(width).height(height);
     tree.invalidate_layout(node)
 }
 

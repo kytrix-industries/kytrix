@@ -132,8 +132,6 @@ impl TranslationPage {
         let select = Select::new(
             app,
             self.host.theme_handle(),
-            self.host.layer(),
-            self.host.animation(),
             key,
             SelectOptions::default()
                 .width(layout::CONTROL_WIDTH)

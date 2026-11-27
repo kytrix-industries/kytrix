@@ -693,7 +693,7 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 | 6 | 点击输入框 padding / border / 滚动条 gutter | 焦点不丢（整盒可点，§11.2 ㉗）；caret 落在**点击处**（P4-10 / ㊳） |
 | 7 | IME 候选窗（中文输入） | 候选窗贴在 caret 行盒位置；输入框不可见（`opacity=0`/零尺寸/被裁剪）时不定位（㉟） |
 
-## 13. P0 浮层重构（popup-overlay-redesign）对 gallery 的影响（2026-11-26 回写）
+## 13. P0 浮层重构（popup-overlay-redesign）对 gallery 的影响（2026-11-26 回写；P1-12 迁移见 §13.5）
 
 > 依据：`.docs/popup-overlay-redesign-design.md` §6 P0、§7.4/§7.5、§8、§11（P0 实施回写）；实现位于 `crates/ui_kit/examples/gallery.rs`（P2-5 的 `crates/base_ui/...` 路径已随批次迁移，语义不变）。
 
@@ -704,7 +704,7 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 - 实现：headless 镜像 `TestApp` + 离屏 `GpuRenderer` + `PersistentPixels`（同一 persist 纹理跨帧、按 `FrameRecord.damage/damage_full` 走增量 + damage scissor、readback 后逐像素比较）；不依赖真实窗口 readback。
 - 断言（`checks` = `record()` 调用数，无手工增量）：**108 条 = 45 条逐帧采样断言（44 changed-outside-damage + 1 full-replay 首帧）（采样帧逐帧）+ 20 idle-frames + 20 background-residue + 3 restored + 2 close-frames + 18 条具名不变量**；具名不变量含 `baseline-opaque`、`open/open-settle`、`first-visible-rect`、`idle-no-animation`、`move-closed(-return)-settle`、`move-settle`、`old-region`、`old-region-coverage`、`residue-detector`、`move-panel`、`close`、`close-restore-settle`、`reopen(-settle/-rect/-close)`。
 - 残影判定口径：移动后对“旧浮层区域 − 新浮层 − 新旧 trigger（各外扩 16 px）”全区域对打开前基线逐像素扫描；**覆盖量下限** `compared ≥ fixture 设备像素 × 30‰`（本机实测 26104/480000 ≈ 5.44%，防排除区膨胀假绿）；**负向自检**在比较集首/尾注入 2 个分散旧色板像素，要求检测到 `mismatched ≥ 2`；idle 采样 137 ms × 20 且先断言“无动画源”；容差通道 span ≤ 2。
-- 迁移登记：该门禁绑定旧 `kit::overlay`（`Overlay::revealed/panel_node/open`）与 `ColorPicker`，P1-11 会删除这些 API → **P1-12 必须重写为 popup 栈 + `debug_stack` + 像素断言，并保留命令名与退出码**（设计 §8 已登记）。
+- 迁移登记：该门禁绑定旧 `kit::overlay`（`Overlay::revealed/panel_node/open`）与 `ColorPicker`，P1-11 会删除这些 API → **P1-12 必须重写为 popup 栈 + `debug_stack` + 像素断言，并保留命令名与退出码**（设计 §8 已登记）。**P1-12 已完成**（2026-11-27）：现驱动 `PopupPanel`/`ColorPicker` 的 `popup_state`/`popup_node`/`panel_node`，P1 口径 94 checks 见 §13.5。
 
 ### 13.2 P0-8：旧 kit `Overlay` 首帧最小修复
 
@@ -712,11 +712,27 @@ gallery: probe <stage> caret_visible=<bool> next_wake=<Instant>
 - `ColorPicker::open`/`open_panel` 返回 `Result<bool, OverlayError>`：内容构建或 measure 失败会关闭回滚并返回强类型错误（Q-04）。
 - gallery 的 `overlay-check`/首帧断言依赖这两条语义；P0-8 是 **P1-11 会整体删除的过渡 API 的一部分**，迁移要求同 13.1。
 
-### 13.3 `--dump-overlay` 语义
+### 13.3 `--dump-overlay` → `--debug-stack`（P1-12 更名；旧命令已移除）
 
-- 真实窗口 `--dump-overlay` 仍只断言 rect/children（不读像素）；真实窗口像素 readback/截图门禁登记为 **P3-6**（方案待定：readback vs 截图），届时与 headless `--pixel-check` 合并为同一退出码。`--idle-check`/`--theme-check` 语义不受 P0 影响。
+- P1-12 起真实窗口命令为 `cargo run -p ui_kit --example gallery -- --debug-stack`（`--auto-close` 可选）：dump `popup_stack` 快照（id/tier/parent/z/state/hit/paint/a11y/owner_modal/focus/node/paint_offset/constrained_size）+ probe rect，`overlay-check` 改为 popup 语义（栈条目数=1、menu tier、菜单度量、首可见帧 rect==稳定帧、关闭后无残留、结束时栈空）。**`--debug-stack` 在最后一轮完成后自行关窗并以 0/3 退出；`--auto-close=<secs>` 只是 ≥30s 看门狗（`max(secs,30)`），无需携带**。
+- 旧 `--dump-overlay` 已从 `parse_flags` 删除（P1-11 删除 `kit::overlay` 后无节点树可打印）；**传旧名不再得到 overlay-check，而是打印改名提示并 exit 2**（终审 K1-04/Q1-07：不再“忽略后 exit 0”的假绿），详见 §13.5。
+- 真实窗口仍**不读像素**：真实窗口像素 readback/截图门禁登记为 **P3-6**（方案待定：readback vs 截图），届时与 headless `--pixel-check` 合并为同一退出码。`--idle-check`/`--theme-check` 语义不受影响。
 
 ### 13.4 与本文档前批次记录的关系
 
 - 本文档 §9–§12 的 P2-5/P2-6b/P2-6c 记录保持不变；P0 的新增门禁与 P0-8 行为是**浮层重构阶段**的增量，不改变 gallery 的 ①–⑳ 场景结构与 `--theme-check`/`--idle-check` 口径。
-- 旧 `overlay::Overlay`/`Layer`/`Band` 的删除与 popup 栈切换在 P1-11 进行；在那之前 gallery 仍用旧 kit Overlay，`--pixel-check` 的迁移必须与 P1-11 同批完成（P1-12）。
+- 旧 `overlay::Overlay`/`Layer`/`Band` 的删除与 popup 栈切换在 P1-11 进行；在那之前 gallery 仍用旧 kit Overlay，`--pixel-check` 的迁移必须与 P1-11 同批完成（P1-12）。**P1-12 已完成全部迁移**，见 §13.5。
+
+### 13.5 P1-12 回写：popup 栈迁移后的 gallery 命令与门禁（2026-11-27）
+
+> 依据：`.docs/popup-overlay-redesign-design.md` §12.2 P1-12、§12.3-8/9、§12.5；实现 `crates/ui_kit/examples/gallery.rs`。
+
+- **旧机制删除**：`kit::overlay`（2871 行）/`kit::layer`（964 行）已随 P1-11 删除；`--pixel-check` 改由新 `PopupPanel` + `ColorPicker`（`popup_state`/`popup_node`/`panel_node`）驱动，命令名与退出码（**0=PASS / 3=FAIL**）保留。
+- **P1 实测基线（`cargo run -p ui_kit --example gallery -- --pixel-check`，终审修复后）**：`checks=94 sampled_frames=32 open_animation_frames=8 close_animation_frames=6+6=12 damage_full_frames=0`，`first_visible==stable=(496,91,300×375)`、`moved=(496,4,300×375)`，exit 0（覆盖下限 30‰ 与 2 点注入自检保持）。
+- **94 条构成**：32 条逐帧采样断言（`changed-outside-damage`；首帧整帧重放时 `full-replay`）+ 16 条 `background-residue`（open/reopen 两个采样窗各 8 帧）+ 46 条静态断言（20 `idle-frames` + 3 `restored` + 2 `close-frames` + 18 具名不变量 + 3 `sampled-animation-floor`）。
+- **相对 P0 108 条的差异（口径说明）**：采样帧 45→32（场景迁到 PopupPanel 后动画时长/采样窗口变化）；idle 期在 `PixelFrame::Idle` 提前返回、不再产生 `background-residue` 逐像素比较（P0 的 20 条 idle 期 background-residue 由 20 条 `idle-frames` + `idle-no-animation` 覆盖“无动画源/无绘制帧”），因此 94 与 108 **不是逐条等价**。
+- **`sampled-animation-floor` 口径**：open/close 的“已提交帧增量”下界；终审 K1-06 修复后按**单次关闭分段**校验（open ≥4、close#1 ≥3、close#2 ≥3，实测 8 / 6+6），防止动画常量变短或单次关闭完全不播动画时被累计采样掩盖；它仍**不是**“每一帧都是动画帧”的逐帧计数。
+- **`--debug-stack` 实测基线**：`menu` 度量 `(6, 180.0, 127.5125)`、picker children=4、最终 `entries=0`、`overlay-check PASS`，exit 0；自动化完成后自行关窗（`overlay-check complete -> closing window`），`--auto-close` 仅 ≥30s 看门狗，带 9 与不带 auto-close 均 PASS。`menu_frames`/`picker_frames` 为逐帧采样计数、运行间浮动（只断言 >0），不是固定契约。
+- **旧 `--dump-overlay` 已移除且显式失败**：参数表中不再存在；传旧名会打印 `gallery: --dump-overlay was renamed; use --debug-stack --auto-close=9` 并 **exit 2**；其它未知参数会打印 `gallery: unknown argument <arg>` 与 usage 并 **exit 2**；`--help` 仍 exit 0（不再“忽略后 exit 0”假绿，终审 K1-04/Q1-07）。三端脚本与 README 一律改 `--debug-stack`。
+- **P1 完成状态**：gallery 的 ⑭ ColorPicker 场景与 overlay-check 已全部跑在新 popup API 上；真实窗口像素 readback/截图与三端验收仍为 **P3-6**（`--debug-stack` 只断言栈/rect）。
+- **最终数字（round-3）**：`--pixel-check` `checks=94`、`close 6+6=12` 不变；`cargo test -p ui_core -p ui_kit` 最终 3780 passed / 2 ignored（ui_kit 801），详见设计 §12.5。

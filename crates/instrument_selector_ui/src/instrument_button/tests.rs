@@ -261,10 +261,7 @@ fn a_click_opens_the_selector_only_when_the_control_is_live() {
     live.click(centre);
     live.drain();
 
-    assert!(
-        !live.app().overlays(live.window()).is_empty(),
-        "a live control opens a dialog"
-    );
+    assert!(live.overlay_count() > 0, "a live control opens a dialog");
 
     let mut disabled = crate::test_support::Harness::new();
     let node = {
@@ -293,7 +290,7 @@ fn a_click_opens_the_selector_only_when_the_control_is_live() {
     disabled.drain();
 
     assert!(
-        disabled.app().overlays(disabled.window()).is_empty(),
+        disabled.overlay_count() == 0,
         "a disabled control states itself; it does not answer a click with a dialog"
     );
 }

@@ -31,19 +31,22 @@ use ui_kit::{
     kit::{
         assets,
         button::Button,
-        dialog::{Dialog, DialogBuilder, DialogError},
+        dialog::{Dialog, DialogBuilder},
         icon::IconKind,
         input::{self, InputNode, InputSpec, InputState},
         list::{List, ListOptions, SelectionMode},
         markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
-        overlay::OverlayError,
         separator::Separator,
         size::{UnifiedSizable, UnifiedSize},
         spinner::Spinner,
     },
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
-use widget::{cx::WidgetCx, error::TranslatedError, status::WidgetAction};
+use widget::{
+    cx::WidgetCx,
+    error::{TranslatedError, dialog_engine_error},
+    status::WidgetAction,
+};
 
 use super::{
     model::SelectionData,
@@ -97,7 +100,7 @@ impl SolanaWalletDialog {
             };
             release_components(cx.app_mut(), components);
             let _ = cx.app_mut().release_scope(scope);
-            return Err(engine_error_of(error, window));
+            return Err(dialog_engine_error(error));
         }
 
         let _ = cx.request_frame();
@@ -209,7 +212,6 @@ impl SolanaWalletDialog {
 }
 
 struct DialogState {
-    window: WindowId,
     scope: SignalScope,
     theme: ThemeHandle,
     translate: Translate,
@@ -322,7 +324,6 @@ impl DialogState {
         let placeholder = t_smol!(translate, "widget.solana_wallet.address_placeholder");
         let addresses: Arc<[SolanaWalletSelection]> = Arc::from([]);
         Self {
-            window: cx.window(),
             scope,
             theme,
             translate,
@@ -397,15 +398,13 @@ impl DialogState {
     }
 
     fn build_dialog(inner: &Weak<RefCell<DialogState>>, cx: &mut WidgetCx<'_>) -> Dialog {
-        let (theme, layer, animation, key, title, closed) = {
+        let (theme, key, title, closed) = {
             let state = inner
                 .upgrade()
                 .expect("the dialog is built while its state is alive");
             let state = state.borrow();
             (
                 state.theme.clone(),
-                cx.layer().clone(),
-                cx.animation().clone(),
                 state.keys.dialog.clone(),
                 t_smol!(state.translate, "widget.solana_wallet.dialog_title"),
                 Rc::clone(&state.closed),
@@ -422,7 +421,7 @@ impl DialogState {
                 state.borrow_mut().build_content(app, window, body)
             })
             .on_close(move |_reason, _app| closed.set(true))
-            .build(cx.app_mut(), theme, layer, animation, key)
+            .build(cx.app_mut(), theme, key)
     }
 
     fn publish(&mut self, cx: &mut WidgetCx<'_>, view: &DialogView) {
@@ -701,9 +700,7 @@ impl DialogState {
 
     fn sync_components(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         if let Some(dialog) = self.dialog.as_ref() {
-            dialog
-                .sync(cx.app_mut())
-                .map_err(|error| engine_error_of(error, self.window))?;
+            dialog.sync(cx.app_mut()).map_err(dialog_engine_error)?;
         }
         if let Some(list) = self.list.as_ref() {
             list.sync(cx.app_mut())?;
@@ -1600,15 +1597,6 @@ impl MarkdownAssets for EmbeddedAssets {
     }
 }
 
-fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
-    match error {
-        DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
-        DialogError::Overlay(OverlayError::PlacementConfig { .. }) | DialogError::NotOpen => {
-            EngineError::UnknownWindow { window }
-        }
-    }
-}
-
 fn build_node(
     app: &mut App,
     window: WindowId,
@@ -1703,7 +1691,7 @@ mod tests {
         dialog
             .test_dialog()
             .expect("the kit dialog is built")
-            .overlay_node()
+            .popup_node()
             .expect("the dialog is open")
     }
 

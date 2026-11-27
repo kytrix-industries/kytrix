@@ -30,11 +30,10 @@ use ui_core::{
 use ui_kit::{
     kit::{
         button::Button,
-        dialog::{Dialog, DialogBuilder, DialogError},
+        dialog::{Dialog, DialogBuilder},
         empty_state::EmptyState,
         input::{self, InputNode, InputSpec, InputState},
         list::{List, ListOptions},
-        overlay::OverlayError,
         separator::Separator,
         size::{UnifiedSizable, UnifiedSize},
         spinner::Spinner,
@@ -45,7 +44,7 @@ use ui_kit::{
 use widget::{
     binding::{Inbound, WidgetBinding},
     cx::WidgetCx,
-    error::TranslatedError,
+    error::{TranslatedError, dialog_engine_error},
     protocol::RequestId,
 };
 
@@ -115,7 +114,6 @@ pub(super) struct IndexSelector {
 }
 
 struct SelectorState {
-    window: WindowId,
     scope: SignalScope,
     theme: ThemeHandle,
     translate: Translate,
@@ -276,7 +274,7 @@ impl IndexSelector {
         if let Err(error) = dialog.open(cx.app_mut(), window) {
             let components = self.inner.borrow_mut().take_components();
             release_components(cx.app_mut(), components);
-            return Err(engine_error_of(error, window));
+            return Err(dialog_engine_error(error));
         }
         self.inner.borrow_mut().after_open(cx)?;
         let _ = cx.request_frame();
@@ -331,7 +329,6 @@ impl SelectorState {
         let rows: Rc<RefCell<Arc<[FinancialIndexDescriptor]>>> =
             Rc::new(RefCell::new(Arc::from([])));
         Self {
-            window: cx.window(),
             scope,
             theme,
             translate,
@@ -425,13 +422,11 @@ impl SelectorState {
     }
 
     fn build_dialog(inner: &Rc<RefCell<Self>>, cx: &mut WidgetCx<'_>) -> Dialog {
-        let (theme, layer, animation, key, closed, title, confirm_label, cancel_label) = {
+        let (theme, key, closed, title, confirm_label, cancel_label) = {
             let state = inner.borrow();
             let translate = &state.translate;
             (
                 state.theme.clone(),
-                cx.layer().clone(),
-                cx.animation().clone(),
                 state.keys.dialog.clone(),
                 Rc::clone(&state.closed),
                 t_smol!(translate, "widget.financial_index.choose"),
@@ -468,7 +463,7 @@ impl SelectorState {
             })
             .cancel(cancel_label, |_app| {})
             .on_close(move |_close, _app| closed.set(true))
-            .build(cx.app_mut(), theme, layer, animation, key)
+            .build(cx.app_mut(), theme, key)
     }
 
     fn after_open(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
@@ -777,9 +772,7 @@ impl SelectorState {
         }
         self.sync_confirm(cx);
         if let Some(dialog) = self.dialog.as_ref() {
-            dialog
-                .sync(cx.app_mut())
-                .map_err(|error| engine_error_of(error, self.window))?;
+            dialog.sync(cx.app_mut()).map_err(dialog_engine_error)?;
         }
         Ok(())
     }
@@ -1439,15 +1432,6 @@ fn update_selection(
     Ok(selected.insert(topic.clone()))
 }
 
-fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
-    match error {
-        DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
-        DialogError::Overlay(OverlayError::PlacementConfig { .. }) | DialogError::NotOpen => {
-            EngineError::UnknownWindow { window }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1479,6 +1463,25 @@ mod tests {
     type Confirmed = Rc<RefCell<Option<Vec<SelectedFinancialIndex>>>>;
 
     const SETTLE_TURNS: usize = 64;
+
+    fn popup_total(harness: &WidgetTestApp) -> usize {
+        harness
+            .app()
+            .popup_stack(harness.window())
+            .map_or(0, |stack| stack.entries.len())
+    }
+    fn popup_count(harness: &WidgetTestApp) -> usize {
+        harness
+            .app()
+            .popup_stack(harness.window())
+            .map_or(0, |stack| {
+                stack
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.tier != ui_core::popup::PopupTier::Scrim)
+                    .count()
+            })
+    }
 
     fn harness() -> WidgetTestApp {
         test_support::harness()
@@ -1566,7 +1569,7 @@ mod tests {
             .dialog
             .as_ref()
             .expect("the dialog is built")
-            .overlay_node()
+            .popup_node()
             .expect("the dialog is open")
     }
 
@@ -2479,7 +2482,7 @@ mod tests {
         assert!(harness.app().has_action_handler(&second_action));
         assert_eq!(
             harness.app().modal_scope(harness.window()),
-            dialog(&second).overlay_node(),
+            dialog(&second).popup_node(),
             "the dialog opened last is the window's modal scope"
         );
 
@@ -2496,14 +2499,24 @@ mod tests {
         assert!(second.is_open(harness.app()));
         assert!(!first.is_open(harness.app()));
         assert_eq!(
-            harness.layer().len(harness.window()),
+            popup_count(&harness),
             1,
-            "only the open selector's dialog is still in the layer"
+            "only the open selector's dialog is still open"
+        );
+        assert_eq!(
+            popup_total(&harness),
+            2,
+            "the still-open dialog keeps exactly its own scrim in the popup stack"
         );
 
         harness.with_cx(|cx| second.release(cx));
         assert!(!harness.app().has_action_handler(&second_action));
-        assert!(harness.layer().is_empty(harness.window()));
+        assert_eq!(popup_count(&harness), 0);
+        assert_eq!(
+            popup_total(&harness),
+            0,
+            "releasing every selector leaves no popup entry behind"
+        );
     }
 
     #[test]
@@ -2552,7 +2565,12 @@ mod tests {
             "a hundred open/release cycles allocated value slots for good"
         );
         assert!(!harness.app().has_action_handler(&first_action));
-        assert!(harness.layer().is_empty(harness.window()));
+        assert_eq!(popup_count(&harness), 0);
+        assert_eq!(
+            popup_total(&harness),
+            0,
+            "a hundred open/release cycles leave no popup entry behind"
+        );
     }
 
     #[test]

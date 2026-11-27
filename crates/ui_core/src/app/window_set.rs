@@ -1,7 +1,6 @@
 use super::{App, RemoveOutcome, input};
 use crate::{
     error::EngineError,
-    interaction,
     node::{dependency::Owner, id::NodeId, signal::SignalScope},
     window::{Window, WindowId, WindowOptions},
 };
@@ -76,20 +75,12 @@ fn remove(
             reader,
         });
     }
-    let (opener, modal) = app.windows.get(&window).map_or((None, false), |target| {
-        let slot = target.tree().overlay_slot(node);
-        (
-            slot.filter(|slot| slot.restore_focus)
-                .and_then(|slot| slot.opener),
-            slot.is_some_and(|slot| slot.trap_focus),
-        )
-    });
     let captured = app.windows.get(&window).is_some_and(|target| {
         let tree = target.tree();
         target
             .pointer()
             .capture
-            .is_some_and(|captured| interaction::overlay::is_in_subtree(tree, captured, node))
+            .is_some_and(|captured| tree.is_ancestor(node, captured))
     });
     if captured {
         app.cancel_pointer_session(window);
@@ -129,10 +120,7 @@ fn remove(
     outcome.scoped_key_bindings = scoped_key_bindings;
     outcome.timers = timers;
     outcome.animations = animations;
-    if modal && let Some(target) = app.windows.get_mut(&window) {
-        crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
-    }
-    super::focus::restore_focus(app, window, opener);
+    super::popup::reap_orphan_scrims(app, window);
     if let Some(scope) = scope {
         let animations_before = app.animations.len();
         outcome.released_values = app.release_scope(scope);
@@ -198,8 +186,7 @@ pub(crate) fn create_window(app: &mut App, mut options: WindowOptions) -> Window
         .expect("window handle space exhausted (u32::MAX windows created)");
     let scope = app.store.new_scope();
     app.window_scopes.insert(id, scope);
-    let mut window = Window::new(id, options);
-    window.tree_mut().bind_window(id);
+    let window = Window::new(id, options);
     app.windows.insert(id, window);
     id
 }

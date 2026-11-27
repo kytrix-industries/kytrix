@@ -128,6 +128,8 @@ pub struct FrameStats {
     pub compositor_inbox_latency: Option<std::time::Duration>,
     pub encode_on_compositor: bool,
     pub scroll_offset_frames: usize,
+    pub popup_settle_rounds: usize,
+    pub popup_unsettled: bool,
     pub a11y_only_frames: usize,
 }
 

@@ -82,6 +82,8 @@ pub(crate) fn needs_frame(window: &Window, wake: bool) -> bool {
         || window.tree.has_bind_work()
         || window.tree.has_layout_work()
         || window.tree.has_paint_work()
+        || window.popups.dirty().any()
+        || window.popups.animating()
 }
 
 pub(crate) fn begin_frame(window: &mut Window) -> Option<FrameTicket> {

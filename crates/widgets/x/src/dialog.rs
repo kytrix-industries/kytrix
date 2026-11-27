@@ -33,18 +33,22 @@ use ui_kit::{
         alert::AlertBuilder,
         badge::Badge,
         button::Button,
-        dialog::{Dialog, DialogBuilder, DialogClose, DialogError},
+        dialog::{Dialog, DialogBuilder, DialogClose},
         icon::{ICON_INTRINSIC_SIZE, IconKind, svg},
         input::{self, InputNode, InputSpec, InputState},
         list::{List, ListOptions, SelectionMode},
-        overlay::OverlayError,
         separator::Separator,
         size::{UnifiedSizable, UnifiedSize},
         spinner::Spinner,
     },
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
-use widget::{cx::WidgetCx, error::TranslatedError, rpc::RpcCallError, status::WidgetAction};
+use widget::{
+    cx::WidgetCx,
+    error::{TranslatedError, dialog_engine_error},
+    rpc::RpcCallError,
+    status::WidgetAction,
+};
 
 use super::{
     model::{MediaState, MediaStates, SelectionData, selection_name},
@@ -120,7 +124,7 @@ impl TweetDialog {
             };
             release_components(cx.app_mut(), components);
             let _ = cx.app_mut().release_scope(scope);
-            return Err(engine_error_of(error, window));
+            return Err(dialog_engine_error(error));
         }
 
         let _ = cx.request_frame();
@@ -545,15 +549,13 @@ impl DialogState {
     }
 
     fn build_dialog(inner: &Weak<RefCell<DialogState>>, cx: &mut WidgetCx<'_>) -> Dialog {
-        let (theme, layer, animation, key, title, close_label, closed) = {
+        let (theme, key, title, close_label, closed) = {
             let state = inner
                 .upgrade()
                 .expect("the dialog is built while its state is alive");
             let state = state.borrow();
             (
                 state.theme.clone(),
-                cx.layer().clone(),
-                cx.animation().clone(),
                 state.keys.dialog.clone(),
                 t_smol!(state.translate, "widget.x.dialog_title"),
                 t_smol!(state.translate, "common.close"),
@@ -576,7 +578,7 @@ impl DialogState {
                     closed.set(true);
                 }
             })
-            .build(cx.app_mut(), theme, layer, animation, key)
+            .build(cx.app_mut(), theme, key)
     }
 
     fn frame(&mut self, cx: &mut WidgetCx<'_>, view: &DialogView) -> Result<(), EngineError> {
@@ -1030,11 +1032,8 @@ impl DialogState {
     }
 
     fn sync_components(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        let window = self.window;
         if let Some(dialog) = self.dialog.as_ref() {
-            dialog
-                .sync(cx.app_mut())
-                .map_err(|error| engine_error_of(error, window))?;
+            dialog.sync(cx.app_mut()).map_err(dialog_engine_error)?;
         }
         if let Some(list) = self.accounts.as_ref() {
             list.sync(cx.app_mut())?;
@@ -1105,9 +1104,9 @@ impl DialogState {
     fn sync_row_controls(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let language = *cx.read(&self.language);
         let may_change = self.may_change();
-        let window = self.window;
         let theme = self.theme.clone();
         let translate = self.translate.clone();
+        let window = self.window;
 
         if let Some(list) = self.accounts.clone() {
             let mounted: BTreeMap<usize, NodeId> =
@@ -1306,8 +1305,6 @@ impl DialogState {
         let alert_message = message;
         let alert_confirm = confirm;
         let theme = self.theme.clone();
-        let layer = cx.layer().clone();
-        let animation = cx.animation().clone();
         let key = self.keys.alert.clone();
         let alert = DialogBuilder::alert(title, move |dialog, _theme| {
             let dialog = dialog.clone();
@@ -1318,11 +1315,11 @@ impl DialogState {
                     dialog.close(app);
                 })
         })
-        .build(cx.app_mut(), theme, layer, animation, key);
+        .build(cx.app_mut(), theme, key);
         let window = self.window;
         alert
             .open(cx.app_mut(), window)
-            .map_err(|error| engine_error_of(error, window))?;
+            .map_err(dialog_engine_error)?;
         if let Some(previous) = self.alert.replace(alert) {
             previous.release(cx.app_mut());
         }
@@ -1333,10 +1330,7 @@ impl DialogState {
         let Some(alert) = self.alert.clone() else {
             return Ok(());
         };
-        let window = self.window;
-        alert
-            .sync(cx.app_mut())
-            .map_err(|error| engine_error_of(error, window))?;
+        alert.sync(cx.app_mut()).map_err(dialog_engine_error)?;
         if !alert.is_open(cx.app()) {
             self.alert = None;
             alert.release(cx.app_mut());
@@ -3070,15 +3064,6 @@ fn release_components(app: &mut App, components: DialogComponents) {
     }
     for button in components.row_controls {
         button.release(app);
-    }
-}
-
-fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
-    match error {
-        DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
-        DialogError::Overlay(OverlayError::PlacementConfig { .. }) | DialogError::NotOpen => {
-            EngineError::UnknownWindow { window }
-        }
     }
 }
 

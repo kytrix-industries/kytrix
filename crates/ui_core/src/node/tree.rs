@@ -18,7 +18,7 @@ use self::{content::TextSlot, layout::LayoutStats};
 use crate::{
     error::EngineError,
     event::Action,
-    interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
+    interaction::{NodeInteraction, ScrollSlot, VirtualSlot},
     layout::{
         Axis, LayoutOverride, LayoutReport, MeasureFn,
         hit_test::{HitResult, HitShape},
@@ -44,6 +44,45 @@ use crate::{
     text::{ShapedLine, TextContent},
     text_edit::{EditableSpec, EditableText},
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MaxSize {
+    pub width: Option<LogicalPx>,
+    pub height: Option<LogicalPx>,
+}
+
+impl MaxSize {
+    #[must_use]
+    pub fn width(width: LogicalPx) -> Self {
+        Self {
+            width: Some(width),
+            height: None,
+        }
+    }
+
+    #[must_use]
+    pub fn height(height: LogicalPx) -> Self {
+        Self {
+            width: None,
+            height: Some(height),
+        }
+    }
+
+    #[must_use]
+    pub fn both(width: LogicalPx, height: LogicalPx) -> Self {
+        Self {
+            width: Some(width),
+            height: Some(height),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HitFocusSkip {
+    #[default]
+    None,
+    Container,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LayoutBox {
@@ -90,6 +129,15 @@ impl NodeKind {
     }
 }
 
+pub(crate) fn popup_root_style() -> crate::paint::style::Style {
+    crate::paint::style_builder::StyleBuilder::new()
+        .absolute()
+        .left(crate::math::px(0.0))
+        .top(crate::math::px(0.0))
+        .size(crate::math::px(0.0), crate::math::px(0.0))
+        .build()
+}
+
 pub(crate) struct NodeSpec {
     kind: NodeKind,
     style: Style,
@@ -107,6 +155,7 @@ pub(crate) struct NodeSpec {
     a11y: Option<crate::a11y::A11yOverride>,
     bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
     tab_stop: bool,
+    hit_focus_skip: HitFocusSkip,
 }
 
 static EMPTY_STYLE_PATCH: StylePatch = StylePatch {
@@ -323,6 +372,13 @@ pub(crate) struct BakedGeometryChunk {
     pub bounds: LogicalRect,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PopupTransform {
+    pub offset: LogicalPoint,
+    pub opacity: f32,
+    pub blocked: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PaintCounters {
     pub visited_nodes: usize,
@@ -343,6 +399,8 @@ pub struct NodeTree {
     clip_keys: Vec<Option<(u8, Option<DeviceRect>)>>,
     baked_screen_bounds: Vec<Option<LogicalRect>>,
     painted_extents: Vec<Option<PaintedExtent>>,
+    popup_transforms: Vec<Option<PopupTransform>>,
+    popup_pointer_transparent: Vec<bool>,
     subtree_bounds: Vec<LogicalRect>,
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
     images_need_refresh: bool,
@@ -356,7 +414,6 @@ pub struct NodeTree {
     moved_nodes: DirtySet,
     scroll_containers: Vec<NodeId>,
     virtual_containers: Vec<NodeId>,
-    overlay_containers: Vec<NodeId>,
     text_dirty: content::TextDirtyQueue,
     text_layout_dirty: content::TextDirtyQueue,
     removed_lanes: Vec<LaneId>,
@@ -381,6 +438,9 @@ pub struct NodeTree {
     paint_full_frames: u64,
     paint_incremental_frames: u64,
     dirty_scratch: Vec<NodeId>,
+    paint_tail: SmallVec<[NodeId; 2]>,
+    order_dirty: bool,
+    popup_root: Option<NodeId>,
     #[cfg(feature = "test-support")]
     scanned: RefCell<ahash::HashSet<NodeId>>,
     bound_nodes: usize,
@@ -396,6 +456,9 @@ impl NodeTree {
     #[must_use]
     pub fn new() -> Self {
         arena::new()
+    }
+    pub(crate) fn install_popup_root(&mut self) -> NodeId {
+        arena::install_popup_root(self)
     }
     #[must_use]
     pub fn root(&self) -> NodeId {
@@ -500,9 +563,6 @@ impl NodeTree {
     pub(crate) fn note_virtual_container(&mut self, node: NodeId) {
         traverse::note_virtual_container(self, node)
     }
-    pub(crate) fn note_overlay_container(&mut self, node: NodeId) {
-        traverse::note_overlay_container(self, node)
-    }
     #[must_use]
     pub(crate) fn scroll_containers(&self) -> &[NodeId] {
         &self.scroll_containers
@@ -511,9 +571,57 @@ impl NodeTree {
     pub(crate) fn virtual_containers(&self) -> &[NodeId] {
         &self.virtual_containers
     }
+
+    #[cfg(feature = "hud")]
+    pub(crate) fn pin_tail_child(&mut self, node: NodeId) {
+        arena::pin_tail_child(self, node)
+    }
+
+    pub fn reorder_children(
+        &mut self,
+        parent: NodeId,
+        order: &[NodeId],
+    ) -> Result<(), EngineError> {
+        arena::reorder_children(self, parent, order)
+    }
+
+    pub fn set_max_size(&mut self, node: NodeId, max: MaxSize) -> Result<(), EngineError> {
+        layout::set_max_size(self, node, max)
+    }
+
     #[must_use]
-    pub(crate) fn overlay_containers(&self) -> &[NodeId] {
-        &self.overlay_containers
+    pub(crate) fn hit_focus_skip(&self, node: NodeId) -> HitFocusSkip {
+        self.interaction(node)
+            .map_or(HitFocusSkip::None, |slot| slot.hit_focus_skip)
+    }
+
+    #[must_use]
+    pub(crate) fn node_screen_rect(&self, node: NodeId) -> Option<LogicalRect> {
+        let target = self.get(node).ok()?;
+        let mut offset = LogicalPoint::ZERO;
+        let mut popup_offset = LogicalPoint::ZERO;
+        let mut cursor = target.parent();
+        while let Some(current) = cursor {
+            offset += self
+                .scroll_slot(current)
+                .map_or(LogicalPoint::ZERO, |slot| slot.offset);
+            if let Some(transform) = self.popup_transform(current) {
+                popup_offset += transform.offset;
+            }
+            cursor = self.get(current).ok()?.parent();
+        }
+        Some(target.layout().bounds.translate(LogicalPoint::new(
+            -offset.x + popup_offset.x,
+            -offset.y + popup_offset.y,
+        )))
+    }
+
+    pub(crate) fn mark_order_dirty(&mut self) {
+        self.order_dirty = true;
+    }
+
+    pub(crate) fn take_order_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.order_dirty)
     }
 
     pub(crate) fn compute_layout(
@@ -548,6 +656,13 @@ impl NodeTree {
     }
     pub(crate) fn set_absolute_inset(&mut self, node: NodeId, origin: LogicalPoint) -> bool {
         layout::set_absolute_inset(self, node, origin)
+    }
+    pub(crate) fn set_absolute_size(
+        &mut self,
+        node: NodeId,
+        size: crate::math::LogicalSize,
+    ) -> bool {
+        layout::set_absolute_size(self, node, size)
     }
     pub(crate) fn taffy_style(&self, node: NodeId) -> &taffy::Style<SmolStr> {
         layout::taffy_style(self, node)
@@ -1154,6 +1269,35 @@ impl NodeTree {
     pub(crate) fn set_painted_extent(&mut self, node: NodeId, extent: Option<PaintedExtent>) {
         content::set_painted_extent(self, node, extent)
     }
+    #[must_use]
+    pub(crate) fn popup_transform(&self, node: NodeId) -> Option<PopupTransform> {
+        content::popup_transform(self, node)
+    }
+    pub(crate) fn set_popup_transform(&mut self, node: NodeId, transform: Option<PopupTransform>) {
+        content::set_popup_transform(self, node, transform)
+    }
+    #[must_use]
+    pub(crate) fn popup_pointer_transparent(&self, node: NodeId) -> bool {
+        content::popup_pointer_transparent(self, node)
+    }
+    pub(crate) fn set_popup_pointer_transparent(&mut self, node: NodeId, transparent: bool) {
+        content::set_popup_pointer_transparent(self, node, transparent)
+    }
+    #[must_use]
+    pub(crate) fn is_popup_root(&self, node: NodeId) -> bool {
+        self.popup_root == Some(node)
+    }
+    #[must_use]
+    pub(crate) fn popup_input_blocked(&self, node: NodeId) -> bool {
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            if content::popup_transform(self, current).is_some_and(|transform| transform.blocked) {
+                return true;
+            }
+            cursor = self.get(current).ok().and_then(|target| target.parent());
+        }
+        false
+    }
     pub(crate) fn clip_key(&self, node: NodeId) -> Option<(u8, Option<DeviceRect>)> {
         content::clip_key(self, node)
     }
@@ -1268,10 +1412,6 @@ impl NodeTree {
     }
     pub(crate) fn scroll_slot_mut(&mut self, node: NodeId) -> Option<&mut ScrollSlot> {
         content::scroll_slot_mut(self, node)
-    }
-    #[must_use]
-    pub(crate) fn overlay_slot(&self, node: NodeId) -> Option<OverlaySlot> {
-        content::overlay_slot(self, node)
     }
     #[must_use]
     pub(crate) fn virtual_slot(&self, node: NodeId) -> Option<&VirtualSlot> {

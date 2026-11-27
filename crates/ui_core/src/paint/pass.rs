@@ -395,6 +395,16 @@ fn paint_node(
         return Ok(());
     }
     context.visited += 1;
+    let (total, inherited_opacity) =
+        context
+            .tree
+            .popup_transform(node)
+            .map_or((total, inherited_opacity), |transform| {
+                (
+                    LogicalPoint::new(total.x - transform.offset.x, total.y - transform.offset.y),
+                    inherited_opacity * transform.opacity,
+                )
+            });
     let current_key = clip.key();
     let Some(state) = context.tree.paint_state(
         node,

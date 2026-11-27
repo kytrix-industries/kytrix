@@ -921,13 +921,11 @@ impl<S: PredictionEventSource> SelectorState<S> {
     }
 
     fn build_dialog(selector: &Rc<PredictionEventSelector<S>>, app: &mut App) -> Dialog {
-        let (theme, translate, layer, animation, closed, key) = {
+        let (theme, translate, closed, key) = {
             let inner = selector.inner.borrow();
             (
                 inner.host.theme().clone(),
                 inner.host.translate().clone(),
-                inner.host.layer().clone(),
-                inner.host.animation(),
                 Rc::clone(&inner.closed),
                 inner.key.clone(),
             )
@@ -960,7 +958,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 }
             })
             .on_close(move |_close, _app| closed.set(true))
-            .build(app, theme, layer, animation, key)
+            .build(app, theme, key)
     }
 
     fn register_route(selector: &Rc<PredictionEventSelector<S>>, host: &SelectorHost) -> RouteId {
@@ -978,8 +976,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         body: NodeId,
     ) -> Result<(), EngineError> {
         let theme = self.host.theme().clone();
-        let layer = self.host.layer().clone();
-        let animation = self.host.animation();
         let translate = self.host.translate().clone();
         let text_size = theme.tokens().small.font_size;
 
@@ -1023,8 +1019,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let select = Select::new(
             app,
             theme.clone(),
-            layer.clone(),
-            animation.clone(),
             format_smolstr!("{}:venue", self.key),
             SelectOptions::default(),
         )
@@ -1142,8 +1136,6 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let tooltip = Tooltip::new(
             app,
             theme.clone(),
-            layer,
-            animation,
             format_smolstr!("{}:translate-tip", self.key),
             TooltipOptions::default(),
         );
@@ -1320,7 +1312,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let open = self
             .dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.is_open(app) || dialog.is_closing());
+            .is_some_and(|dialog| dialog.is_open(app) || dialog.is_closing(app));
         if !open {
             self.closed.set(true);
             self.finish(app);

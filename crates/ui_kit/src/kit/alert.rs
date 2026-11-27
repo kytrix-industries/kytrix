@@ -74,7 +74,7 @@ pub struct AlertBuilder {
     validate: Option<Validator>,
     ok_action: Option<OkAction>,
     cancel_action: Option<CancelAction>,
-    closing: Option<Rc<dyn Fn() -> bool>>,
+    closing: Option<Rc<dyn Fn(&App) -> bool>>,
 }
 
 impl AlertBuilder {
@@ -168,7 +168,7 @@ impl AlertBuilder {
         self
     }
 
-    pub(crate) fn closing_guard(mut self, closing: impl Fn() -> bool + 'static) -> Self {
+    pub(crate) fn closing_guard(mut self, closing: impl Fn(&App) -> bool + 'static) -> Self {
         self.closing = Some(Rc::new(closing));
         self
     }
@@ -299,7 +299,8 @@ impl AlertBuilder {
         let ok_button = Button::new(app, theme.clone(), smol_str::format_smolstr!("{key}.ok"))
             .label(ok_text)
             .on_click(move |ctx: &mut ActionCtx<'_>| {
-                if closing_for_ok.as_ref().is_some_and(|closing| closing()) {
+                let app = ctx.app_mut();
+                if closing_for_ok.as_ref().is_some_and(|closing| closing(app)) {
                     return;
                 }
                 let value = input_for_ok
@@ -336,7 +337,11 @@ impl AlertBuilder {
             .label(self.cancel_text.clone())
             .joined(1, 2)
             .on_click(move |ctx: &mut ActionCtx<'_>| {
-                if closing_for_cancel.as_ref().is_some_and(|closing| closing()) {
+                let app = ctx.app_mut();
+                if closing_for_cancel
+                    .as_ref()
+                    .is_some_and(|closing| closing(app))
+                {
                     return;
                 }
                 if let Some(action) = &cancel_action {
@@ -835,7 +840,7 @@ mod tests {
                 .ok_cancel("Discard", "Lose changes?")
                 .ok_action(move |_, _| ok_for_builder.set(ok_for_builder.get() + 1))
                 .cancel_action(move |_| cancel_for_builder.set(cancel_for_builder.get() + 1))
-                .closing_guard(move || closing_for_builder.get())
+                .closing_guard(move |_| closing_for_builder.get())
         });
         let mut app = harness.app;
         let ok = harness.alert.ok_button().node().expect("ok node");

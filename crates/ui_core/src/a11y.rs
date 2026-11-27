@@ -1,10 +1,14 @@
+use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::{
     math::{DeviceRect, LogicalPoint, LogicalPx},
     node::id::NodeId,
+    popup::HasPopup,
     window::WindowId,
 };
+
+pub const DISMISS_CUSTOM_ACTION_ID: i32 = -1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum A11yRole {
@@ -189,6 +193,9 @@ pub enum A11yAction {
     Expand,
     Collapse,
     ShowContextMenu,
+    Dismiss,
+    HideTooltip,
+    ShowTooltip,
     Custom(i32),
 }
 
@@ -242,6 +249,12 @@ pub struct A11yPatch {
     pub checked: Option<bool>,
     pub selected: Option<bool>,
     pub expanded: Option<bool>,
+    pub has_popup: Option<HasPopup>,
+    pub owns: Option<SmallVec<[NodeId; 2]>>,
+    pub controls: Option<SmallVec<[NodeId; 2]>>,
+    pub described_by: Option<NodeId>,
+    pub a11y_parent: Option<NodeId>,
+    pub active_descendant: Option<NodeId>,
     pub live: Option<A11yLive>,
     pub pos_in_set: Option<usize>,
     pub size_of_set: Option<usize>,
@@ -268,7 +281,9 @@ pub struct A11yPatch {
 impl A11yPatch {
     #[must_use]
     pub(crate) fn affects_descendants(&self, previous: &Self) -> bool {
-        self.role != previous.role || self.hidden != previous.hidden
+        self.role != previous.role
+            || self.hidden != previous.hidden
+            || self.a11y_parent != previous.a11y_parent
     }
 }
 
@@ -309,6 +324,11 @@ pub struct A11yNode {
     pub checked: Option<bool>,
     pub selected: Option<bool>,
     pub expanded: Option<bool>,
+    pub has_popup: Option<HasPopup>,
+    pub controls: SmallVec<[A11yNodeId; 2]>,
+    pub owns: SmallVec<[A11yNodeId; 2]>,
+    pub described_by: SmallVec<[A11yNodeId; 2]>,
+    pub active_descendant: Option<A11yNodeId>,
     pub row_index: Option<usize>,
     pub column_index: Option<usize>,
     pub row_count: Option<usize>,
@@ -481,6 +501,14 @@ pub enum A11yDiagnostic {
         node: NodeId,
         id: i32,
     },
+    InvalidA11yParent {
+        node: NodeId,
+        parent: NodeId,
+    },
+    ReservedCustomAction {
+        node: NodeId,
+        id: i32,
+    },
     DisabledAction {
         node: NodeId,
         action: A11yAction,
@@ -642,5 +670,8 @@ pub(crate) mod adapter;
 mod contract_tests;
 pub(crate) mod identity;
 pub(crate) mod mapping;
+pub(crate) mod popup;
+#[cfg(all(test, feature = "test-support"))]
+mod popup_tests;
 pub(crate) mod textrun;
 pub(crate) mod tree;

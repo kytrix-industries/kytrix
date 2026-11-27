@@ -1784,10 +1784,8 @@ impl CandlestickWidget {
         let options = SelectOptions::default()
             .size(UnifiedSize::Small)
             .placeholder(t_smol!(translate, adjustment_key(self.config.adjustment)));
-        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
-        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
-        let select = Select::new(cx.app_mut(), theme.clone(), layer, router, key, options)
-            .on_change(move |app, chosen| {
+        let select =
+            Select::new(cx.app_mut(), theme.clone(), key, options).on_change(move |app, chosen| {
                 let Some(id) = chosen.first() else {
                     return;
                 };
@@ -1840,10 +1838,8 @@ impl CandlestickWidget {
             .size(UnifiedSize::Small)
             .label(t_smol!(translate, "widget.candlestick.timeframe"))
             .placeholder(SmolStr::new_static(self.config.timeframe.label()));
-        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
-        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
-        let select = Select::new(cx.app_mut(), theme.clone(), layer, router, key, options)
-            .on_change(move |app, chosen| {
+        let select =
+            Select::new(cx.app_mut(), theme.clone(), key, options).on_change(move |app, chosen| {
                 let Some(id) = chosen.first() else {
                     return;
                 };

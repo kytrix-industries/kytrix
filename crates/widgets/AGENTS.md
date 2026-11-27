@@ -205,7 +205,7 @@ pub trait WidgetView: Sized + 'static {
 
 ## 5. `WidgetCx`：一个上下文，一次借一个
 
-`WidgetCx<'a>` 是 widget 唯一拿得到的宿主视图：`&mut App`、`WindowId`、`&WidgetServices`（含组合根三单例）、自己的
+`WidgetCx<'a>` 是 widget 唯一拿得到的宿主视图：`&mut App`、`WindowId`、`&WidgetServices`、自己的
 `SignalScope`。节点树在 `Window` 里、`Window` 在 `App` 里，因此上下文按需借出，**同一表达式里不能同时持有两个**：
 
 ```rust
@@ -216,7 +216,7 @@ cx.services() / cx.translate() / cx.language() / cx.theme()
 cx.services_rc()                    // Rc<WidgetServices>：自建 selector host 等宿主时 clone 传入
 cx.config_ref(|config| ...)          // 不克隆地读设置快照（read 不登记依赖）
 cx.account() / cx.data_time_zone()   // 由设置快照派生
-cx.scope() / cx.layer() / cx.frame_router() / cx.animation()
+cx.scope() / cx.frame_router()
 cx.unique_key("header.sound")       // kit 组件 key：`<后缀>@<本实例 scope>`，跨 pane 唯一（§9）
 cx.signal(v) / cx.transient(v)       // 铸进 widget scope
 cx.read(&s) / cx.write(&s, v) / cx.update(&s, f)
@@ -224,12 +224,10 @@ cx.request_frame() / cx.request_node_repaint(node) / cx.set_a11y_patch(node, pat
 cx.handle() / cx.spawn(future) / cx.runtime()
 ```
 
-**组合根三单例（`cx.layer()` / `cx.frame_router()` / `cx.animation()`）**：`Layer`（浮层层序）、`FrameRouter`（`App::on_frame`
-单槽唯一注册者）、`AnimationRouter`（`App::on_animation_complete` 单槽唯一注册者）都是**应用级唯一实例**，由组合根创建、
-经 `WidgetServices` 注入。构建需要用它们的 kit 组件（`Overlay` / `Tooltip` / 对话框 / selector host）时 **clone 传入**
-（三者都是 `Rc` 句柄，clone 共享同一实例）。**widget 不得自建**：第二个 `Layer` 会让两个浮层对谁在上意见不一；第二个
-`AnimationRouter` 会静默覆盖引擎的完成槽，先前登记的淡出永远收不了尾；第二个 `FrameRouter` 装不上（单槽已被占用），
-它上面的路由永远不会跑。
+**组合根单例（`cx.frame_router()`）**：`FrameRouter`（`App::on_frame` 单槽唯一注册者）是**应用级唯一实例**，由组合根创建、
+经 `WidgetServices` 注入。**widget 不得自建**：第二个 `FrameRouter` 装不上（单槽已被占用），它上面的路由永远不会跑。
+浮层由**引擎 popup 栈**持有：kit 组件（`PopupPanel` / `Tooltip` / 对话框 / 菜单 / 选择器）的构造只需要 `theme`，不再接收
+`Layer` / `AnimationRouter`；断言浮层用 `App::popup_stack(window)` / `App::popup_rect(id)`。
 
 **借用通法**：先拿 `parent`（`NodeId` 是 `Copy`），再调组件的 `build(cx.app_mut(), window, parent)`；kit 组件的
 `build` 需要 `&mut App` 时先 `let window = cx.window();`。`bind_*` 闭包里要 `Translate` / `ThemeHandle` 时先 `clone()`
@@ -338,9 +336,7 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 | `open_url: Rc<dyn Fn(&str)>` | 打开外部链接 | 调用即可，不碰浏览器 / shell |
 | `sound: Rc<dyn Fn(&'static str) -> Option<Bytes>>` | 应用层音效字节 | `None` = 本宿主无音频（测试通常如此），不是错误 |
 | `reduce_motion: Signal<bool>` | 无障碍减弱动效 | 动画前 `cx.read(&services.reduce_motion)`，为真直接落终值 |
-| `layer: Rc<Layer>` | 应用级唯一的浮层层序 | 经 `cx.layer()` 取；构建 `Overlay` / `Tooltip` / 对话框 / selector host 时 **clone 传入**。widget 不得自建（§5） |
 | `frame_router: Rc<FrameRouter>` | 应用级唯一的每帧扇出 | 经 `cx.frame_router()` 取；框架的 widget 路由已在上面。widget 自建 router 装不上单槽、路由永不跑 |
-| `animation_router: Rc<AnimationRouter>` | 应用级唯一的动画完成路由 | 经 `cx.animation()` 取；每个 `Overlay` / `Tooltip` 都用它。widget 自建会覆盖引擎单槽，先前淡出收不了尾 |
 | `runtime: tokio::runtime::Handle` | stream / RPC 的运行时 | 不自己建 runtime |
 
 **数据时区与账户**：画的那一帧读 `cx.data_time_zone()` / `cx.account()`（由设置快照派生，不缓存、不格式化后存快照）；
@@ -436,10 +432,9 @@ if generation != self.seen {
 
   **只 `off_action` 不 `Button::release` 会漏组件作用域**（W2a 审查 F2：header 每次重建 +10 live 信号槽）；kit 组件的
   `release` 两件事都做，所以优先在字段里保留组件句柄。需要「只摘 handler、不交还组件」的接缝属于 selector 批（§15.5）。
-- **需要组合根单例的 kit 组件用 `cx` 的访问器装配**：`Overlay` / `Tooltip` / 对话框 / selector host 的构造要
-  `theme.clone()` + `layer.clone()` + `animation.clone()`（`cx.theme()` / `cx.layer()` / `cx.animation()`），`sync` 由
-  `cx.frame_router()` 上的路由驱动（widget 自己的 `sync` 里调 `component.sync(cx.app_mut())` 即可，不要再注册第二个
-  `App::on_frame`）。三个 `Rc` 句柄 clone 的是同一个组合根实例，widget 不新建（§5）。
+- **kit 组件用 `cx` 的主题装配**：`PopupPanel` / `Tooltip` / 对话框 / 菜单 / 选择器的构造要 `theme.clone()`（`cx.theme()`），
+  浮层生命周期由引擎 popup 栈持有，不再接收 `Layer` / `AnimationRouter`；`sync` 由 `cx.frame_router()` 上的路由驱动
+  （widget 自己的 `sync` 里调 `component.sync(cx.app_mut())` 即可，不要再注册第二个 `App::on_frame`）。
 - **需要整个服务聚合的宿主**（`SelectorHost` 一类拥有 `Rc<WidgetServices>` 的宿主）用 `Rc::clone(cx.services_rc())`
   取组合根那一个 `Rc`：不重建聚合、不逐字段复制，宿主与 widget 共用同一实例（P3-1f）。
 - **表格 / 列表的行闭包没有 `App`**：行内容里的动态值只能来自挂在节点上的 `bind_*`（读主题 / 设置信号）或行模型字段；
@@ -474,9 +469,8 @@ if generation != self.seen {
 - 契约层装置是 `widget::test_support::WidgetTestApp`（`#[cfg(test)]` 或 feature `test-support`）：
   - 组合与生产相同的 `WidgetServices`（目录 / 服务为 `None`，`catalog_generation` = 0，`open_url` / `sound` 是 no-op，
     `reduce_motion` = false）；
-  - **组合根三单例**（P3-1e）：宿主自建 `Layer` / `FrameRouter` / `AnimationRouter`，经 `WidgetServices::builder` 注入，
-    并用自己的句柄暴露为 `layer()` / `router()` / `animation()`；`cx.layer()` / `cx.animation()` 打开的浮层可直接在这些
-    宿主句柄上断言（注册进同一栈、装的是同一个完成路由）。测试不得另建一套单例；
+  - **组合根单例**（P3-1e）：宿主自建 `FrameRouter`，经 `WidgetServices::builder` 注入，并用自己的句柄暴露为 `router()`。
+    浮层断言用 `app.popup_stack(window)` / `app.popup_rect(id)`（引擎 popup 栈），不再有 `layer()` / `animation()`。测试不得另建一套单例；
   - `WidgetTestApp::new()`（fixture 目录）或 `with_translate(...)`（产品目录文案）；
   - **注入协作者**（P3-1d，不再在 widget crate 里加私有源缝）：`with_open_url(|url| ...)`、`with_sound(|name| ...)`、
     `with_market_participants(Option<MarketParticipantsConnector>)`、`with_kytrix_service(Option<KytrixServiceConnector>)`。

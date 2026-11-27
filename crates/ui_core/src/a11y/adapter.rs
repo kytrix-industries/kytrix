@@ -9,23 +9,22 @@ use smallvec::SmallVec;
 use crate::{
     a11y::{
         A11yDiagnostic, A11yLabelSource, A11yNode, A11yNodeId, A11yRole, A11yTreeSnapshot,
+        DISMISS_CUSTOM_ACTION_ID,
         identity::A11yIds,
         mapping::{
-            action_to_accesskit, live_to_accesskit, orientation_to_accesskit, role_to_accesskit,
-            sort_to_accesskit,
+            action_to_accesskit, has_popup_to_accesskit, live_to_accesskit,
+            orientation_to_accesskit, role_to_accesskit, sort_to_accesskit,
         },
+        popup::{A11yPopupContext, note_changes},
         textrun,
         tree::{
-            CollectionSemanticsCache, collect_subtree, node_a11y_records_with_cache,
-            push_ancestors, resolve_focus,
+            A11yBuildContext, CollectionSemanticsCache, collect_subtree, logical_depth_of,
+            node_a11y_records_with_cache, push_logical_ancestors, resolve_focus,
         },
     },
     app::App,
     math::DevicePixelRatio,
-    node::{
-        id::NodeId,
-        tree::{Node, NodeTree},
-    },
+    node::{id::NodeId, tree::NodeTree},
     window::WindowId,
 };
 
@@ -73,6 +72,8 @@ pub(crate) struct A11yBridge {
     queue_cursor: usize,
     queued: ahash::HashSet<NodeId>,
     refresh: SmallVec<[NodeId; 8]>,
+    popup: A11yPopupContext,
+    patch_parents: crate::a11y::tree::PatchParentIndex,
     #[cfg(test)]
     refresh_deferred: u64,
     tree_info_pending: bool,
@@ -101,6 +102,8 @@ impl A11yBridge {
             queue_cursor: 0,
             queued: ahash::HashSet::default(),
             refresh: SmallVec::new(),
+            popup: A11yPopupContext::default(),
+            patch_parents: crate::a11y::tree::PatchParentIndex::default(),
             #[cfg(test)]
             refresh_deferred: 0,
             tree_info_pending: false,
@@ -122,6 +125,10 @@ impl A11yBridge {
 
     pub(crate) fn consumer_epoch_pending(&self) -> bool {
         self.consumer_epoch.current() != self.seen_consumer_epoch
+    }
+
+    pub(crate) fn popup_changed(&self, popup: &A11yPopupContext) -> bool {
+        self.popup != *popup
     }
 
     pub(crate) fn consumer_epoch(&self) -> A11yConsumerEpoch {
@@ -223,10 +230,33 @@ impl A11yBridge {
         title: &str,
         caret: Option<(NodeId, usize)>,
         diagnostics: &mut Vec<A11yDiagnostic>,
+        popup: &A11yPopupContext,
     ) -> Option<A11yTreeSnapshot> {
+        let modal_scope_changed = note_changes(&self.popup, popup, tree);
+        self.popup = popup.clone();
+        if modal_scope_changed {
+            crate::a11y::tree::mark_modal_scope_changed(tree);
+        }
+        let (focus_id, missing) = resolve_focus(tree, focus);
+        if let Some(missing) = missing {
+            diagnostics.push(A11yDiagnostic::MissingFocusTarget { node: missing });
+        }
+        if self.last_focus != Some(focus_id) {
+            let owners: SmallVec<[NodeId; 8]> = self.popup.active_item_owners().collect();
+            for owner in owners {
+                tree.mark_a11y(owner);
+            }
+        }
         if !self.pending(tree, focus) {
             return None;
         }
+        let next_patch_parents = crate::a11y::tree::collect_patch_parents(tree);
+        let _ = crate::a11y::tree::note_patch_parent_changes(
+            &self.patch_parents,
+            &next_patch_parents,
+            tree,
+        );
+        self.patch_parents = next_patch_parents;
         self.ids.begin_delivery();
         self.tables.clear();
         let consumer_epoch = self.consumer_epoch.current();
@@ -266,6 +296,7 @@ impl A11yBridge {
                     batch.push(node);
                 }
             };
+        let build = A11yBuildContext::new(&self.popup, Some(focus_id), &self.patch_parents);
         let mut deferred: SmallVec<[NodeId; 8]> = SmallVec::new();
         for node in std::mem::take(&mut self.refresh) {
             if batch.len() >= A11Y_BATCH_BUDGET {
@@ -290,7 +321,7 @@ impl A11yBridge {
                 continue;
             }
             if !full_run {
-                push_ancestors(tree, node, &mut ancestors);
+                push_logical_ancestors(tree, node, &build, &mut ancestors);
                 for ancestor in ancestors.drain(..) {
                     push(ancestor, &mut batch, &mut batch_set);
                 }
@@ -298,21 +329,12 @@ impl A11yBridge {
             push(node, &mut batch, &mut batch_set);
         }
 
-        batch.sort_by_key(|node| depth_of(tree, *node));
-        let (focus_id, missing) = resolve_focus(tree, focus);
-        if let Some(missing) = missing {
-            diagnostics.push(A11yDiagnostic::MissingFocusTarget { node: missing });
-        }
+        batch.sort_by_key(|node| logical_depth_of(tree, *node, &build));
         let mut focus_chain: SmallVec<[NodeId; 16]> = SmallVec::new();
         if !batch_set.contains(&focus_id) {
-            let mut cursor = tree.get(focus_id).ok().and_then(Node::parent);
-            while let Some(parent) = cursor {
-                if !batch_set.contains(&parent) {
-                    focus_chain.push(parent);
-                }
-                cursor = tree.get(parent).ok().and_then(Node::parent);
-            }
-            focus_chain.reverse();
+            push_logical_ancestors(tree, focus_id, &build, &mut focus_chain);
+            focus_chain.retain(|parent| !batch_set.contains(parent));
+            focus_chain.as_mut_slice().reverse();
         }
         let focus_related = |engine: NodeId| engine == focus_id || focus_chain.contains(&engine);
         let mut nodes = Vec::with_capacity(batch.len() + 1);
@@ -325,6 +347,7 @@ impl A11yBridge {
                 title,
                 &mut self.ids,
                 &mut self.tables,
+                &build,
                 diagnostics,
             ) {
                 let before = record.node.children.len();
@@ -340,8 +363,14 @@ impl A11yBridge {
                 if record.node.children.len() != before {
                     re_refresh.push(*node);
                 }
+                let related = relation_engines(&self.ids, &record.node);
                 apply_caret(&mut record.node, caret);
                 nodes.push(record.node);
+                for engine in related {
+                    if !self.delivered.contains(&engine) && !batch_set.contains(&engine) {
+                        re_refresh.push(engine);
+                    }
+                }
                 if let Some(run) = record.text_run {
                     nodes.push(run);
                 }
@@ -363,6 +392,7 @@ impl A11yBridge {
                 title,
                 &mut self.ids,
                 &mut self.tables,
+                &build,
                 diagnostics,
             ) {
                 let before = record.node.children.len();
@@ -408,6 +438,7 @@ impl A11yBridge {
                     title,
                     &mut self.ids,
                     &mut self.tables,
+                    &build,
                     diagnostics,
                 )
                 .expect("resolve_focus 已保证焦点节点存活");
@@ -426,6 +457,11 @@ impl A11yBridge {
                 record.node
             };
         apply_caret(&mut focus_node, caret);
+        for engine in relation_engines(&self.ids, &focus_node) {
+            if !self.delivered.contains(&engine) {
+                self.refresh.push(engine);
+            }
+        }
         self.delivered.insert(focus_id);
         self.queued.remove(&focus_id);
         self.last_focus = Some(focus_id);
@@ -482,14 +518,15 @@ impl Default for A11yBridge {
     }
 }
 
-fn depth_of(tree: &NodeTree, node: NodeId) -> u32 {
-    let mut depth = 0u32;
-    let mut cursor = tree.get(node).ok().and_then(|target| target.parent());
-    while let Some(parent) = cursor {
-        depth += 1;
-        cursor = tree.get(parent).ok().and_then(|target| target.parent());
-    }
-    depth
+fn relation_engines(ids: &A11yIds, record: &A11yNode) -> SmallVec<[NodeId; 8]> {
+    record
+        .controls
+        .iter()
+        .chain(&record.owns)
+        .chain(&record.described_by)
+        .chain(record.active_descendant.iter())
+        .filter_map(|id| ids.engine_of(*id))
+        .collect()
 }
 
 fn apply_caret(record: &mut A11yNode, caret: Option<(NodeId, usize)>) {
@@ -610,6 +647,39 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     if let Some(expanded) = record.expanded {
         node.set_expanded(expanded);
     }
+    if let Some(has_popup) = record.has_popup {
+        node.set_has_popup(has_popup_to_accesskit(has_popup));
+    }
+    if !record.controls.is_empty() {
+        node.set_controls(
+            record
+                .controls
+                .iter()
+                .map(|id| AkNodeId(id.get()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    if !record.owns.is_empty() {
+        node.set_owns(
+            record
+                .owns
+                .iter()
+                .map(|id| AkNodeId(id.get()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    if !record.described_by.is_empty() {
+        node.set_described_by(
+            record
+                .described_by
+                .iter()
+                .map(|id| AkNodeId(id.get()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(active) = record.active_descendant {
+        node.set_active_descendant(AkNodeId(active.get()));
+    }
     if let Some(live) = record.live {
         node.set_live(live_to_accesskit(live));
     }
@@ -723,11 +793,20 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
             description: custom.label.to_string(),
         });
     }
-    if !record.custom_actions.is_empty() {
-        node.add_action(accesskit::Action::CustomAction);
-    }
+    let mut custom_action = !record.custom_actions.is_empty();
     for action in &record.actions {
+        if *action == crate::a11y::A11yAction::Dismiss {
+            node.push_custom_action(accesskit::CustomAction {
+                id: DISMISS_CUSTOM_ACTION_ID,
+                description: String::from("dismiss"),
+            });
+            custom_action = true;
+            continue;
+        }
         node.add_action(action_to_accesskit(*action));
+    }
+    if custom_action {
+        node.add_action(accesskit::Action::CustomAction);
     }
     let bounds = record.bounds;
     node.set_bounds(AkRect::new(
@@ -766,7 +845,15 @@ mod tests {
         focus: Option<NodeId>,
     ) -> Option<crate::a11y::A11yTreeSnapshot> {
         let mut diagnostics = Vec::new();
-        bridge.take(tree, focus, scale(), "Kytrix", None, &mut diagnostics)
+        bridge.take(
+            tree,
+            focus,
+            scale(),
+            "Kytrix",
+            None,
+            &mut diagnostics,
+            &crate::a11y::popup::A11yPopupContext::default(),
+        )
     }
 
     #[test]
@@ -1645,6 +1732,7 @@ mod tests {
                 "Kytrix",
                 Some((text, 3)),
                 &mut diagnostics,
+                &crate::a11y::popup::A11yPopupContext::default(),
             )
             .expect("首笔");
         let record = snapshot.node_for(text).expect("text");
@@ -2340,6 +2428,7 @@ mod tests {
                 "Kytrix",
                 Some((input, 2)),
                 &mut diagnostics,
+                &crate::a11y::popup::A11yPopupContext::default(),
             )
             .expect("首笔");
         let record = snapshot.node_for(input).expect("input record");

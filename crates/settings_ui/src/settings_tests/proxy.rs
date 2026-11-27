@@ -593,6 +593,7 @@ fn a_form_over_the_settings_should_write_the_entry_at_once() {
         "the settings should still be drawn under the form"
     );
 
+    click_field(&mut harness, "name");
     type_text(&mut harness, "osaka");
     harness.click_node(CONFIRM_SELECTOR);
     harness.settle(2);
@@ -633,6 +634,7 @@ fn renaming_an_entry_should_move_every_route_bound_to_it() {
     let mut harness = Harness::with_config(config);
     open_edit_form(&mut harness, 0);
 
+    click_field(&mut harness, "name");
     type_text(&mut harness, "2");
     harness.click_node(CONFIRM_SELECTOR);
     harness.settle(2);
@@ -1233,6 +1235,7 @@ fn opening_and_closing_the_form_should_leave_one_form_behind() {
 
     for round in 0..4 {
         open_edit_form(&mut harness, 0);
+        click_field(&mut harness, "name");
         type_text(&mut harness, &format!("{round}"));
         harness.click_node(CANCEL_SELECTOR);
         harness.settle(2);
@@ -1243,6 +1246,7 @@ fn opening_and_closing_the_form_should_leave_one_form_behind() {
     }
 
     open_edit_form(&mut harness, 0);
+    click_field(&mut harness, "name");
     type_text(&mut harness, "osaka");
     harness.click_node(CONFIRM_SELECTOR);
     harness.settle(2);

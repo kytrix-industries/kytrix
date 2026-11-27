@@ -10,6 +10,7 @@ use crate::{
             effective_label, effective_role, effective_value, is_decorative_image, is_hidden,
             is_text_input_role,
         },
+        popup::{A11yPopupContext, A11yPopupOverlay, is_physical_descendant, resolve_parent},
         textrun,
     },
     interaction::ScrollAxis,
@@ -21,6 +22,141 @@ use crate::{
     },
     paint::style::Clip,
 };
+
+pub(crate) struct A11yBuildContext<'a> {
+    pub popup: &'a A11yPopupContext,
+    pub focus: Option<NodeId>,
+    pub patch_parents: &'a PatchParentIndex,
+    parents: std::cell::RefCell<ahash::HashMap<NodeId, Option<NodeId>>>,
+    depths: std::cell::RefCell<ahash::HashMap<NodeId, usize>>,
+}
+
+impl<'a> A11yBuildContext<'a> {
+    pub(crate) fn new(
+        popup: &'a A11yPopupContext,
+        focus: Option<NodeId>,
+        patch_parents: &'a PatchParentIndex,
+    ) -> Self {
+        Self {
+            popup,
+            focus,
+            patch_parents,
+            parents: std::cell::RefCell::new(ahash::HashMap::default()),
+            depths: std::cell::RefCell::new(ahash::HashMap::default()),
+        }
+    }
+
+    fn overlay(&self, node: NodeId) -> Option<&A11yPopupOverlay> {
+        self.popup.overlay(node)
+    }
+
+    pub(crate) fn parent_of(&self, tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+        if let Some(cached) = self.parents.borrow().get(&node) {
+            return *cached;
+        }
+        let parent = effective_a11y_parent(tree, node, patch_child(tree, node), self);
+        self.parents.borrow_mut().insert(node, parent);
+        parent
+    }
+
+    pub(crate) fn depth_of(&self, tree: &NodeTree, node: NodeId) -> usize {
+        if let Some(depth) = self.depths.borrow().get(&node) {
+            return *depth;
+        }
+        let mut path: SmallVec<[NodeId; 16]> = SmallVec::new();
+        let mut cached = None;
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            if let Some(depth) = self.depths.borrow().get(&current) {
+                cached = Some(*depth);
+                break;
+            }
+            path.push(current);
+            cursor = self.parent_of(tree, current);
+        }
+        let mut parent_depth = cached;
+        for current in path.iter().rev() {
+            let depth = parent_depth.map_or(0, |parent| parent + 1);
+            self.depths.borrow_mut().insert(*current, depth);
+            parent_depth = Some(depth);
+        }
+        self.depths.borrow().get(&node).copied().unwrap_or_default()
+    }
+}
+
+pub(crate) type PatchParentIndex = ahash::HashMap<NodeId, SmallVec<[NodeId; 2]>>;
+
+pub(crate) fn collect_patch_parents(tree: &NodeTree) -> PatchParentIndex {
+    let mut index: PatchParentIndex = ahash::HashMap::default();
+    let mut candidates: SmallVec<[(NodeId, NodeId); 16]> = SmallVec::new();
+    tree.for_each_dfs(|node| {
+        if let Some(parent) = patch_child(tree, node)
+            .and_then(|patch| patch.a11y_parent)
+            .and_then(|parent| resolve_parent(tree, node, parent))
+            && !patch_parent_cycle(tree, node, parent)
+        {
+            candidates.push((node, parent));
+        }
+    });
+    for (node, parent) in candidates {
+        index.entry(parent).or_default().push(node);
+    }
+    index
+}
+
+fn patch_parent_cycle(tree: &NodeTree, node: NodeId, parent: NodeId) -> bool {
+    let mut cursor = Some(parent);
+    let mut steps = 0usize;
+    while let Some(current) = cursor {
+        if current == node {
+            return true;
+        }
+        steps += 1;
+        if steps > tree.len() {
+            return true;
+        }
+        cursor = patch_child(tree, current).and_then(|patch| patch.a11y_parent);
+    }
+    false
+}
+
+pub(crate) fn note_patch_parent_changes(
+    previous: &PatchParentIndex,
+    next: &PatchParentIndex,
+    tree: &mut NodeTree,
+) -> bool {
+    let mut dirty: SmallVec<[NodeId; 16]> = SmallVec::new();
+    for (node, parents) in next {
+        if previous.get(node) != Some(parents) {
+            dirty.push(*node);
+            if let Some(previous) = previous.get(node) {
+                dirty.extend(previous.iter().copied());
+            }
+            dirty.extend(parents.iter().copied());
+        }
+    }
+    for (node, parents) in previous {
+        if !next.contains_key(node) {
+            dirty.push(*node);
+            dirty.extend(parents.iter().copied());
+        }
+    }
+    for (parent, children) in next {
+        if previous.get(parent) != Some(children) {
+            dirty.push(*parent);
+        }
+    }
+    for parent in previous.keys() {
+        if !next.contains_key(parent) {
+            dirty.push(*parent);
+        }
+    }
+    let changed = !dirty.is_empty();
+    for node in dirty {
+        tree.mark_a11y(node);
+    }
+    changed
+}
 
 pub(crate) struct A11yRecord {
     pub node: A11yNode,
@@ -66,7 +202,18 @@ pub(crate) fn node_a11y(
     diagnostics: &mut Vec<A11yDiagnostic>,
 ) -> Option<A11yNode> {
     let mut tables = CollectionSemanticsCache::default();
-    node_a11y_with_cache(tree, node, scale, title, ids, &mut tables, diagnostics)
+    let context = A11yPopupContext::default();
+    node_a11y_records_with_cache(
+        tree,
+        node,
+        scale,
+        title,
+        ids,
+        &mut tables,
+        &A11yBuildContext::new(&context, None, &PatchParentIndex::default()),
+        diagnostics,
+    )
+    .map(|record| record.node)
 }
 
 #[cfg(test)]
@@ -79,8 +226,18 @@ pub(crate) fn node_a11y_with_cache(
     tables: &mut CollectionSemanticsCache,
     diagnostics: &mut Vec<A11yDiagnostic>,
 ) -> Option<A11yNode> {
-    node_a11y_records_with_cache(tree, node, scale, title, ids, tables, diagnostics)
-        .map(|record| record.node)
+    let context = A11yPopupContext::default();
+    node_a11y_records_with_cache(
+        tree,
+        node,
+        scale,
+        title,
+        ids,
+        tables,
+        &A11yBuildContext::new(&context, None, &PatchParentIndex::default()),
+        diagnostics,
+    )
+    .map(|record| record.node)
 }
 
 pub(crate) fn node_a11y_records_with_cache(
@@ -90,14 +247,21 @@ pub(crate) fn node_a11y_records_with_cache(
     title: &str,
     ids: &mut A11yIds,
     tables: &mut CollectionSemanticsCache,
+    context: &A11yBuildContext<'_>,
     diagnostics: &mut Vec<A11yDiagnostic>,
 ) -> Option<A11yRecord> {
     let target = tree.get(node).ok()?;
+    if tree.hit_focus_skip(node) == crate::node::tree::HitFocusSkip::Container {
+        return None;
+    }
     let slot = tree.a11y_of(node);
     let over = slot.and_then(|slot| slot.over.as_ref());
     let patch = slot.map(|slot| &slot.patch);
+    let overlay = context.overlay(node);
 
-    let role = effective_role(tree, node, target, over, patch);
+    let role = overlay
+        .and_then(|overlay| overlay.role)
+        .unwrap_or_else(|| effective_role(tree, node, target, over, patch));
     let lifted_window = if matches!(
         role,
         A11yRole::Table | A11yRole::Grid | A11yRole::Tree | A11yRole::ListBox | A11yRole::Menu
@@ -106,8 +270,13 @@ pub(crate) fn node_a11y_records_with_cache(
     } else {
         None
     };
-    let parent = logical_a11y_parent(tree, node);
+    let parent = a11y_parent_for(tree, node, patch, context, diagnostics);
     let mut label = effective_label(tree, node, target, role, over, patch);
+    if label.is_none() {
+        label = overlay
+            .and_then(|overlay| overlay.label.clone())
+            .map(|text| A11yLabel::new(text, A11yLabelSource::Override));
+    }
     if node == tree.root() && label.is_none() && !title.is_empty() {
         label = Some(A11yLabel::new(
             smol_str::SmolStr::new(title),
@@ -118,11 +287,20 @@ pub(crate) fn node_a11y_records_with_cache(
     let description = effective_description(over, patch);
     let checked = patch.and_then(|patch| patch.checked);
     let hidden = is_hidden(target, role, label.as_ref(), over, patch)
+        || overlay.is_some_and(|overlay| overlay.hidden)
         || hidden_by_skipped_ancestors(tree, node, parent)
-        || hidden_outside_modal_scope(tree, node);
+        || hidden_outside_modal_scope(tree, node, context.popup)
+        || hidden_menu_separator(tree, node, role, context);
     let disabled = a11y_disabled(tree, node);
     let read_only = a11y_read_only(tree, node);
-    let actions = effective_actions(tree, node, role, over, patch, disabled, read_only);
+    let mut actions = effective_actions(tree, node, role, over, patch, disabled, read_only);
+    if let Some(overlay) = overlay {
+        for action in &overlay.actions {
+            if !actions.contains(action) {
+                actions.push(*action);
+            }
+        }
+    }
 
     let decorative_image = is_decorative_image(target, over);
     if role == A11yRole::Image
@@ -162,12 +340,23 @@ pub(crate) fn node_a11y_records_with_cache(
         diagnostics.push(A11yDiagnostic::MissingLabel { node });
     }
 
-    let custom_actions = match patch.and_then(|patch| patch.custom_actions.clone()) {
+    let mut custom_actions = match patch.and_then(|patch| patch.custom_actions.clone()) {
         Some(actions) => actions,
         None => over
             .map(|over| over.custom_actions.clone())
             .unwrap_or_default(),
     };
+    custom_actions.retain(|custom| {
+        if custom.id == crate::a11y::DISMISS_CUSTOM_ACTION_ID {
+            diagnostics.push(A11yDiagnostic::ReservedCustomAction {
+                node,
+                id: custom.id,
+            });
+            false
+        } else {
+            true
+        }
+    });
     for action in &actions {
         if let crate::a11y::A11yAction::Custom(id) = action
             && !custom_actions.iter().any(|custom| custom.id == *id)
@@ -218,13 +407,36 @@ pub(crate) fn node_a11y_records_with_cache(
         .or_else(|| lifted_window.and_then(|window| scroll_state(tree, window)));
     let clips_children = clips_children_of(tree, node) || lifted_window.is_some();
 
-    let modal =
-        patch
-            .and_then(|patch| patch.modal)
-            .unwrap_or_else(|| match tree.overlay_slot(node) {
-                Some(slot) => slot.trap_focus,
-                None => over.is_some_and(|over| over.modal),
-            });
+    let modal = patch
+        .and_then(|patch| patch.modal)
+        .or_else(|| over.map(|over| over.modal))
+        .unwrap_or(false)
+        || overlay.is_some_and(|overlay| overlay.modal);
+    let expanded = overlay
+        .and_then(|overlay| overlay.expanded)
+        .or_else(|| patch.and_then(|patch| patch.expanded));
+    let has_popup = overlay
+        .and_then(|overlay| overlay.has_popup)
+        .or_else(|| patch.and_then(|patch| patch.has_popup));
+    let declared_owns = patch
+        .and_then(|patch| patch.owns.clone())
+        .unwrap_or_else(|| {
+            overlay
+                .map(|overlay| overlay.owns.clone())
+                .unwrap_or_default()
+        });
+    let declared_controls = match overlay.map(|overlay| overlay.controls.clone()) {
+        Some(controls) if !controls.is_empty() => controls,
+        _ => patch
+            .and_then(|patch| patch.controls.clone())
+            .unwrap_or_default(),
+    };
+    let declared_described_by = patch
+        .and_then(|patch| patch.described_by)
+        .or_else(|| overlay.and_then(|overlay| overlay.described_by));
+    let declared_active = patch
+        .and_then(|patch| patch.active_descendant)
+        .or_else(|| context.popup.active_descendant(tree, context.focus, node));
     let busy = patch
         .and_then(|patch| patch.busy)
         .or_else(|| over.map(|over| over.busy))
@@ -262,7 +474,7 @@ pub(crate) fn node_a11y_records_with_cache(
         identity_key(tree, node, over, patch),
         diagnostics,
     );
-    let mut children: Vec<A11yNodeId> = a11y_children(tree, node, role, tables)
+    let mut children: Vec<A11yNodeId> = a11y_children(tree, node, role, tables, context)
         .into_iter()
         .map(|child| {
             let key = identity_key(
@@ -274,6 +486,48 @@ pub(crate) fn node_a11y_records_with_cache(
             ids.id_for(tree, child, key, diagnostics)
         })
         .collect();
+    let owns = related_ids(
+        tree,
+        node,
+        &declared_owns,
+        RelatedFilter::Owned,
+        context,
+        ids,
+        diagnostics,
+    );
+    let controls = related_ids(
+        tree,
+        node,
+        &declared_controls,
+        RelatedFilter::Owned,
+        context,
+        ids,
+        diagnostics,
+    );
+    let described_by = declared_described_by.map_or_else(SmallVec::new, |target| {
+        related_ids(
+            tree,
+            node,
+            std::slice::from_ref(&target),
+            RelatedFilter::Referenced,
+            context,
+            ids,
+            diagnostics,
+        )
+    });
+    let active_descendant = declared_active.and_then(|target| {
+        related_ids(
+            tree,
+            node,
+            std::slice::from_ref(&target),
+            RelatedFilter::Referenced,
+            context,
+            ids,
+            diagnostics,
+        )
+        .first()
+        .copied()
+    });
     let text_run = editable.then(|| {
         let run_id = ids.id_for_text_run(node);
         let run = text_run_record(
@@ -320,7 +574,12 @@ pub(crate) fn node_a11y_records_with_cache(
         disabled,
         checked,
         selected: patch.and_then(|patch| patch.selected),
-        expanded: patch.and_then(|patch| patch.expanded),
+        expanded,
+        has_popup,
+        controls,
+        owns,
+        described_by,
+        active_descendant,
         live: patch
             .and_then(|patch| patch.live)
             .or_else(|| over.and_then(|over| over.live)),
@@ -417,6 +676,11 @@ fn text_run_record(
         checked: None,
         selected: None,
         expanded: None,
+        has_popup: None,
+        controls: SmallVec::new(),
+        owns: SmallVec::new(),
+        described_by: SmallVec::new(),
+        active_descendant: None,
         row_index: None,
         column_index: None,
         row_count: None,
@@ -831,8 +1095,93 @@ pub(crate) fn write_a11y_patch(
     true
 }
 
+fn a11y_parent_for(
+    tree: &NodeTree,
+    node: NodeId,
+    patch: Option<&A11yPatch>,
+    context: &A11yBuildContext<'_>,
+    diagnostics: &mut Vec<A11yDiagnostic>,
+) -> Option<NodeId> {
+    if let Some(requested) = patch.and_then(|patch| patch.a11y_parent) {
+        let resolved = resolve_parent(tree, node, requested);
+        if resolved != Some(requested) {
+            diagnostics.push(A11yDiagnostic::InvalidA11yParent {
+                node,
+                parent: requested,
+            });
+        }
+    }
+    let parent = raw_a11y_parent(tree, node, patch, context)?;
+    if raw_parent_cycle(tree, parent, node, context).is_some() {
+        diagnostics.push(A11yDiagnostic::InvalidA11yParent { node, parent });
+        return logical_a11y_parent(tree, node);
+    }
+    Some(parent)
+}
+
+fn effective_a11y_parent(
+    tree: &NodeTree,
+    node: NodeId,
+    patch: Option<&A11yPatch>,
+    context: &A11yBuildContext<'_>,
+) -> Option<NodeId> {
+    let parent = raw_a11y_parent(tree, node, patch, context)?;
+    if raw_parent_cycle(tree, parent, node, context).is_some() {
+        return logical_a11y_parent(tree, node);
+    }
+    Some(parent)
+}
+
+fn raw_a11y_parent(
+    tree: &NodeTree,
+    node: NodeId,
+    patch: Option<&A11yPatch>,
+    context: &A11yBuildContext<'_>,
+) -> Option<NodeId> {
+    patch
+        .and_then(|patch| patch.a11y_parent)
+        .and_then(|parent| resolve_parent(tree, node, parent))
+        .or_else(|| {
+            context
+                .popup
+                .logical_parent(node)
+                .and_then(|parent| resolve_parent(tree, node, parent))
+        })
+        .or_else(|| logical_a11y_parent(tree, node))
+}
+
+fn raw_parent_cycle(
+    tree: &NodeTree,
+    parent: NodeId,
+    node: NodeId,
+    context: &A11yBuildContext<'_>,
+) -> Option<NodeId> {
+    let mut visited: SmallVec<[NodeId; 16]> = SmallVec::new();
+    let mut cursor = Some(parent);
+    let mut steps = 0usize;
+    while let Some(current) = cursor {
+        if current == node {
+            return Some(parent);
+        }
+        if visited.contains(&current) {
+            return Some(parent);
+        }
+        if steps > tree.len() {
+            return Some(parent);
+        }
+        visited.push(current);
+        steps += 1;
+        cursor = raw_a11y_parent(tree, current, patch_child(tree, current), context);
+    }
+    None
+}
+
 pub(crate) fn logical_a11y_parent(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
-    let physical = tree.get(node).ok().and_then(Node::parent);
+    let physical = tree
+        .get(node)
+        .ok()
+        .and_then(Node::parent)
+        .and_then(|parent| lifted_skip_container(tree, parent));
     let adopted = match declared_role(tree, node) {
         Some(A11yRole::Row) => nearest_ancestor_where(tree, node, |role| {
             matches!(role, A11yRole::Table | A11yRole::Grid)
@@ -846,6 +1195,59 @@ pub(crate) fn logical_a11y_parent(tree: &NodeTree, node: NodeId) -> Option<NodeI
         _ => None,
     };
     adopted.or(physical)
+}
+
+#[derive(Clone, Copy)]
+enum RelatedFilter {
+    Owned,
+    Referenced,
+}
+
+fn related_ids(
+    tree: &NodeTree,
+    node: NodeId,
+    targets: &[NodeId],
+    filter: RelatedFilter,
+    context: &A11yBuildContext<'_>,
+    ids: &mut A11yIds,
+    diagnostics: &mut Vec<A11yDiagnostic>,
+) -> SmallVec<[A11yNodeId; 2]> {
+    let mut out: SmallVec<[A11yNodeId; 2]> = SmallVec::new();
+    for target in targets {
+        if *target == node || tree.get(*target).is_err() {
+            continue;
+        }
+        if matches!(filter, RelatedFilter::Owned) {
+            let nested = is_physical_descendant(tree, node, *target)
+                || effective_a11y_parent(tree, *target, patch_child(tree, *target), context)
+                    == Some(node);
+            if nested {
+                continue;
+            }
+        }
+        let key = identity_key(
+            tree,
+            *target,
+            over_child(tree, *target),
+            patch_child(tree, *target),
+        );
+        let id = ids.id_for(tree, *target, key, diagnostics);
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+fn lifted_skip_container(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if tree.hit_focus_skip(current) != crate::node::tree::HitFocusSkip::Container {
+            return Some(current);
+        }
+        cursor = tree.get(current).ok().and_then(Node::parent);
+    }
+    None
 }
 
 fn tree_collection_root(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
@@ -867,8 +1269,9 @@ fn a11y_children(
     node: NodeId,
     role: A11yRole,
     tables: &mut CollectionSemanticsCache,
+    context: &A11yBuildContext<'_>,
 ) -> Vec<NodeId> {
-    match role {
+    let mut children = match role {
         A11yRole::Table | A11yRole::Grid => tables.table(tree, node).children.clone(),
         A11yRole::Row => {
             let Some(table) = nearest_ancestor_where(tree, node, |role| {
@@ -899,24 +1302,57 @@ fn a11y_children(
                 .children
                 .get(&node)
                 .cloned()
-                .unwrap_or_else(|| logical_physical_children(tree, node))
+                .unwrap_or_else(|| logical_physical_children(tree, node, context))
         }
-        _ => logical_physical_children(tree, node),
+        _ => logical_physical_children(tree, node, context),
+    };
+    for adopted in context.popup.adopted_children(node) {
+        if !children.contains(adopted)
+            && effective_a11y_parent(tree, *adopted, patch_child(tree, *adopted), context)
+                == Some(node)
+        {
+            children.push(*adopted);
+        }
     }
+    if let Some(adopted) = context.patch_parents.get(&node) {
+        for child in adopted {
+            if !children.contains(child)
+                && effective_a11y_parent(tree, *child, patch_child(tree, *child), context)
+                    == Some(node)
+            {
+                children.push(*child);
+            }
+        }
+    }
+    children
 }
 
-fn logical_physical_children(tree: &NodeTree, node: NodeId) -> Vec<NodeId> {
-    children_of(tree, node)
-        .iter()
-        .copied()
-        .filter(|child| logical_a11y_parent(tree, *child) == Some(node))
-        .collect()
+fn logical_physical_children(
+    tree: &NodeTree,
+    node: NodeId,
+    context: &A11yBuildContext<'_>,
+) -> Vec<NodeId> {
+    let mut children = Vec::with_capacity(children_of(tree, node).len());
+    let mut stack: Vec<NodeId> = children_of(tree, node).iter().rev().copied().collect();
+    while let Some(child) = stack.pop() {
+        if tree.hit_focus_skip(child) == crate::node::tree::HitFocusSkip::Container {
+            stack.extend(children_of(tree, child).iter().rev().copied());
+            continue;
+        }
+        if effective_a11y_parent(tree, child, patch_child(tree, child), context) == Some(node) {
+            children.push(child);
+        }
+    }
+    children
 }
 
 fn hidden_by_skipped_ancestors(tree: &NodeTree, node: NodeId, a11y_parent: Option<NodeId>) -> bool {
     let mut cursor = tree.get(node).ok().and_then(Node::parent);
     while let Some(current) = cursor {
         if Some(current) == a11y_parent {
+            return false;
+        }
+        if tree.hit_focus_skip(current) == crate::node::tree::HitFocusSkip::Container {
             return false;
         }
         let Ok(target) = tree.get(current) else {
@@ -943,14 +1379,36 @@ fn children_of(tree: &NodeTree, node: NodeId) -> &[NodeId] {
     tree.get(node).map_or(&[], |target| target.children())
 }
 
-fn hidden_outside_modal_scope(tree: &NodeTree, node: NodeId) -> bool {
+fn hidden_outside_modal_scope(tree: &NodeTree, node: NodeId, context: &A11yPopupContext) -> bool {
     if node == tree.root() {
         return false;
     }
-    let Some(scope) = crate::interaction::overlay::focus_scope_root(tree, tree.root()) else {
+    context.has_modal_scope() && !context.in_modal_scope(tree, node)
+}
+
+fn hidden_menu_separator(
+    tree: &NodeTree,
+    node: NodeId,
+    role: A11yRole,
+    context: &A11yBuildContext<'_>,
+) -> bool {
+    if role != A11yRole::Separator {
         return false;
-    };
-    !crate::interaction::overlay::in_modal_scope(tree, node, Some(scope))
+    }
+    let mut cursor = tree.get(node).ok().and_then(Node::parent);
+    while let Some(current) = cursor {
+        let overlay_role = context.overlay(current).and_then(|overlay| overlay.role);
+        if overlay_role.is_some_and(|role| matches!(role, A11yRole::Menu | A11yRole::MenuBar))
+            || matches!(
+                declared_role(tree, current),
+                Some(A11yRole::Menu | A11yRole::MenuBar)
+            )
+        {
+            return true;
+        }
+        cursor = tree.get(current).ok().and_then(Node::parent);
+    }
+    false
 }
 
 pub(crate) fn mark_modal_scope_changed(tree: &mut NodeTree) {
@@ -1103,12 +1561,30 @@ pub(crate) fn collect_subtree(tree: &NodeTree, root: NodeId, out: &mut SmallVec<
     }
 }
 
-pub(crate) fn push_ancestors(tree: &NodeTree, from: NodeId, out: &mut SmallVec<[NodeId; 16]>) {
-    let mut cursor = tree.get(from).ok().and_then(|target| target.parent());
+pub(crate) fn push_logical_ancestors(
+    tree: &NodeTree,
+    from: NodeId,
+    context: &A11yBuildContext<'_>,
+    out: &mut SmallVec<[NodeId; 16]>,
+) {
+    let mut cursor = context.parent_of(tree, from);
+    let mut steps = 0usize;
     while let Some(current) = cursor {
         out.push(current);
-        cursor = tree.get(current).ok().and_then(|target| target.parent());
+        steps += 1;
+        if steps > tree.len() {
+            break;
+        }
+        cursor = context.parent_of(tree, current);
     }
+}
+
+pub(crate) fn logical_depth_of(
+    tree: &NodeTree,
+    node: NodeId,
+    context: &A11yBuildContext<'_>,
+) -> usize {
+    context.depth_of(tree, node)
 }
 
 pub(crate) fn resolve_focus(tree: &NodeTree, focus: Option<NodeId>) -> (NodeId, Option<NodeId>) {
@@ -1123,7 +1599,7 @@ pub(crate) fn resolve_focus(tree: &NodeTree, focus: Option<NodeId>) -> (NodeId, 
 mod tests {
     use smallvec::SmallVec;
 
-    use super::{collect_subtree, push_ancestors, resolve_focus};
+    use super::{collect_subtree, resolve_focus};
     use crate::{
         a11y::{A11yAction, A11yOverride, A11yRole, A11ySort, identity::A11yIds},
         math::{DevicePixelRatio, px},
@@ -1245,15 +1721,6 @@ mod tests {
         let mut out = SmallVec::new();
         collect_subtree(&tree, root, &mut out);
         assert_eq!(out.as_slice(), &[root, parent, child, sibling]);
-    }
-
-    #[test]
-    fn push_ancestors_walks_to_root() {
-        let mut tree = NodeTree::new();
-        let (root, parent, child) = chain(&mut tree);
-        let mut out = SmallVec::new();
-        push_ancestors(&tree, child, &mut out);
-        assert_eq!(out.as_slice(), &[parent, root]);
     }
 
     #[test]
@@ -1863,24 +2330,6 @@ mod tests {
             &mut diagnostics,
         )
         .expect("snapshot")
-    }
-
-    fn declare_overlay(
-        tree: &mut NodeTree,
-        node: NodeId,
-        trap_focus: bool,
-        opener: Option<NodeId>,
-    ) {
-        tree.ensure_interaction(node).expect("interaction").overlay =
-            Some(crate::interaction::OverlaySlot {
-                dismiss: crate::interaction::OverlayDismiss::Explicit,
-                placement: crate::interaction::OverlayPlacement::Point(
-                    crate::math::LogicalPoint::ZERO,
-                ),
-                trap_focus,
-                opener,
-                restore_focus: false,
-            });
     }
 
     fn assert_single_parent_per_node(
@@ -2551,190 +3000,6 @@ mod tests {
             super::nearest_collection_ancestor(&tree, item),
             Some(tree_root),
             "Tree 同样是集合根"
-        );
-    }
-
-    #[test]
-    fn an_overlay_wrapper_is_a_container_unless_it_declares_a_role() {
-        let mut tree = NodeTree::new();
-        let root = tree.root();
-        let plain = NodeBuilder::boxed()
-            .build(&mut tree, root)
-            .expect("overlay");
-        declare_overlay(&mut tree, plain, false, None);
-        let menu = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(A11yRole::Menu),
-                label: Some(smol_str::SmolStr::new_static("交易菜单")),
-                ..A11yOverride::default()
-            })
-            .build(&mut tree, root)
-            .expect("menu");
-        declare_overlay(&mut tree, menu, false, None);
-        let dialog = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(A11yRole::Dialog),
-                label: Some(smol_str::SmolStr::new_static("确认下单")),
-                ..A11yOverride::default()
-            })
-            .build(&mut tree, root)
-            .expect("dialog");
-        declare_overlay(&mut tree, dialog, false, None);
-        let alert = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(A11yRole::AlertDialog),
-                label: Some(smol_str::SmolStr::new_static("风险提示")),
-                ..A11yOverride::default()
-            })
-            .build(&mut tree, root)
-            .expect("alert");
-        declare_overlay(&mut tree, alert, false, None);
-
-        let mut ids = A11yIds::new();
-        let mut tables = super::CollectionSemanticsCache::default();
-        let plain_record = snapshot_with(&tree, plain, &mut ids, &mut tables);
-        assert_eq!(
-            plain_record.role,
-            A11yRole::GenericContainer,
-            "没有显式声明的浮层包装必须按容器处理（不得猜成 Dialog）"
-        );
-        assert!(
-            plain_record.actions.is_empty(),
-            "浮层包装不得自动宣告 Expand/Collapse：{:?}",
-            plain_record.actions
-        );
-        assert!(!plain_record.modal, "非模态浮层的包装不是 modal");
-
-        let menu_record = snapshot_with(&tree, menu, &mut ids, &mut tables);
-        assert_eq!(menu_record.role, A11yRole::Menu, "显式 Menu 角色必须生效");
-        assert_eq!(menu_record.label_text(), Some("交易菜单"));
-        assert!(menu_record.actions.is_empty(), "Menu 默认不宣告动作");
-        assert_eq!(
-            crate::a11y::adapter::to_accesskit(&menu_record).role(),
-            accesskit::Role::Menu
-        );
-
-        let dialog_record = snapshot_with(&tree, dialog, &mut ids, &mut tables);
-        assert_eq!(dialog_record.role, A11yRole::Dialog);
-        assert!(
-            !dialog_record
-                .actions
-                .contains(&crate::a11y::A11yAction::Expand),
-            "显式 Dialog 也不得默认宣告 Expand（aria-expanded 属于触发器）"
-        );
-        let alert_record = snapshot_with(&tree, alert, &mut ids, &mut tables);
-        assert_eq!(alert_record.role, A11yRole::AlertDialog);
-        assert_eq!(
-            crate::a11y::adapter::to_accesskit(&alert_record).role(),
-            accesskit::Role::AlertDialog
-        );
-    }
-
-    #[test]
-    fn a_modal_overlay_hides_the_background_from_a11y() {
-        let mut tree = NodeTree::new();
-        let root = tree.root();
-        let background = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(A11yRole::Button),
-                label: Some(smol_str::SmolStr::new_static("下单")),
-                ..A11yOverride::default()
-            })
-            .build(&mut tree, root)
-            .expect("background");
-        let stray_overlay = NodeBuilder::boxed().build(&mut tree, root).expect("popup");
-        declare_overlay(&mut tree, stray_overlay, false, None);
-        let stray_item = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(A11yRole::MenuItem),
-                label: Some(smol_str::SmolStr::new_static("复制")),
-                ..A11yOverride::default()
-            })
-            .build(&mut tree, stray_overlay)
-            .expect("popup item");
-        let modal = NodeBuilder::boxed().build(&mut tree, root).expect("modal");
-        declare_overlay(&mut tree, modal, true, None);
-        let confirm = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(A11yRole::Button),
-                label: Some(smol_str::SmolStr::new_static("确认")),
-                ..A11yOverride::default()
-            })
-            .build(&mut tree, modal)
-            .expect("confirm");
-
-        let mut ids = A11yIds::new();
-        let mut tables = super::CollectionSemanticsCache::default();
-        let root_record = snapshot_with(&tree, root, &mut ids, &mut tables);
-        assert!(!root_record.hidden, "根是模态的祖先，必须保持可见");
-        let background_record = snapshot_with(&tree, background, &mut ids, &mut tables);
-        assert!(
-            background_record.hidden,
-            "模态作用域外的背景节点必须 aria-hidden"
-        );
-        assert!(
-            crate::a11y::adapter::to_accesskit(&background_record).is_hidden(),
-            "hidden 必须真的落进 accesskit::Node"
-        );
-        let stray_record = snapshot_with(&tree, stray_overlay, &mut ids, &mut tables);
-        assert!(stray_record.hidden, "不属于该模态的浮层也必须隐藏");
-        assert!(snapshot_with(&tree, stray_item, &mut ids, &mut tables).hidden);
-
-        let modal_record = snapshot_with(&tree, modal, &mut ids, &mut tables);
-        assert!(!modal_record.hidden, "模态包装本身必须可见");
-        assert_eq!(
-            modal_record.role,
-            A11yRole::GenericContainer,
-            "未声明的包装仍是容器（模态由 trap_focus 表达，不靠 Dialog 角色）"
-        );
-        assert!(modal_record.modal, "a11y modal 跟 trap_focus 走");
-        let modal_ak = crate::a11y::adapter::to_accesskit(&modal_record);
-        assert!(modal_ak.is_modal(), "accesskit::Node 必须带 modal 状态");
-        assert!(!snapshot_with(&tree, confirm, &mut ids, &mut tables).hidden);
-
-        tree.ensure_interaction(modal).expect("interaction").overlay = None;
-        let mut fresh_ids = A11yIds::new();
-        let mut fresh_tables = super::CollectionSemanticsCache::default();
-        assert!(
-            !snapshot_with(&tree, background, &mut fresh_ids, &mut fresh_tables).hidden,
-            "没有模态时背景不得隐藏"
-        );
-    }
-
-    #[test]
-    fn a_popup_opened_inside_the_modal_stays_visible_to_a11y() {
-        let mut tree = NodeTree::new();
-        let root = tree.root();
-        let modal = NodeBuilder::boxed().build(&mut tree, root).expect("modal");
-        declare_overlay(&mut tree, modal, true, None);
-        let trigger = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(A11yRole::Button),
-                label: Some(smol_str::SmolStr::new_static("选择数量")),
-                ..A11yOverride::default()
-            })
-            .build(&mut tree, modal)
-            .expect("trigger");
-        let menu = NodeBuilder::boxed().build(&mut tree, root).expect("menu");
-        declare_overlay(&mut tree, menu, false, Some(trigger));
-        let item = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(A11yRole::MenuItem),
-                label: Some(smol_str::SmolStr::new_static("全部")),
-                ..A11yOverride::default()
-            })
-            .build(&mut tree, menu)
-            .expect("item");
-
-        let mut ids = A11yIds::new();
-        let mut tables = super::CollectionSemanticsCache::default();
-        assert!(
-            !snapshot_with(&tree, menu, &mut ids, &mut tables).hidden,
-            "opener 在模态内的弹出层属于作用域，不得隐藏"
-        );
-        assert!(
-            !snapshot_with(&tree, item, &mut ids, &mut tables).hidden,
-            "弹出层内容对 AT 必须可见（对话框里的下拉菜单）"
         );
     }
 

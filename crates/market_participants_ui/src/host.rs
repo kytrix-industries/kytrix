@@ -5,10 +5,7 @@ use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_connector::connector::{MarketParticipantsConnector, VenueLoadError};
 use market_participants_model::identifier::VenueId;
 use ui_core::app::App;
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
+use ui_kit::theme::handle::ThemeHandle;
 use widget::services::WidgetServices;
 
 pub trait VenueDirectory: Send + Sync + 'static {
@@ -143,15 +140,5 @@ impl MarketParticipantsHost {
     #[must_use]
     pub fn language(&self, app: &App) -> LanguageCode {
         *app.read(&self.services.language)
-    }
-
-    #[must_use]
-    pub fn layer(&self) -> &Layer {
-        &self.services.layer
-    }
-
-    #[must_use]
-    pub fn animation(&self) -> AnimationRouter {
-        (*self.services.animation_router).clone()
     }
 }

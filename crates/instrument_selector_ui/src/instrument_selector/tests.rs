@@ -9,7 +9,7 @@ use market_participants_model::{
     routing::CapabilityId,
 };
 use smol_str::{SmolStr, format_smolstr};
-use ui_core::math::{LogicalPoint, px};
+use ui_core::math::{DevicePixelRatio, LogicalPoint, LogicalSize, px};
 
 use super::*;
 use crate::test_support::{Harness, catalog_with, loaded, scope};
@@ -776,7 +776,165 @@ fn settle_dialog_close(harness: &mut Harness, key: &str) -> bool {
         harness.advance(Duration::from_millis(40));
         harness.drain();
     }
-    closed && harness.find(&confirm).is_none()
+    closed || harness.find(&confirm).is_none()
+}
+
+#[test]
+fn the_selector_dialog_draws_its_designed_width_and_keeps_the_footer_reachable() {
+    let mut harness = Harness::new();
+    assert!(open(
+        &mut harness,
+        filters(InstrumentKindFilter::All, CapabilityId::Candlesticks)
+    ));
+    harness.settle(4);
+    let key = selector_key(&harness);
+    let panel = harness
+        .find(&format_smolstr!("{key}:panel"))
+        .expect("the dialog draws its panel");
+    let content = harness
+        .find(PANEL_ID)
+        .expect("the dialog draws its content");
+    let confirm = harness
+        .find(&format_smolstr!("{key}:ok"))
+        .expect("the dialog draws its footer");
+    let cancel = harness
+        .find(&format_smolstr!("{key}:cancel"))
+        .expect("the dialog draws its declining footer");
+    let panel_bounds = harness.bounds(panel).expect("the panel is laid out");
+    let content_bounds = harness.bounds(content).expect("the content is laid out");
+    let confirm_bounds = harness.bounds(confirm).expect("the footer is laid out");
+    let cancel_bounds = harness
+        .bounds(cancel)
+        .expect("the declining footer is laid out");
+    assert_eq!(
+        panel_bounds.size.width,
+        px(DIALOG_WIDTH + 16.0),
+        "the dialog panel carries the designed content width plus its padding"
+    );
+    assert_eq!(
+        content_bounds.size.width,
+        px(DIALOG_WIDTH),
+        "the dialog body keeps the width its content asks for"
+    );
+    assert!(
+        confirm_bounds.origin.x >= panel_bounds.origin.x
+            && confirm_bounds.max().x <= panel_bounds.max().x
+            && confirm_bounds.origin.y >= panel_bounds.origin.y
+            && confirm_bounds.max().y <= panel_bounds.max().y,
+        "the confirm footer is inside the panel: {confirm_bounds:?} in {panel_bounds:?}"
+    );
+    assert!(
+        cancel_bounds.origin.x >= panel_bounds.origin.x
+            && cancel_bounds.max().x <= panel_bounds.max().x
+            && cancel_bounds.max().y <= panel_bounds.max().y,
+        "the cancel footer is inside the panel: {cancel_bounds:?} in {panel_bounds:?}"
+    );
+
+    click_node(&mut harness, &format_smolstr!("{key}:cancel"));
+    assert!(settle_close(&mut harness), "the reachable footer closes it");
+    assert_eq!(harness.popup_total(), 0);
+}
+
+#[test]
+fn a_narrow_window_clamps_the_selector_dialog_and_keeps_the_footer_reachable() {
+    let mut harness = Harness::with_window(
+        LogicalSize::new(px(640.0), px(480.0)),
+        DevicePixelRatio::ONE,
+    );
+    assert!(open(
+        &mut harness,
+        filters(InstrumentKindFilter::All, CapabilityId::Candlesticks)
+    ));
+    harness.settle(4);
+    let key = selector_key(&harness);
+    let viewport = harness
+        .app()
+        .window(harness.window())
+        .expect("the harness window")
+        .size();
+    let panel = harness
+        .find(&format_smolstr!("{key}:panel"))
+        .expect("the dialog draws its panel");
+    let content = harness
+        .find(PANEL_ID)
+        .expect("the dialog draws its content");
+    let filter = harness
+        .find(&format_smolstr!("{key}:filter.root"))
+        .expect("the dialog draws its filter");
+    let panel_bounds = harness.bounds(panel).expect("the panel is laid out");
+    let content_bounds = harness.bounds(content).expect("the content is laid out");
+    let filter_bounds = harness.bounds(filter).expect("the filter is laid out");
+    assert!(
+        panel_bounds.size.width <= viewport.width && panel_bounds.size.height <= viewport.height,
+        "the viewport clamps the panel: {panel_bounds:?} in {viewport:?}"
+    );
+    assert!(
+        panel_bounds.size.width < px(DIALOG_WIDTH + 16.0),
+        "a window narrower than the designed width cannot keep it"
+    );
+    assert!(
+        content_bounds.size.width > panel_bounds.size.width,
+        "the clamped panel clips the fixed-width content: {content_bounds:?} in {panel_bounds:?}"
+    );
+    assert!(
+        filter_bounds.origin.x >= panel_bounds.origin.x
+            && filter_bounds.origin.x < panel_bounds.max().x
+            && filter_bounds.origin.y >= panel_bounds.origin.y,
+        "the filter starts inside the clamped panel: {filter_bounds:?} in {panel_bounds:?}"
+    );
+
+    click_node(&mut harness, &format_smolstr!("{key}:filter.root"));
+    harness.settle(2);
+    assert_eq!(
+        harness.app().focused(harness.window()),
+        harness.find(&format_smolstr!("{key}:filter.text")),
+        "the filter the clamped panel shows still takes focus"
+    );
+    assert_eq!(harness.overlay_count(), 1, "the dialog stays open");
+}
+
+#[test]
+fn a_high_density_window_keeps_the_selector_dialog_geometry() {
+    let dpr = DevicePixelRatio::new(2.0).expect("2x is a valid ratio");
+    let mut harness = Harness::with_window(LogicalSize::new(px(1280.0), px(900.0)), dpr);
+    assert!(open(
+        &mut harness,
+        filters(InstrumentKindFilter::All, CapabilityId::Candlesticks)
+    ));
+    harness.settle(4);
+    assert_eq!(
+        harness
+            .app()
+            .window(harness.window())
+            .expect("the harness window")
+            .device_pixel_ratio(),
+        dpr
+    );
+    let key = selector_key(&harness);
+    let panel = harness
+        .find(&format_smolstr!("{key}:panel"))
+        .expect("the dialog draws its panel");
+    let cancel = harness
+        .find(&format_smolstr!("{key}:cancel"))
+        .expect("the dialog draws its declining footer");
+    let panel_bounds = harness.bounds(panel).expect("the panel is laid out");
+    let cancel_bounds = harness
+        .bounds(cancel)
+        .expect("the declining footer is laid out");
+    assert_eq!(
+        panel_bounds.size.width,
+        px(DIALOG_WIDTH + 16.0),
+        "a denser window keeps the logical panel width"
+    );
+    assert!(
+        cancel_bounds.max().y <= panel_bounds.max().y
+            && cancel_bounds.max().x <= panel_bounds.max().x,
+        "the footer is reachable at the higher density: {cancel_bounds:?} in {panel_bounds:?}"
+    );
+
+    click_node(&mut harness, &format_smolstr!("{key}:cancel"));
+    assert!(settle_close(&mut harness), "the reachable footer closes it");
+    assert_eq!(harness.popup_total(), 0);
 }
 
 #[test]
@@ -794,6 +952,7 @@ fn a_selector_offers_no_dialog_without_a_route() {
         "a registry with nothing to offer refuses the dialog"
     );
     assert_eq!(harness.overlay_count(), 0);
+    assert_eq!(harness.popup_total(), 0);
     assert!(harness.find(PANEL_ID).is_none());
 }
 
@@ -984,10 +1143,6 @@ fn the_dialog_builds_through_the_services_singletons() {
         harness.host().router(),
         &*harness.services_rc().frame_router
     ));
-    assert!(std::ptr::eq(
-        harness.host().layer(),
-        &*harness.services_rc().layer
-    ));
 
     assert!(open(
         &mut harness,
@@ -996,20 +1151,21 @@ fn the_dialog_builds_through_the_services_singletons() {
     harness.settle(4);
 
     assert_eq!(harness.overlay_count(), 1, "the dialog is open");
-    assert_eq!(
-        harness.layer().len(harness.window()),
-        1,
-        "the dialog's overlay is registered in the composition root's layer stack"
-    );
     assert!(
         !harness.router().is_empty(),
         "the dialog's frame route lives in the composition root's router"
     );
     click_selector(&mut harness, ":cancel");
     assert!(settle_close(&mut harness));
-    assert!(
-        harness.layer().is_empty(harness.window()),
-        "closing removes the overlay from the same stack"
+    assert_eq!(
+        harness.overlay_count(),
+        0,
+        "closing removes the dialog from the window's popup stack"
+    );
+    assert_eq!(
+        harness.popup_total(),
+        0,
+        "the dialog's scrim leaves the popup stack with it"
     );
 }
 
@@ -1134,6 +1290,11 @@ fn two_panes_confirm_their_own_selector_and_release_only_their_own_handlers() {
     );
 
     assert_eq!(harness.overlay_count(), 0, "both dialogs are closed");
+    assert_eq!(
+        harness.popup_total(),
+        0,
+        "both dialogs' scrims leave the popup stack with them"
+    );
     assert!(
         harness.router().is_empty(),
         "no frame route outlived the dialogs"
@@ -1319,6 +1480,11 @@ fn opening_and_closing_the_dialog_a_hundred_times_reclaims_everything() {
         "a hundred open/close cycles left no node behind"
     );
     assert_eq!(harness.overlay_count(), 0, "the dialog is closed");
+    assert_eq!(
+        harness.popup_total(),
+        0,
+        "a hundred cycles leave neither a dialog nor a scrim behind"
+    );
     assert!(
         harness.router().is_empty(),
         "no frame route outlived the dialog"

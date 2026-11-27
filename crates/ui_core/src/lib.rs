@@ -7,6 +7,7 @@ pub mod layout;
 pub mod math;
 pub mod node;
 pub mod paint;
+pub mod popup;
 pub mod resources;
 pub mod text;
 pub mod text_edit;

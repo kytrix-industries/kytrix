@@ -2,16 +2,18 @@ use super::Window;
 use crate::node::id::NodeId;
 
 fn effective_focus(window: &Window) -> Option<NodeId> {
-    let focus = window.focus.focused()?;
-    if window.tree.get(focus).is_err() {
-        return None;
-    }
-    let scope = crate::interaction::overlay::focus_scope_root(&window.tree, window.tree.root());
-    crate::interaction::overlay::in_modal_scope(&window.tree, focus, scope).then_some(focus)
+    let focus = window.effective_focus()?;
+    window.tree.get(focus).is_ok().then_some(focus)
 }
 
 pub(crate) fn a11y_pending(window: &Window) -> bool {
-    window.a11y.pending(&window.tree, effective_focus(window))
+    window.a11y.pending(&window.tree, effective_focus(window)) || popup_a11y_pending(window)
+}
+
+fn popup_a11y_pending(window: &Window) -> bool {
+    let mut diagnostics = Vec::new();
+    let popup = crate::a11y::popup::project(&window.tree, window.popups(), &mut diagnostics);
+    window.a11y.popup_changed(&popup)
 }
 
 pub(crate) fn a11y_focus_pending(window: &Window) -> bool {
@@ -60,6 +62,7 @@ pub(crate) fn a11y_take(
     diagnostics: &mut Vec<crate::a11y::A11yDiagnostic>,
 ) -> Option<crate::a11y::A11yTreeSnapshot> {
     let focus = effective_focus(window);
+    let popup = crate::a11y::popup::project(&window.tree, window.popups(), diagnostics);
     let Window {
         tree,
         a11y,
@@ -76,6 +79,7 @@ pub(crate) fn a11y_take(
         options.title.as_str(),
         caret,
         diagnostics,
+        &popup,
     )
 }
 
@@ -110,6 +114,8 @@ pub(crate) fn a11y_only_frame(window: &Window) -> bool {
         && !window.full_damage_pending
         && window.pending_damage.is_none()
         && !window.atlas_rects_pending()
+        && !window.popups().dirty().any()
+        && !window.popups().animating()
 }
 
 #[cfg(feature = "test-support")]

@@ -14,6 +14,14 @@ pub(crate) fn focus_mut(window: &mut Window) -> &mut FocusScope {
     &mut window.focus
 }
 
+#[must_use]
+pub(crate) fn effective_focus(window: &Window) -> Option<NodeId> {
+    if let Some((_, node)) = window.popups.focus_owner() {
+        return node.filter(|node| window.tree.get(*node).is_ok());
+    }
+    window.focus.focused()
+}
+
 pub(crate) fn text_caret_rect(
     window: &Window,
     node: NodeId,
@@ -26,11 +34,17 @@ pub(crate) fn text_caret_rect(
         bounds.origin.x + content_offset.x,
         bounds.origin.y + content_offset.y,
     );
-    Ok(scroll::to_screen(
-        &window.tree,
-        node,
-        local.translate(origin),
-    ))
+    let mut screen = scroll::to_screen(&window.tree, node, local.translate(origin));
+    let mut popup_offset = LogicalPoint::ZERO;
+    let mut cursor = window.tree.get(node)?.parent();
+    while let Some(current) = cursor {
+        if let Some(transform) = window.tree.popup_transform(current) {
+            popup_offset += transform.offset;
+        }
+        cursor = window.tree.get(current)?.parent();
+    }
+    screen.origin += popup_offset;
+    Ok(screen)
 }
 
 pub(crate) fn text_byte_index_at(

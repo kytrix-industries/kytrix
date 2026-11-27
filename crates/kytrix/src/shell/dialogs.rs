@@ -90,7 +90,7 @@ impl Dialogs {
             .map(|_| ())
         });
         let builder = builder.confirm(confirm, move |app| confirmed(app));
-        self.open_builder(app, composition, builder, None);
+        self.open_builder(app, builder, None);
     }
 
     pub(crate) fn alert_with_cancel(
@@ -124,7 +124,7 @@ impl Dialogs {
         let builder = builder
             .confirm(confirm, move |app| confirmed(app))
             .cancel(cancel, |_| {});
-        self.open_builder(app, composition, builder, None);
+        self.open_builder(app, builder, None);
     }
 
     pub(crate) fn name_alert(
@@ -193,24 +193,12 @@ impl Dialogs {
                     dialog.close(app);
                 })
         });
-        self.open_builder(app, composition, builder, Some(scope));
+        self.open_builder(app, builder, Some(scope));
     }
 
-    fn open_builder(
-        &mut self,
-        app: &mut App,
-        composition: &Composition,
-        builder: DialogBuilder,
-        scope: Option<SignalScope>,
-    ) {
+    fn open_builder(&mut self, app: &mut App, builder: DialogBuilder, scope: Option<SignalScope>) {
         let key = self.next_key();
-        let dialog = builder.build(
-            app,
-            self.theme.clone(),
-            (*composition.layer).clone(),
-            (*composition.animation_router).clone(),
-            key,
-        );
+        let dialog = builder.build(app, self.theme.clone(), key);
         if let Err(error) = dialog.open(app, self.window) {
             log::error!("a dialog could not be opened: {error}");
             if let Some(scope) = scope {

@@ -25,6 +25,10 @@ use ui_core::{
         style::StylePatch,
         style_builder::{PaintBuilder, StyleBuilder},
     },
+    popup::{
+        Alignment, Anchor, DismissPolicy, EscapePolicy, FocusPolicy, HasPopup, OutsidePress,
+        PlacementSpec, PopupError, PopupTier, RestoreFocus, Side,
+    },
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -33,12 +37,11 @@ use crate::{
     kit::{
         icon::IconKind,
         interactive::{Interactive, mount_dynamic_icon},
-        layer::{Band, Layer},
         menu::{
-            IconSnapshot, ItemPanel, ItemPanelOptions, PanelContent, PanelMeasure, PanelRoles,
-            PanelRow, PanelWidth, build_icon_slot,
+            IconSnapshot, ItemPanel, ItemPanelOptions, PanelContent, PanelMeasure, PanelOpen,
+            PanelRoles, PanelRow, PanelWidth, build_icon_slot, popup_error,
         },
-        overlay::{Anchor, AnimationRouter, OverlayError, Placement},
+        popup_panel::{AnchorChange, AnchorWatch},
         size::{UnifiedSizable, UnifiedSize},
     },
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
@@ -47,6 +50,16 @@ use crate::{
 const TAG_RADIUS: LogicalPx = LogicalPx::new(4.0);
 const TAG_GAP: LogicalPx = LogicalPx::new(4.0);
 const CHECK_COLUMN: LogicalPx = LogicalPx::new(14.0);
+const SELECT_DISMISS: DismissPolicy = DismissPolicy::Chain {
+    outside: OutsidePress::Replay,
+    escape: EscapePolicy::CloseTopmost,
+    anchor_lost: true,
+    focus_lost: true,
+};
+const SELECT_ROLES: PanelRoles = PanelRoles {
+    panel: None,
+    row: A11yRole::ListBoxOption,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectItem {
@@ -86,8 +99,7 @@ pub struct SelectOptions {
     pub variant: InteractiveVariant,
     pub width: Option<LogicalPx>,
     pub max_height: LogicalPx,
-    pub placement: Placement,
-    pub gap: LogicalPx,
+    pub placement: PlacementSpec,
     pub label: Option<SmolStr>,
     pub placeholder: SmolStr,
     pub multiple: bool,
@@ -102,8 +114,12 @@ impl Default for SelectOptions {
             variant: InteractiveVariant::Outline,
             width: None,
             max_height: px(320.0),
-            placement: Placement::BOTTOM_START,
-            gap: px(4.0),
+            placement: PlacementSpec {
+                side: Side::Bottom,
+                align: Alignment::Start,
+                gap: px(4.0),
+                ..PlacementSpec::default()
+            },
             label: None,
             placeholder: SmolStr::new_static("Select…"),
             multiple: false,
@@ -139,7 +155,7 @@ impl SelectOptions {
     }
 
     #[must_use]
-    pub fn placement(mut self, placement: Placement) -> Self {
+    pub fn placement(mut self, placement: PlacementSpec) -> Self {
         self.placement = placement;
         self
     }
@@ -214,6 +230,7 @@ struct SelectInner {
     tooltip: RefCell<Option<SmolStr>>,
     on_change: RefCell<Option<Rc<dyn Fn(&mut App, Vec<SmolStr>)>>>,
     actions: SelectActions,
+    watch: RefCell<AnchorWatch>,
     state: RefCell<SelectState>,
 }
 
@@ -221,8 +238,6 @@ impl Select {
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         key: impl Into<SmolStr>,
         options: SelectOptions,
     ) -> Self {
@@ -232,28 +247,21 @@ impl Select {
         let panel = ItemPanel::new(
             app,
             theme.clone(),
-            layer,
-            router,
             format_smolstr!("{key}:panel"),
             ItemPanelOptions {
                 size: options.size,
                 max_height: options.max_height,
                 row_height: options.size.h(),
-                band: Band::Popup,
-                modal: true,
-                placement: options.placement,
-                gap: options.gap,
-                roles: PanelRoles {
-                    panel: None,
-                    row: A11yRole::ListBoxOption,
-                },
+                placement: options.placement.clone(),
+                dismiss: SELECT_DISMISS,
+                tier: PopupTier::Auto,
+                roles: SELECT_ROLES,
                 label: options.label.clone(),
                 width: if options.width.is_some() {
                     PanelWidth::Exact
                 } else {
                     PanelWidth::AtLeast
                 },
-                slot: crate::kit::layer::LayerSlot::Exclusive,
             },
         );
         let open_state = panel.open_state();
@@ -269,6 +277,7 @@ impl Select {
             .label(static_label)
             .a11y_label_signal(a11y_label)
             .a11y_expanded(open_state)
+            .a11y_has_popup(HasPopup::ListBox)
             .action(trigger_click.clone());
         let inner = Rc::new(SelectInner {
             actions: SelectActions {
@@ -290,6 +299,7 @@ impl Select {
             a11y_label,
             tooltip: RefCell::new(None),
             on_change: RefCell::new(None),
+            watch: RefCell::new(AnchorWatch::default()),
             state: RefCell::new(SelectState::default()),
         });
         let select = Self { inner };
@@ -309,7 +319,12 @@ impl Select {
 
     #[must_use]
     pub fn panel_node(&self) -> Option<NodeId> {
-        self.inner.panel.overlay().panel_node()
+        self.inner.panel.panel_node()
+    }
+
+    #[must_use]
+    pub fn popup_node(&self) -> Option<NodeId> {
+        self.inner.panel.popup_node()
     }
 
     #[must_use]
@@ -724,7 +739,7 @@ impl Select {
         Ok(node)
     }
 
-    pub fn open(&self, app: &mut App) -> Result<bool, OverlayError> {
+    pub fn open(&self, app: &mut App) -> Result<bool, PopupError> {
         let (Some(window), Some(trigger)) = (
             self.inner.state.borrow().window,
             self.inner.state.borrow().trigger,
@@ -733,7 +748,7 @@ impl Select {
         };
         self.measure_trigger(app);
         self.resolve_icons(app, window)
-            .map_err(OverlayError::from)?;
+            .map_err(|source| popup_error(app, window, source))?;
         let width = self
             .inner
             .options
@@ -742,28 +757,40 @@ impl Select {
         self.inner
             .panel
             .set_content(app, self.panel_content(app))
-            .map_err(OverlayError::from)?;
-        let opened = self
-            .inner
-            .panel
-            .open(app, window, Anchor::node(trigger), width)?;
+            .map_err(|source| popup_error(app, window, source))?;
+        let opened = self.inner.panel.open(
+            app,
+            window,
+            PanelOpen {
+                anchor: Anchor::Node { node: trigger },
+                opener: Some(trigger),
+                focus: FocusPolicy::Take {
+                    restore: RestoreFocus::Opener,
+                },
+                parent: None,
+                width,
+                a11y_parent: None,
+            },
+        )?;
         if opened {
+            self.inner.watch.borrow_mut().reset();
             let row = self
                 .chosen_indices(app)
                 .first()
                 .copied()
                 .or_else(|| self.first_enabled());
             self.inner.panel.set_highlighted(app, row);
-            let _ = self.inner.panel.focus(app);
         }
         Ok(opened)
     }
 
     pub fn close(&self, app: &mut App) -> bool {
+        self.inner.watch.borrow_mut().reset();
         self.inner.panel.close(app)
     }
 
     pub fn close_now(&self, app: &mut App) -> bool {
+        self.inner.watch.borrow_mut().reset();
         self.inner.panel.close_now(app)
     }
 
@@ -773,13 +800,24 @@ impl Select {
         changed |= self.sync_trigger_icon(app)?;
         changed |= self.sync_tags(app);
         if self.is_open(app) {
+            let lost = self
+                .inner
+                .panel
+                .id()
+                .zip(self.inner.state.borrow().window)
+                .is_some_and(|(id, window)| {
+                    self.inner.watch.borrow_mut().observe(app, id, window) == AnchorChange::Lost
+                });
+            if lost {
+                changed |= self.close(app);
+            }
             self.measure_trigger(app);
             if self.inner.options.width.is_none() {
                 let width = self.inner.state.borrow().trigger_width.max(px(1.0));
-                self.inner.panel.resize(app, width)?;
+                changed |= self.inner.panel.set_width(app, width);
             }
         }
-        changed |= self.inner.panel.sync(app, true)?;
+        changed |= self.inner.panel.sync(app)?;
         Ok(changed)
     }
 
@@ -788,6 +826,7 @@ impl Select {
     }
 
     pub fn release(&self, app: &mut App) -> usize {
+        self.inner.watch.borrow_mut().reset();
         for action in [
             &self.inner.actions.trigger_click,
             &self.inner.actions.down,
@@ -1251,29 +1290,26 @@ impl fmt::Debug for Select {
             .finish()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc, time::Duration};
 
     use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
-        a11y::A11yRole,
-        event::{Action, Event, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{LogicalPoint, LogicalRect, px},
+        a11y::{A11yAction, A11yRole},
+        event::{Action, ActionSource, Event, InputEvent, KeyCode, Modifiers, PointerButton},
+        interaction::{ScrollConfig, ScrollHandle},
+        math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
+        paint::style_builder::StyleBuilder,
+        popup::{HasPopup, PopupId, PopupSnapshotEntry, PopupState},
         test_support::{app::TestApp, diagnostics::signal_slot_stats},
         window::WindowId,
     };
 
     use super::{Select, SelectItem, SelectOptions};
     use crate::{
-        kit::{
-            icon::IconKind,
-            layer::Layer,
-            overlay::AnimationRouter,
-            test_support::{a11y_snapshot_without_oracle, overlay_wrapper},
-        },
+        kit::{icon::IconKind, test_support::a11y_snapshot_without_oracle},
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
@@ -1281,9 +1317,8 @@ mod tests {
         app: TestApp,
         window: WindowId,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         changed: Rc<RefCell<Vec<Vec<SmolStr>>>>,
+        background_clicks: Rc<std::cell::Cell<usize>>,
     }
 
     impl Harness {
@@ -1292,6 +1327,12 @@ mod tests {
             let window = app.window_id();
             let root = app.app().window(window).expect("窗口").tree().root();
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+            let clicks = Rc::new(std::cell::Cell::new(0));
+            let sink = clicks.clone();
+            app.app_mut().on_action(
+                Action::Custom(SmolStr::new_static("background.click")),
+                move |_| sink.set(sink.get() + 1),
+            );
             NodeBuilder::boxed()
                 .id("background")
                 .layout_override(LogicalRect::new(px(620.0), px(520.0), px(80.0), px(40.0)))
@@ -1305,23 +1346,15 @@ mod tests {
                 app,
                 window,
                 theme,
-                layer: Layer::new(),
-                router: AnimationRouter::new(),
                 changed: Rc::new(RefCell::new(Vec::new())),
+                background_clicks: clicks,
             }
         }
 
         fn select(&mut self, options: SelectOptions) -> Select {
             let changed = self.changed.clone();
-            Select::new(
-                self.app.app_mut(),
-                self.theme.clone(),
-                self.layer.clone(),
-                self.router.clone(),
-                "select",
-                options,
-            )
-            .on_change(move |_, chosen| changed.borrow_mut().push(chosen))
+            Select::new(self.app.app_mut(), self.theme.clone(), "select", options)
+                .on_change(move |_, chosen| changed.borrow_mut().push(chosen))
         }
 
         fn mount(&mut self, select: &Select, items: impl IntoIterator<Item = SelectItem>) {
@@ -1332,11 +1365,75 @@ mod tests {
                 .expect("窗口")
                 .tree()
                 .root();
+            self.mount_under(select, items, root);
+        }
+
+        fn mount_under(
+            &mut self,
+            select: &Select,
+            items: impl IntoIterator<Item = SelectItem>,
+            parent: NodeId,
+        ) {
             select.set_items(self.app.app_mut(), items).expect("条目");
             select
-                .mount(self.app.app_mut(), self.window, root)
+                .mount(self.app.app_mut(), self.window, parent)
                 .expect("挂载");
             self.settle(select);
+        }
+
+        fn scroll_page(&mut self) -> (NodeId, ScrollHandle) {
+            let root = self
+                .app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let page = {
+                let tree = self
+                    .app
+                    .app_mut()
+                    .window_mut(self.window)
+                    .expect("窗口")
+                    .tree_mut();
+                NodeBuilder::boxed()
+                    .id("page")
+                    .style(
+                        StyleBuilder::new()
+                            .relative()
+                            .flex_col()
+                            .width(px(400.0))
+                            .height(px(200.0))
+                            .overflow_hidden()
+                            .build(),
+                    )
+                    .build(tree, root)
+                    .expect("滚动页")
+            };
+            let handle = self
+                .app
+                .app_mut()
+                .make_scroll(self.window, page, ScrollConfig::default())
+                .expect("滚动容器");
+            self.app
+                .app_mut()
+                .set_scroll_content(&handle, LogicalSize::new(px(400.0), px(1200.0)))
+                .expect("滚动内容");
+            (page, handle)
+        }
+
+        fn spacer(&mut self, parent: NodeId, height: LogicalPx) {
+            let tree = self
+                .app
+                .app_mut()
+                .window_mut(self.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id("spacer")
+                .style(StyleBuilder::new().width_full().height(height).build())
+                .build(tree, parent)
+                .expect("占位");
         }
 
         fn settle(&mut self, select: &Select) {
@@ -1349,6 +1446,12 @@ mod tests {
             let _ = self.app.drain().expect("帧");
             let _ = select.sync(self.app.app_mut());
             let _ = self.app.drain().expect("帧");
+        }
+
+        fn drain(&mut self, select: &Select) -> ui_core::test_support::record::FrameRecord {
+            let record = self.app.drain().expect("帧").clone();
+            let _ = select.sync(self.app.app_mut());
+            record
         }
 
         fn focus_trigger(&mut self, select: &Select) {
@@ -1366,7 +1469,7 @@ mod tests {
             self.settle(select);
         }
 
-        fn click(&mut self, select: &Select, at: LogicalPoint) {
+        fn press_release(&mut self, at: LogicalPoint) {
             let _ = self.app.inject(InputEvent::pointer_down(
                 at,
                 PointerButton::Primary,
@@ -1377,6 +1480,10 @@ mod tests {
                 PointerButton::Primary,
                 Modifiers::empty(),
             ));
+        }
+
+        fn click(&mut self, select: &Select, at: LogicalPoint) {
+            self.press_release(at);
             self.settle(select);
         }
 
@@ -1472,6 +1579,32 @@ mod tests {
 
         fn idles(&mut self) -> bool {
             !self.app.drain().expect("帧").rendered
+        }
+
+        fn popup_entry(&self, select: &Select) -> PopupSnapshotEntry {
+            let node = select.popup_node().expect("浮层内容节点");
+            self.app
+                .app()
+                .popup_stack(self.window)
+                .expect("浮层栈")
+                .entries
+                .into_iter()
+                .find(|entry| entry.node == node)
+                .expect("面板在栈里")
+        }
+
+        fn popup_rect(&self, select: &Select) -> LogicalRect {
+            self.popup_entry(select).hit_rect
+        }
+
+        fn trigger_screen_rect(&self, select: &Select) -> LogicalRect {
+            let trigger = select.trigger_node().expect("触发器");
+            self.app
+                .app()
+                .window(self.window)
+                .expect("窗口")
+                .node_screen_rect(trigger)
+                .expect("触发器屏幕矩形")
         }
     }
 
@@ -1635,6 +1768,43 @@ mod tests {
     }
 
     #[test]
+    fn an_a11y_click_chooses_the_option_it_targets() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+
+        let row = harness.find("select:panel:list:row:1").expect("选项行节点");
+        let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
+        let record = snapshot.node_for(row).expect("行 a11y 记录");
+        assert_eq!(record.role, A11yRole::ListBoxOption);
+        assert!(
+            record.actions.contains(&A11yAction::Click),
+            "ListBoxOption 必须宣告 a11y Click：{:?}",
+            record.actions
+        );
+
+        let action = Action::Custom(SmolStr::new_static("select:panel.row"));
+        let handled = harness.app.app_mut().dispatch_action(
+            harness.window,
+            row,
+            action,
+            ActionSource::Programmatic,
+        );
+        assert!(handled, "AT Click 必须被分发到行 action");
+        harness.settle(&select);
+        assert_eq!(
+            select.chosen(harness.app.app()),
+            vec![SmolStr::new_static("b")],
+            "AT Click 选中它指向的选项"
+        );
+        assert_eq!(harness.changed.borrow().len(), 1, "选中回调只触发一次");
+        assert!(!select.is_open(harness.app.app()));
+    }
+
+    #[test]
     fn escape_and_outside_presses_close_the_panel_and_return_focus() {
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions::default());
@@ -1653,6 +1823,27 @@ mod tests {
         harness.click(&select, harness.center(trigger));
         harness.click(&select, LogicalPoint::new(px(10.0), px(10.0)));
         assert!(!select.is_open(harness.app.app()), "点击外部关闭");
+        assert_eq!(
+            harness.background_clicks.get(),
+            0,
+            "点外部 (10,10) 没命中背景节点，只有浮层关闭"
+        );
+    }
+
+    #[test]
+    fn an_outside_press_replays_to_the_page() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        harness.click(&select, LogicalPoint::new(px(640.0), px(520.0)));
+        assert!(!select.is_open(harness.app.app()), "点击外部关闭");
+        assert_eq!(
+            harness.background_clicks.get(),
+            1,
+            "D14：外部按下按 Replay 重派给下层命中控件"
+        );
     }
 
     #[test]
@@ -1691,11 +1882,11 @@ mod tests {
         harness.click(&select, harness.center(trigger));
         let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
         let panel = select.panel_node().expect("面板");
-        let wrapper = overlay_wrapper(harness.app.app(), harness.window, panel);
+        let wrapper = select.popup_node().expect("浮层内容节点");
         assert_eq!(
             snapshot.node_for(wrapper).expect("包装").role,
             A11yRole::GenericContainer,
-            "ListBox 角色缺位（E15）时包装不声明角色"
+            "Select 面板不声明 Menu/ListBox 角色"
         );
         assert_eq!(
             snapshot
@@ -1704,7 +1895,11 @@ mod tests {
                 .filter(|node| node.role == A11yRole::List)
                 .count(),
             1,
-            "集合语义只来自内层 E9 虚拟列表容器（不得双 List）"
+            "集合语义只来自内层虚拟列表容器（不得双 List）"
+        );
+        assert_eq!(
+            snapshot.node_for(panel).expect("面板").role,
+            A11yRole::GenericContainer
         );
         let options: Vec<String> = snapshot
             .nodes()
@@ -1807,6 +2002,22 @@ mod tests {
     }
 
     #[test]
+    fn the_panel_matches_the_trigger_width_for_short_items() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        let trigger_width = harness.bounds(trigger).size.width;
+        harness.click(&select, harness.center(trigger));
+        let panel = harness.bounds(select.panel_node().expect("面板"));
+        assert!(
+            (panel.size.width - trigger_width).abs() < px(0.5),
+            "match width：面板 {} / 触发器 {trigger_width}",
+            panel.size.width
+        );
+    }
+
+    #[test]
     fn a_long_item_grows_the_panel_past_its_trigger() {
         let mut harness = Harness::new();
         let select = harness.select(SelectOptions::default());
@@ -1826,7 +2037,7 @@ mod tests {
         let panel = harness.bounds(select.panel_node().expect("面板"));
         assert!(
             panel.size.width > trigger_width + 100.0,
-            "长条目把面板撑宽（旧 min_w 下限口径）：面板 {} / 触发器 {trigger_width}",
+            "长条目把面板撑宽：面板 {} / 触发器 {trigger_width}",
             panel.size.width
         );
     }
@@ -2014,12 +2225,22 @@ mod tests {
         let record = snapshot.node_for(trigger).expect("触发器进 a11y");
         assert_eq!(record.role, A11yRole::Button);
         assert_eq!(record.label_text(), Some("Select…"), "占位文本是可访问名");
+        assert_eq!(
+            record.has_popup,
+            Some(HasPopup::ListBox),
+            "关闭态静态 aria-haspopup=listbox"
+        );
         assert_eq!(record.expanded, Some(false), "关闭态 aria-expanded=false");
 
         harness.click(&select, harness.center(trigger));
         harness.settle(&select);
         let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
         let record = snapshot.node_for(trigger).expect("触发器进 a11y");
+        assert_eq!(
+            record.has_popup,
+            Some(HasPopup::ListBox),
+            "打开态 haspopup 仍保留"
+        );
         assert_eq!(record.expanded, Some(true), "打开态 aria-expanded=true");
 
         harness.click(&select, harness.row_center(1));
@@ -2027,6 +2248,11 @@ mod tests {
         let snapshot = a11y_snapshot_without_oracle(&mut harness.app);
         let record = snapshot.node_for(trigger).expect("触发器进 a11y");
         assert_eq!(record.label_text(), Some("Beta"), "可访问名跟随选中项");
+        assert_eq!(
+            record.has_popup,
+            Some(HasPopup::ListBox),
+            "关闭后静态 haspopup 不丢失"
+        );
         assert_eq!(record.expanded, Some(false), "关闭后 expanded 复原");
     }
 
@@ -2049,7 +2275,7 @@ mod tests {
         assert_eq!(
             record.label_text(),
             Some("Alpha +1"),
-            "多选触发器给出选中摘要（旧实现完全不可读）"
+            "多选触发器给出选中摘要"
         );
     }
 
@@ -2076,21 +2302,186 @@ mod tests {
     }
 
     #[test]
+    fn the_first_visible_frame_already_has_the_settled_rect() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        let trigger_width = harness.bounds(trigger).size.width;
+        let _ = harness.app.drain().expect("帧");
+        harness.press_release(harness.center(trigger));
+        let _ = harness.app.drain().expect("帧");
+        let first_entry = harness.popup_entry(&select);
+        assert_eq!(
+            first_entry.state,
+            PopupState::Open,
+            "首帧即 Open（不再需要等 reveal）"
+        );
+        let first = first_entry.hit_rect;
+        let first_panel = harness.bounds(select.panel_node().expect("面板"));
+        assert!(
+            (first_panel.size.width - trigger_width).abs() < px(0.5),
+            "首帧面板宽度已跟随触发器：面板 {} / 触发器 {trigger_width}",
+            first_panel.size.width
+        );
+        harness.settle(&select);
+        let stable = harness.popup_rect(&select);
+        assert_eq!(first, stable, "首可见帧 rect 等于稳定帧");
+        let stable_panel = harness.bounds(select.panel_node().expect("面板"));
+        assert_eq!(
+            first_panel.size.width, stable_panel.size.width,
+            "首帧面板宽度等于稳定帧"
+        );
+    }
+
+    #[test]
+    fn scrolling_the_trigger_out_of_the_page_closes_the_select() {
+        let mut harness = Harness::new();
+        let (page, scroll) = harness.scroll_page();
+        let select = harness.select(SelectOptions::default());
+        harness.mount_under(&select, items(), page);
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()), "面板打开");
+
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&scroll, LogicalPoint::new(px(0.0), px(600.0)))
+            .expect("滚动");
+        harness.settle(&select);
+        assert!(
+            !select.is_open(harness.app.app()),
+            "触发器滚出滚动页后关闭面板"
+        );
+    }
+
+    #[test]
+    fn scrolling_a_visible_trigger_re_anchors_the_open_select() {
+        let mut harness = Harness::new();
+        let (page, scroll) = harness.scroll_page();
+        harness.spacer(page, px(100.0));
+        let select = harness.select(SelectOptions::default());
+        harness.mount_under(&select, items(), page);
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()), "面板打开");
+        let before = harness.popup_rect(&select);
+
+        harness
+            .app
+            .app_mut()
+            .scroll_to(&scroll, LogicalPoint::new(px(0.0), px(60.0)))
+            .expect("滚动");
+        harness.settle(&select);
+        assert!(select.is_open(harness.app.app()), "触发器仍可见时保持打开");
+        let after = harness.popup_rect(&select);
+        assert_ne!(before, after, "滚动后浮层随锚点重新落位");
+        let trigger_rect = harness.trigger_screen_rect(&select);
+        assert!(
+            (after.origin.y - (trigger_rect.origin.y + trigger_rect.size.height + px(4.0))).abs()
+                < px(0.5),
+            "浮层贴住触发器下沿：浮层 {after:?} / 触发器 {trigger_rect:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_select_follows_a_window_resize() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        assert!(select.is_open(harness.app.app()));
+
+        harness
+            .app
+            .app_mut()
+            .window_mut(harness.window)
+            .expect("窗口")
+            .set_size(LogicalSize::new(px(320.0), px(240.0)));
+        harness.settle(&select);
+
+        let viewport = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .size();
+        let panel = harness.popup_rect(&select);
+        assert!(
+            panel.max().x <= viewport.width + px(0.5)
+                && panel.max().y <= viewport.height + px(0.5)
+                && panel.origin.x >= px(3.5)
+                && panel.origin.y >= px(3.5),
+            "resize 后面板重新 settle 进视口（margin 4）：{panel:?} / viewport {viewport:?}"
+        );
+        let trigger_rect = harness.trigger_screen_rect(&select);
+        assert!(
+            (panel.origin.y - (trigger_rect.max().y + px(4.0)))
+                .value()
+                .abs()
+                < 0.5
+                || panel.max().y <= trigger_rect.origin.y + px(0.5),
+            "面板仍锚定触发器（下方或翻到上方）：panel {panel:?} trigger {trigger_rect:?}"
+        );
+    }
+
+    #[test]
+    fn opening_and_closing_the_select_never_forces_a_full_repaint() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        let id: PopupId = harness.popup_entry(&select).id;
+        for _ in 0..4 {
+            let record = harness.drain(&select);
+            assert!(!record.damage_full, "打开面板不得全量重绘");
+        }
+        assert!(select.close(harness.app.app_mut()));
+        for _ in 0..12 {
+            harness.app.advance(Duration::from_millis(16));
+            let record = harness.drain(&select);
+            assert!(!record.damage_full, "关闭面板不得全量重绘");
+            if harness.app.app().popup_rect(id).is_none() {
+                break;
+            }
+        }
+        assert!(
+            harness.app.app().popup_rect(id).is_none(),
+            "关闭动画结束后节点卸载"
+        );
+    }
+
+    #[test]
+    fn the_panel_debug_ids_stay_stable() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default());
+        harness.mount(&select, items());
+        let trigger = select.trigger_node().expect("触发器");
+        harness.click(&select, harness.center(trigger));
+        let panel = select.panel_node().expect("面板");
+        assert_eq!(harness.find("select:panel:panel"), Some(panel));
+        assert!(harness.find("select:panel:surface").is_some());
+        assert!(
+            harness.find("select:panel:list:viewport").is_some(),
+            "列表 viewport 命名保持"
+        );
+    }
+
+    #[test]
     fn releasing_a_select_returns_its_signal_scope() {
         let mut app = TestApp::new();
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let layer = Layer::new();
-        let router = AnimationRouter::new();
         let baseline = signal_slot_stats(app.app());
         let mut steady_slots = None;
         for round in 0..4 {
             let select = Select::new(
                 app.app_mut(),
                 theme.clone(),
-                layer.clone(),
-                router.clone(),
                 format_smolstr!("select{round}"),
                 SelectOptions::default(),
             );

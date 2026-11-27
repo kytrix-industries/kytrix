@@ -85,7 +85,5 @@ pub(crate) fn raise_debug_hud(app: &mut App, window: WindowId) {
     let Some(target) = app.windows.get_mut(&window) else {
         return;
     };
-    let tree = target.tree_mut();
-    let root = tree.root();
-    let _ = tree.append_child(root, hud);
+    target.tree_mut().pin_tail_child(hud);
 }

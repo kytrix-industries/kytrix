@@ -357,6 +357,20 @@ fn pick(
     transforms: bool,
 ) -> Option<HitResult> {
     let slot = tree.get(node).ok()?;
+    let (offset, blocked) = tree
+        .popup_transform(node)
+        .map_or((offset, false), |transform| {
+            (
+                LogicalPoint::new(offset.x - transform.offset.x, offset.y - transform.offset.y),
+                transform.blocked,
+            )
+        });
+    if blocked {
+        return None;
+    }
+    if tree.popup_pointer_transparent(node) {
+        return None;
+    }
     let bounds = slot.layout().bounds.translate(negate(offset));
     let ancestors = chain;
 
@@ -394,6 +408,9 @@ fn pick(
                 continue;
             };
             let mut subtree = tree.subtree_bounds(*child).translate(negate(child_offset));
+            if let Some(transform) = tree.popup_transform(*child) {
+                subtree = subtree.translate(transform.offset);
+            }
             if transforms && child_slot.kind().is_geometry() {
                 let transform = tree.geometry_transform(*child);
                 if transform != Transform::IDENTITY {
@@ -403,7 +420,7 @@ fn pick(
                     }
                 }
             }
-            if !subtree.contains(point) {
+            if !tree.is_popup_root(*child) && !subtree.contains(point) {
                 continue;
             }
             if let Some(hit) = pick(
@@ -421,6 +438,9 @@ fn pick(
     }
 
     if disabled {
+        return None;
+    }
+    if tree.hit_focus_skip(node) == crate::node::tree::HitFocusSkip::Container {
         return None;
     }
     let local_point = LogicalPoint::new(point.x - bounds.origin.x, point.y - bounds.origin.y);

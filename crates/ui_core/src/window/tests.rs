@@ -23,7 +23,7 @@ fn new_window_has_root_and_empty_scene() {
     let window = window();
 
     assert_eq!(window.id(), WindowId::for_test(1));
-    assert_eq!(window.tree().len(), 1, "初始只有 root");
+    assert_eq!(window.tree().len(), 2, "初始只有 root 与 popup root");
     assert_eq!(window.scene().lane_count(), 0);
     assert!(window.scene().is_empty());
     assert_eq!(window.device_pixel_ratio(), DevicePixelRatio::ONE);
@@ -1026,6 +1026,7 @@ fn set_state_is_idempotent_and_marks_the_root_for_paint_when_it_changes() {
     let mut window = window();
     let root = window.tree().root();
     window.tree_mut().clear_paint(root);
+    window.tree_mut().clear_all_dirty_for_test();
     assert!(!window.tree().has_paint_work(), "前置：根节点已清脏");
 
     let unchanged = window.state();
@@ -1569,4 +1570,43 @@ fn text_byte_index_at_returns_zero_for_empty_text_at_window_level() {
             "{point:?}"
         );
     }
+}
+
+#[test]
+fn set_max_size_reruns_layout_through_the_window_api() {
+    let mut window = window();
+    let root = window.tree().root();
+    let mut style = Style::default();
+    style.align_self(taffy::style::AlignSelf::FLEX_START);
+    let node = NodeBuilder::boxed()
+        .style(style)
+        .measure(Box::new(|_known, _available| {
+            LogicalSize::new(px(200.0), px(100.0))
+        }))
+        .build(window.tree_mut(), root)
+        .expect("node");
+    window.compute_layout().expect("layout");
+    assert_eq!(
+        window.tree().get(node).expect("node").layout().bounds.size,
+        LogicalSize::new(px(200.0), px(100.0))
+    );
+
+    window
+        .set_max_size(node, crate::node::tree::MaxSize::width(px(70.0)))
+        .expect("max size");
+    window.compute_layout().expect("layout");
+
+    assert_eq!(
+        window.tree().get(node).expect("node").layout().bounds.size,
+        LogicalSize::new(px(70.0), px(100.0))
+    );
+    assert!(
+        window
+            .tree()
+            .get(node)
+            .expect("node")
+            .damage()
+            .contains(LogicalPoint::new(px(150.0), px(50.0))),
+        "运行时 max-size 必须 damage 旧外延"
+    );
 }

@@ -20,6 +20,10 @@ use ui_core::{
         signal::{Signal, SignalScope},
     },
     paint::{style::StylePatch, style_builder::StyleBuilder},
+    popup::{
+        Anchor, DismissPolicy, FocusPolicy, InitialFocus, PlacementSpec, PopupA11y, PopupAnimation,
+        PopupSpec, PopupTier, RestoreFocus,
+    },
     text::{TextOverflow, TextStyle},
     window::WindowId,
 };
@@ -31,10 +35,7 @@ use ui_kit::{
         dialog::{Dialog, DialogBuilder},
         icon::{IconKind, IconSpec},
         interactive::Interactive,
-        layer::Band,
-        overlay::{
-            Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayOptions, OverlaySurface, Placement,
-        },
+        popup_panel::{PanelWidth, PopupPanel, PopupPanelOptions, PopupSurface},
         size::{UnifiedSizable, UnifiedSize},
         spinner::Spinner,
         tooltip::{Tooltip, TooltipContent, TooltipOptions},
@@ -120,7 +121,7 @@ impl MarketParticipants {
             trigger: None,
             trigger_node: None,
             tooltip: None,
-            overlay: None,
+            panel: None,
             rows_root: None,
             buttons: Vec::new(),
             spinners: Vec::new(),
@@ -148,9 +149,9 @@ impl MarketParticipants {
     pub fn is_open(&self, app: &App) -> bool {
         self.inner
             .borrow()
-            .overlay
+            .panel
             .as_ref()
-            .is_some_and(|overlay| overlay.is_open(app))
+            .is_some_and(|panel| panel.is_open(app))
     }
 
     pub fn build(
@@ -206,7 +207,7 @@ struct MenuInner {
     trigger: Option<Interactive>,
     trigger_node: Option<NodeId>,
     tooltip: Option<Tooltip>,
-    overlay: Option<Overlay>,
+    panel: Option<PopupPanel>,
     rows_root: Option<NodeId>,
     buttons: Vec<Button>,
     spinners: Vec<Spinner>,
@@ -249,17 +250,7 @@ impl MenuInner {
         self.trigger_node = Some(trigger_node);
 
         let tooltip_key = format_smolstr!("{}:tooltip", self.key);
-        let tooltip = Tooltip::new(
-            app,
-            theme.clone(),
-            self.host.layer().clone(),
-            self.host.animation(),
-            tooltip_key,
-            TooltipOptions {
-                placement: Placement::BOTTOM,
-                ..TooltipOptions::default()
-            },
-        );
+        let tooltip = Tooltip::new(app, theme.clone(), tooltip_key, TooltipOptions::default());
         tooltip.attach(app, window, trigger_node);
         tooltip.set_content(Some(TooltipContent::new(t_smol!(
             self.host.translate(),
@@ -267,29 +258,14 @@ impl MenuInner {
         ))));
         self.tooltip = Some(tooltip);
 
-        let overlay_key = format_smolstr!("{}:panel", self.key);
-        let overlay = Overlay::new(
+        let panel_key = format_smolstr!("{}:panel", self.key);
+        let panel = PopupPanel::new(
             app,
             theme,
-            self.host.layer().clone(),
-            self.host.animation(),
-            overlay_key,
-            OverlayOptions {
-                placement: Placement::BOTTOM_START,
-                gap: px(4.0),
-                dismiss: DismissPolicy::OutsideClick,
-                modal: true,
-                band: Band::Dialog,
-                surface: OverlaySurface::menu(),
-                a11y: OverlayA11y::menu(t_smol!(
-                    self.host.translate(),
-                    "window.market_participants.title"
-                )),
-                scrim: None,
-                ..OverlayOptions::default()
-            },
+            panel_key,
+            PopupPanelOptions::new(PopupSurface::menu(), PanelWidth::Auto),
         );
-        self.overlay = Some(overlay);
+        self.panel = Some(panel);
         Ok(())
     }
 
@@ -297,11 +273,11 @@ impl MenuInner {
         if self.released {
             return Ok(());
         }
-        let Some(overlay) = self.overlay.clone() else {
+        let Some(panel) = self.panel.clone() else {
             return Ok(());
         };
-        if overlay.is_open(app) {
-            overlay.close(app);
+        if panel.is_open(app) {
+            panel.close(app);
             return Ok(());
         }
         let Some(trigger) = self.trigger_node else {
@@ -312,7 +288,27 @@ impl MenuInner {
         }
         self.rows = read_rows(self.host.directory());
         self.panel_signature = None;
-        overlay.open(app, window, Anchor::Node(trigger), |_, _| Ok(()))?;
+        let mut spec = PopupSpec::new(Anchor::Node { node: trigger }, PlacementSpec::default());
+        spec.tier = PopupTier::Modal;
+        spec.dismiss = DismissPolicy::Explicit {
+            outside: true,
+            escape: true,
+        };
+        spec.focus = FocusPolicy::Trap {
+            restore: RestoreFocus::Opener,
+            initial: InitialFocus::Container,
+        };
+        spec.opener = Some(trigger);
+        spec.animation = PopupAnimation::Fade;
+        spec.a11y = PopupA11y {
+            role: Some(A11yRole::Menu),
+            label: Some(t_smol!(
+                self.host.translate(),
+                "window.market_participants.title"
+            )),
+            ..PopupA11y::default()
+        };
+        panel.open(app, window, spec, |_, _, _| Ok(()))?;
         Ok(())
     }
 
@@ -337,12 +333,12 @@ impl MenuInner {
             trigger.sync(app)?;
         }
 
-        let Some(overlay) = self.overlay.clone() else {
+        let Some(panel) = self.panel.clone() else {
             return Ok(());
         };
-        let was_open = overlay.is_open(app);
-        overlay.sync(app);
-        let open = overlay.is_open(app);
+        let was_open = panel.is_open(app);
+        panel.sync(app);
+        let open = panel.is_open(app);
         if was_open && !open {
             self.clear_panel(app);
         }
@@ -400,10 +396,10 @@ impl MenuInner {
         let Some(window) = self.window else {
             return Ok(());
         };
-        let Some(overlay) = self.overlay.clone() else {
+        let Some(panel) = self.panel.clone() else {
             return Ok(());
         };
-        let Some(panel) = overlay.panel_node() else {
+        let Some(body) = panel.body_node() else {
             return Ok(());
         };
 
@@ -432,7 +428,7 @@ impl MenuInner {
                         .min_width_0()
                         .build(),
                 )
-                .build(tree, panel)?
+                .build(tree, body)?
         };
         for row in rows {
             let activity = self.activity.get(&row.venue).copied();
@@ -550,8 +546,6 @@ impl MenuInner {
             previous.release(app);
         }
         let theme = self.host.theme().clone();
-        let layer = self.host.layer().clone();
-        let animation = self.host.animation();
         let key = format_smolstr!("{}:alert", self.key);
         let confirm = t_smol!(self.host.translate(), "common.confirm");
         let dialog_title = title.clone();
@@ -564,7 +558,7 @@ impl MenuInner {
                     dialog.close(app);
                 })
         })
-        .build(app, theme, layer, animation, key);
+        .build(app, theme, key);
         dialog.open(app, window)?;
         self.alert = Some(dialog);
         Ok(())
@@ -592,8 +586,8 @@ impl MenuInner {
         for venue in pending {
             self.host.directory().cancel_load(&venue);
         }
-        if let Some(overlay) = self.overlay.take() {
-            overlay.release(app);
+        if let Some(panel) = self.panel.take() {
+            panel.release(app);
         }
         self.release_row_components(app);
         if let Some(alert) = self.alert.take() {
@@ -967,6 +961,7 @@ mod tests {
         assert!(!harness.menu().is_open(harness.app()));
         assert!(alert_dialog(&harness).is_none());
         assert_eq!(harness.overlay_count(), 0);
+        assert_eq!(harness.popup_total(), 0);
     }
 
     #[test]
@@ -1414,7 +1409,7 @@ mod tests {
     fn an_open_panel_should_be_steady_when_nothing_moves() {
         let mut harness = Harness::new();
         open_panel(&mut harness);
-        harness.settle(2);
+        harness.settle_fade();
         let requests = harness.frame_requests();
 
         harness.settle(2);
@@ -1465,6 +1460,11 @@ mod tests {
             "the closed panel leaves no rows behind"
         );
         assert_eq!(harness.overlay_count(), 0);
+        assert_eq!(
+            harness.popup_total(),
+            0,
+            "the closed panel leaves no popup entry behind"
+        );
     }
 
     #[test]
@@ -1554,15 +1554,16 @@ mod tests {
             "the second menu draws every venue once"
         );
 
-        let first_trigger = harness.menu().trigger_node().expect("the first trigger");
-        harness.remove_node(first_trigger);
-        harness.release_menu();
-
         let action = harness
             .find_all(&format!("{}:action:Okx", second.key()))
             .into_iter()
             .next()
             .expect("the second menu's action is drawn");
+        let first_trigger = harness.menu().trigger_node().expect("the first trigger");
+        harness.remove_node(first_trigger);
+        harness.release_menu();
+        harness.settle(1);
+
         harness.click(action);
         second
             .sync(harness.app_mut())
@@ -1593,6 +1594,11 @@ mod tests {
             "the load in flight was cancelled before it was dropped"
         );
         assert_eq!(harness.overlay_count(), 0, "the panel overlay is gone");
+        assert_eq!(
+            harness.popup_total(),
+            0,
+            "releasing the menu leaves no popup entry behind"
+        );
         assert!(alert_dialog(&harness).is_none());
         assert_eq!(
             harness.menu().trigger_node(),

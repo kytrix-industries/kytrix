@@ -186,8 +186,6 @@ impl IndicatorCore {
         let tooltip = Tooltip::new(
             app,
             self.theme.clone(),
-            (*self.services.layer).clone(),
-            (*self.services.animation_router).clone(),
             format_smolstr!("{}.indicator-tooltip", self.key),
             TooltipOptions::default(),
         );
@@ -344,7 +342,7 @@ mod tests {
         harness.drain();
 
         assert!(
-            !harness.layer.is_empty(window),
+            harness.popup_count() > 0,
             "the tooltip the control is labelled with is open"
         );
     }
@@ -372,8 +370,13 @@ mod tests {
             "releasing removes the control's nodes"
         );
         assert!(
-            harness.layer.is_empty(harness.window()),
+            harness.popup_count() == 0,
             "releasing withdraws the tooltip"
+        );
+        assert_eq!(
+            harness.popup_total(),
+            0,
+            "releasing withdraws every popup entry the tooltip had"
         );
         assert_eq!(
             harness.router.len(),

@@ -3,18 +3,19 @@ use accesskit::{Action, ActionData, ActionRequest};
 use crate::{
     a11y::{
         A11yAction, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yNodeId, A11yRole,
-        A11yTextPosition,
+        A11yTextPosition, DISMISS_CUSTOM_ACTION_ID,
         mapping::{action_from_accesskit, effective_role_of, is_text_input_role},
         textrun,
     },
     app::App,
     event::ActionSource,
-    interaction::focus::{action_target, focusable, in_scope},
+    interaction::focus::{action_target, focusable},
     math::{LogicalPoint, LogicalPx, px},
     node::{
         id::NodeId,
         tree::{Node, NodeKind, NodeTree},
     },
+    popup::{DismissReason, PopupTier},
     window::{Window, WindowId},
 };
 
@@ -38,11 +39,14 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
 
-    let scope = app.modal_scope(window);
-    let allowed = app
-        .window(window)
-        .is_some_and(|target| in_scope(target.tree(), engine, scope));
-    if !allowed {
+    if !a11y_action_in_scope(app, window, engine) {
+        app.a11y_note(A11yDiagnostic::UnhandledAction {
+            node: engine,
+            action: action_from_accesskit(request.action),
+        });
+        return;
+    }
+    if action_targets_closing_popup(app, window, engine) {
         app.a11y_note(A11yDiagnostic::UnhandledAction {
             node: engine,
             action: action_from_accesskit(request.action),
@@ -58,6 +62,11 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         return;
     }
     let action = match (request.action, data.as_ref()) {
+        (Action::CustomAction, Some(ActionData::CustomAction(id)))
+            if *id == DISMISS_CUSTOM_ACTION_ID =>
+        {
+            A11yAction::Dismiss
+        }
         (Action::CustomAction, Some(ActionData::CustomAction(id))) => A11yAction::Custom(*id),
         (action, _) => match action_from_accesskit(action) {
             Some(action) => action,
@@ -70,6 +79,30 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
             }
         },
     };
+
+    if matches!(
+        action,
+        A11yAction::Dismiss | A11yAction::HideTooltip | A11yAction::ShowTooltip
+    ) {
+        if app.a11y_has_handler(action)
+            && run_handler(app, window, engine, action, A11yActionData::None)
+        {
+            return;
+        }
+        let handled = match action {
+            A11yAction::Dismiss => close_target_popup(app, window, engine),
+            A11yAction::HideTooltip => hide_target_tooltip(app, window, engine),
+            A11yAction::ShowTooltip => false,
+            _ => false,
+        };
+        if !handled {
+            app.a11y_note(A11yDiagnostic::UnhandledAction {
+                node: engine,
+                action: Some(action),
+            });
+        }
+        return;
+    }
 
     let disabled = app
         .window(window)
@@ -165,6 +198,9 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
         | A11yAction::Expand
         | A11yAction::Collapse
         | A11yAction::ShowContextMenu
+        | A11yAction::Dismiss
+        | A11yAction::HideTooltip
+        | A11yAction::ShowTooltip
         | A11yAction::Custom(_) => false,
     };
     if !handled {
@@ -421,6 +457,65 @@ fn on_focus(app: &mut App, window: WindowId, node: crate::node::id::NodeId) -> b
         .window(window)
         .is_some_and(|window_state| focusable(window_state.tree(), node));
     focusable_node && app.set_focus(window, Some(node))
+}
+
+fn a11y_action_in_scope(app: &App, window: WindowId, node: NodeId) -> bool {
+    let Some(target) = app.window(window) else {
+        return false;
+    };
+    let tree = target.tree();
+    let popups = target.popups();
+    match popups.topmost_modal() {
+        Some(modal) => popups.node_in_popup_scope(tree, node, modal),
+        None => true,
+    }
+}
+
+fn enclosing_popup(app: &App, window: WindowId, node: NodeId) -> Option<crate::popup::PopupId> {
+    let target = app.window(window)?;
+    target.popups().enclosing(target.tree(), node)
+}
+
+fn action_targets_closing_popup(app: &App, window: WindowId, node: NodeId) -> bool {
+    let Some(id) = enclosing_popup(app, window, node) else {
+        return false;
+    };
+    app.window(window)
+        .and_then(|target| target.popups().entry(id).ok())
+        .is_some_and(|entry| !entry.state.is_dismissable())
+}
+
+fn close_target_popup(app: &mut App, window: WindowId, node: NodeId) -> bool {
+    let Some(id) = enclosing_popup(app, window, node) else {
+        return false;
+    };
+    app.begin_close_popup(id, DismissReason::A11yDismiss)
+        .unwrap_or(false)
+}
+
+fn hide_target_tooltip(app: &mut App, window: WindowId, node: NodeId) -> bool {
+    let Some(target) = app.window(window) else {
+        return false;
+    };
+    let tree = target.tree();
+    let popups = target.popups();
+    let enclosing = popups.enclosing(tree, node).filter(|id| {
+        popups
+            .entry(*id)
+            .is_ok_and(|entry| entry.tier == PopupTier::Hint)
+    });
+    let id = enclosing.or_else(|| {
+        popups.order().iter().rev().copied().find(|id| {
+            popups
+                .entry(*id)
+                .is_ok_and(|entry| entry.tier == PopupTier::Hint && entry.state.is_dismissable())
+        })
+    });
+    let Some(id) = id else {
+        return false;
+    };
+    app.begin_close_popup(id, DismissReason::A11yDismiss)
+        .unwrap_or(false)
 }
 
 fn scroll_container(
@@ -719,7 +814,10 @@ mod tests {
 
     #[test]
     fn a11y_actions_outside_the_modal_scope_are_rejected() {
-        use crate::interaction::{OverlayDismiss, OverlayOptions};
+        use crate::popup::{
+            Anchor, DismissPolicy, FocusPolicy, InitialFocus, PlacementSpec, PopupAnimation,
+            PopupSpec, PopupTier, RestoreFocus,
+        };
 
         let (_runtime, mut app, window) = setup();
         let root = app.window(window).expect("window").tree().root();
@@ -756,26 +854,45 @@ mod tests {
             seen_increment.set(seen_increment.get() + 1);
         });
 
-        let modal = app
-            .create_overlay(
+        let inside = Rc::new(Cell::new(None));
+        let created = Rc::clone(&inside);
+        let mut spec = PopupSpec::new(
+            Anchor::WindowRect(crate::math::LogicalRect::new(
+                px(150.0),
+                px(50.0),
+                px(0.0),
+                px(0.0),
+            )),
+            PlacementSpec::default(),
+        );
+        spec.tier = PopupTier::Modal;
+        spec.focus = FocusPolicy::Trap {
+            restore: RestoreFocus::Opener,
+            initial: InitialFocus::Container,
+        };
+        spec.dismiss = DismissPolicy::Explicit {
+            outside: false,
+            escape: true,
+        };
+        spec.animation = PopupAnimation::None;
+        let _modal = app
+            .open_popup(
                 window,
-                OverlayOptions {
-                    trap_focus: true,
-                    dismiss: OverlayDismiss::Explicit,
-                    ..OverlayOptions::default()
+                spec,
+                move |app, window, content| {
+                    let node = NodeBuilder::boxed()
+                        .a11y(A11yOverride {
+                            role: Some(crate::a11y::A11yRole::Slider),
+                            ..A11yOverride::default()
+                        })
+                        .build(app.window_mut(window).expect("window").tree_mut(), content)?;
+                    created.set(Some(node));
+                    Ok(())
                 },
+                None,
             )
             .expect("modal");
-        let inside = NodeBuilder::boxed()
-            .a11y(A11yOverride {
-                role: Some(crate::a11y::A11yRole::Slider),
-                ..A11yOverride::default()
-            })
-            .build(
-                app.window_mut(window).expect("window").tree_mut(),
-                modal.node(),
-            )
-            .expect("mount");
+        let inside = inside.get().expect("inside slider");
 
         dispatch_request(
             &mut app,

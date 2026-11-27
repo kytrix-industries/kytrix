@@ -540,8 +540,6 @@ impl SettingsPage {
         .build(
             app,
             self.host.theme_handle(),
-            self.host.layer(),
-            self.host.animation(),
             format_smolstr!("{}.save-failed.{}", self.key, self.alert_count),
         );
         let _ = dialog.open(app, self.window);

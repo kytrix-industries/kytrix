@@ -84,6 +84,9 @@ pub(crate) const fn action_to_accesskit(action: A11yAction) -> accesskit::Action
         A::Expand => Action::Expand,
         A::Collapse => Action::Collapse,
         A::ShowContextMenu => Action::ShowContextMenu,
+        A::HideTooltip => Action::HideTooltip,
+        A::ShowTooltip => Action::ShowTooltip,
+        A::Dismiss => Action::CustomAction,
         A::Custom(_) => Action::CustomAction,
     }
 }
@@ -109,12 +112,26 @@ pub(crate) const fn action_from_accesskit(action: accesskit::Action) -> Option<A
         Action::Expand => Some(A::Expand),
         Action::Collapse => Some(A::Collapse),
         Action::ShowContextMenu => Some(A::ShowContextMenu),
+        Action::HideTooltip => Some(A::HideTooltip),
+        Action::ShowTooltip => Some(A::ShowTooltip),
         Action::CustomAction
         | Action::Blur
-        | Action::HideTooltip
-        | Action::ShowTooltip
         | Action::ScrollToPoint
         | Action::SetSequentialFocusNavigationStartingPoint => None,
+    }
+}
+
+pub(crate) const fn has_popup_to_accesskit(
+    has_popup: crate::popup::HasPopup,
+) -> accesskit::HasPopup {
+    use crate::popup::HasPopup as P;
+
+    match has_popup {
+        P::Menu => accesskit::HasPopup::Menu,
+        P::ListBox => accesskit::HasPopup::Listbox,
+        P::Tree => accesskit::HasPopup::Tree,
+        P::Grid => accesskit::HasPopup::Grid,
+        P::Dialog => accesskit::HasPopup::Dialog,
     }
 }
 
@@ -215,9 +232,6 @@ pub(crate) fn role_by_kind(tree: &NodeTree, node: NodeId, target: &Node) -> A11y
     }
     if tree.scroll_slot(node).is_some() {
         return R::ScrollView;
-    }
-    if tree.overlay_slot(node).is_some() {
-        return R::GenericContainer;
     }
     if is_virtual_row(tree, node) {
         return R::ListBoxOption;
@@ -843,6 +857,8 @@ mod tests {
             A11yAction::Expand,
             A11yAction::Collapse,
             A11yAction::ShowContextMenu,
+            A11yAction::HideTooltip,
+            A11yAction::ShowTooltip,
         ] {
             assert_eq!(
                 action_from_accesskit(action_to_accesskit(action)),
@@ -852,6 +868,11 @@ mod tests {
         assert_eq!(
             action_to_accesskit(A11yAction::Custom(7)),
             accesskit::Action::CustomAction
+        );
+        assert_eq!(
+            action_to_accesskit(A11yAction::Dismiss),
+            accesskit::Action::CustomAction,
+            "Dismiss 走保留 id 的 CustomAction"
         );
         assert_eq!(
             action_from_accesskit(accesskit::Action::CustomAction),

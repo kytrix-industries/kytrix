@@ -89,9 +89,3 @@ pub(crate) fn note_virtual_container(tree: &mut NodeTree, node: NodeId) {
         tree.virtual_containers.push(node);
     }
 }
-
-pub(crate) fn note_overlay_container(tree: &mut NodeTree, node: NodeId) {
-    if !tree.overlay_containers.contains(&node) {
-        tree.overlay_containers.push(node);
-    }
-}

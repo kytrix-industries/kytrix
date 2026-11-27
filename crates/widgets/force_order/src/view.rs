@@ -723,7 +723,7 @@ mod tests {
         window::{WindowId, WindowOptions},
     };
     use ui_kit::{
-        kit::{layer::Layer, list::RowHeight, overlay::AnimationRouter, table::ColumnWidth},
+        kit::{list::RowHeight, table::ColumnWidth},
         theme::appearance::Appearance,
     };
     use widget::{
@@ -1235,8 +1235,6 @@ mod tests {
             let window = app.create_window(WindowOptions::default());
             let scope = app.signal_scope();
             let theme = ThemeHandle::new(&mut app, Appearance::Light);
-            let layer = Rc::new(Layer::new());
-            let animation = Rc::new(AnimationRouter::new());
             let router =
                 Rc::new(FrameRouter::new(&mut app).expect("the host owns the frame hook slot"));
             let services = Rc::new(
@@ -1245,9 +1243,7 @@ mod tests {
                     runtime.handle().clone(),
                     product_translate(LanguageCode::En),
                     theme,
-                    layer,
                     router,
-                    animation,
                 )
                 .build(),
             );

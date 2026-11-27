@@ -6,22 +6,23 @@ use std::{
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
+    a11y::A11yRole,
     app::{App, TimerId},
     error::EngineError,
     math::{LogicalPx, px},
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope, tree::NodeTree},
     paint::{style::StylePatch, style_builder::StyleBuilder},
+    popup::{
+        Alignment, Anchor, DismissPolicy, FocusPolicy, Placement, PlacementSpec, PopupA11y,
+        PopupAnimation, PopupSpec, PopupTier, Side,
+    },
     text::TextStyle,
     window::WindowId,
 };
 
 use crate::{
-    kit::{
-        layer::{Band, Layer},
-        overlay::{
-            Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayOptions,
-            OverlaySurface, Placement,
-        },
+    kit::popup_panel::{
+        AnchorChange, AnchorWatch, PanelWidth, PopupPanel, PopupPanelOptions, PopupSurface,
     },
     theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
 };
@@ -56,22 +57,31 @@ impl TooltipContent {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TooltipOptions {
-    pub placement: Placement,
-    pub gap: LogicalPx,
-    pub delay: Duration,
-    pub fade: bool,
+    pub placement: PlacementSpec,
+    pub show_delay: Duration,
+    pub close_delay: Duration,
+    pub animation: PopupAnimation,
     pub max_width: LogicalPx,
 }
 
 impl Default for TooltipOptions {
     fn default() -> Self {
+        let mut placement = PlacementSpec {
+            side: Side::Bottom,
+            align: Alignment::Center,
+            ..PlacementSpec::default()
+        };
+        placement.fallbacks.clear();
+        placement
+            .fallbacks
+            .push(Placement::new(Side::Top, Alignment::Center));
         Self {
-            placement: Placement::BOTTOM,
-            gap: px(4.0),
-            delay: Duration::from_millis(500),
-            fade: true,
+            placement,
+            show_delay: Duration::from_millis(500),
+            close_delay: Duration::from_millis(100),
+            animation: PopupAnimation::Fade,
             max_width: px(320.0),
         }
     }
@@ -80,13 +90,26 @@ impl Default for TooltipOptions {
 impl TooltipOptions {
     #[must_use]
     pub fn immediate(mut self) -> Self {
-        self.delay = Duration::ZERO;
+        self.show_delay = Duration::ZERO;
+        self.close_delay = Duration::ZERO;
         self
     }
 
     #[must_use]
-    pub fn delay(mut self, delay: Duration) -> Self {
-        self.delay = delay;
+    pub fn show_delay(mut self, show_delay: Duration) -> Self {
+        self.show_delay = show_delay;
+        self
+    }
+
+    #[must_use]
+    pub fn close_delay(mut self, close_delay: Duration) -> Self {
+        self.close_delay = close_delay;
+        self
+    }
+
+    #[must_use]
+    pub fn placement(mut self, placement: PlacementSpec) -> Self {
+        self.placement = placement;
         self
     }
 
@@ -101,8 +124,9 @@ impl TooltipOptions {
 enum Phase {
     #[default]
     Idle,
-    Waiting,
+    WaitingShow,
     Shown,
+    WaitingClose,
 }
 
 struct TooltipInner {
@@ -110,15 +134,17 @@ struct TooltipInner {
     theme: ThemeHandle,
     options: TooltipOptions,
     scope: SignalScope,
-    overlay: Overlay,
-    delay_timer: Cell<Option<TimerId>>,
-    delay_ready: Cell<bool>,
+    panel: PopupPanel,
+    timer: Cell<Option<TimerId>>,
+    timer_ready: Cell<bool>,
     phase: Cell<Phase>,
     window: Cell<Option<WindowId>>,
     trigger: Cell<Option<NodeId>>,
     content: RefCell<Option<TooltipContent>>,
     shown: RefCell<Option<TooltipContent>>,
     pending_restart: Cell<bool>,
+    suppressed: Cell<bool>,
+    watch: RefCell<AnchorWatch>,
 }
 
 #[derive(Clone)]
@@ -130,50 +156,34 @@ impl Tooltip {
     pub fn new(
         app: &mut App,
         theme: ThemeHandle,
-        layer: Layer,
-        router: AnimationRouter,
         key: impl Into<SmolStr>,
         options: TooltipOptions,
     ) -> Self {
         let key = key.into();
         let scope = app.signal_scope();
-        let overlay = Overlay::new(
+        let panel = PopupPanel::new(
             app,
             theme.clone(),
-            layer,
-            router,
-            format_smolstr!("{key}:overlay"),
-            OverlayOptions {
-                placement: options.placement,
-                gap: options.gap,
-                margin: px(4.0),
-                flip: true,
-                dismiss: DismissPolicy::Explicit,
-                modal: false,
-                restore_focus: false,
-                band: Band::Tooltip,
-                slot: crate::kit::layer::LayerSlot::Exclusive,
-                surface: OverlaySurface::tooltip(),
-                scrim: None,
-                a11y: OverlayA11y::default(),
-                fade: options.fade,
-            },
+            key.clone(),
+            PopupPanelOptions::new(PopupSurface::tooltip(), PanelWidth::Auto),
         );
         Self {
             inner: Rc::new(TooltipInner {
-                scope,
                 key,
                 theme,
                 options,
-                overlay,
-                delay_timer: Cell::new(None),
-                delay_ready: Cell::new(false),
+                scope,
+                panel,
+                timer: Cell::new(None),
+                timer_ready: Cell::new(false),
                 phase: Cell::new(Phase::Idle),
                 window: Cell::new(None),
                 trigger: Cell::new(None),
                 content: RefCell::new(None),
                 shown: RefCell::new(None),
                 pending_restart: Cell::new(false),
+                suppressed: Cell::new(false),
+                watch: RefCell::new(AnchorWatch::default()),
             }),
         }
     }
@@ -185,7 +195,7 @@ impl Tooltip {
 
     pub fn attach(&self, app: &mut App, window: WindowId, trigger: NodeId) {
         if self.inner.trigger.get() != Some(trigger) || self.inner.window.get() != Some(window) {
-            self.hide(app);
+            self.reset(app);
         }
         self.inner.window.set(Some(window));
         self.inner.trigger.set(Some(trigger));
@@ -207,17 +217,32 @@ impl Tooltip {
 
     #[must_use]
     pub fn is_visible(&self, app: &App) -> bool {
-        self.inner.phase.get() == Phase::Shown && self.inner.overlay.is_open(app)
+        matches!(self.inner.phase.get(), Phase::Shown | Phase::WaitingClose)
+            && self.inner.panel.is_open(app)
     }
 
     #[must_use]
-    pub fn overlay(&self) -> &Overlay {
-        &self.inner.overlay
+    pub fn panel_node(&self) -> Option<NodeId> {
+        self.inner.panel.panel_node()
+    }
+
+    #[must_use]
+    pub fn popup_node(&self) -> Option<NodeId> {
+        self.inner.panel.popup_node()
     }
 
     pub fn sync(&self, app: &mut App) -> bool {
-        let mut changed = self.inner.overlay.sync(app);
-        if self.inner.phase.get() == Phase::Shown && !self.inner.overlay.is_open(app) {
+        let mut changed = self.inner.panel.sync(app);
+        if matches!(self.inner.phase.get(), Phase::Shown | Phase::WaitingClose)
+            && !self.inner.panel.is_open(app)
+        {
+            self.inner.suppressed.set(true);
+            self.abandon(app);
+            return true;
+        }
+        if matches!(self.inner.phase.get(), Phase::Shown | Phase::WaitingClose)
+            && self.anchor_lost(app)
+        {
             self.reset(app);
             return true;
         }
@@ -229,42 +254,58 @@ impl Tooltip {
             return changed;
         };
         let active = self.is_active(app, trigger);
+        let has_content = self.inner.content.borrow().is_some();
+        let content_changed = *self.inner.content.borrow() != *self.inner.shown.borrow();
+        if self.inner.suppressed.get() {
+            if !active {
+                self.inner.suppressed.set(false);
+            }
+            return changed;
+        }
         match self.inner.phase.get() {
             Phase::Idle => {
-                let has_content = self.inner.content.borrow().is_some();
                 if active && has_content {
-                    if self.inner.overlay.is_open(app) {
-                        if !self.inner.pending_restart.get() {
+                    if self.inner.pending_restart.get() {
+                        if self.inner.panel.state(app).is_none() {
+                            self.inner.pending_restart.set(false);
                             changed |= self.show(app);
                         }
-                    } else if self.inner.pending_restart.replace(false) {
+                    } else if self.inner.panel.state(app).is_some()
+                        || self.inner.options.show_delay.is_zero()
+                    {
                         changed |= self.show(app);
                     } else {
-                        self.start_delay(app);
+                        self.start_timer(app, Phase::WaitingShow, self.inner.options.show_delay);
                         changed = true;
                     }
-                } else if !self.inner.overlay.is_open(app) {
+                } else if self.inner.panel.state(app).is_none() {
                     self.inner.pending_restart.set(false);
                 }
             }
-            Phase::Waiting => {
-                if !active || self.inner.content.borrow().is_none() {
+            Phase::WaitingShow => {
+                if !active || !has_content {
                     self.reset(app);
                     changed = true;
-                } else if self.inner.delay_ready.replace(false) {
+                } else if self.inner.timer_ready.replace(false) {
                     changed |= self.show(app);
                 }
             }
             Phase::Shown => {
-                let withdrawn = self.inner.content.borrow().is_none();
-                let content_changed = *self.inner.content.borrow() != *self.inner.shown.borrow();
-                if !active || withdrawn {
-                    self.hide(app);
-                    self.inner.pending_restart.set(withdrawn || content_changed);
+                if !active || !has_content || content_changed {
+                    self.inner
+                        .pending_restart
+                        .set(content_changed || !has_content);
+                    self.begin_close(app);
                     changed = true;
-                } else if content_changed {
-                    self.hide(app);
-                    self.inner.pending_restart.set(true);
+                }
+            }
+            Phase::WaitingClose => {
+                if active && has_content && !content_changed {
+                    self.cancel_timer(app);
+                    self.inner.phase.set(Phase::Shown);
+                    changed = true;
+                } else if self.inner.timer_ready.replace(false) {
+                    self.close_panel(app);
                     changed = true;
                 }
             }
@@ -273,8 +314,8 @@ impl Tooltip {
     }
 
     pub fn release(&self, app: &mut App) {
-        self.cancel_delay(app);
-        self.inner.overlay.release(app);
+        self.cancel_timer(app);
+        self.inner.panel.release(app);
         let _ = app.release_scope(self.inner.scope);
     }
 
@@ -283,6 +324,13 @@ impl Tooltip {
         let trigger = self.inner.trigger.get()?;
         let tree = app.window(window)?.tree();
         tree.get(trigger).ok().map(|_| trigger)
+    }
+
+    fn anchor_lost(&self, app: &App) -> bool {
+        let (Some(id), Some(window)) = (self.inner.panel.id(), self.inner.window.get()) else {
+            return false;
+        };
+        self.inner.watch.borrow_mut().observe(app, id, window) == AnchorChange::Lost
     }
 
     fn is_active(&self, app: &App, trigger: NodeId) -> bool {
@@ -294,34 +342,52 @@ impl Tooltip {
         };
         let hovered = app.hovered(window);
         let focused = app.focused(window);
-        [hovered, focused]
+        if [hovered, focused]
             .into_iter()
             .flatten()
             .any(|node| is_within(tree, node, trigger))
+        {
+            return true;
+        }
+        self.pointer_within_panel(app, window)
     }
 
-    fn start_delay(&self, app: &mut App) {
-        self.cancel_delay(app);
+    fn pointer_within_panel(&self, app: &App, window: WindowId) -> bool {
+        let (Some(pointer), Some(id)) = (app.popup_pointer(window), self.inner.panel.id()) else {
+            return false;
+        };
+        app.popup_rect(id)
+            .is_some_and(|rect| rect.hit.contains(pointer) || rect.paint.contains(pointer))
+    }
+
+    fn start_timer(&self, app: &mut App, phase: Phase, delay: Duration) {
+        self.cancel_timer(app);
+        self.inner.phase.set(phase);
+        if delay.is_zero() {
+            self.inner.timer_ready.set(true);
+            return;
+        }
         let (Some(window), Some(trigger)) = (self.inner.window.get(), self.inner.trigger.get())
         else {
             return;
         };
-        if self.inner.options.delay.is_zero() {
-            self.inner.phase.set(Phase::Waiting);
-            let _ = self.show(app);
-            return;
-        }
-        self.inner.phase.set(Phase::Waiting);
         let ready = Rc::downgrade(&self.inner);
-        let registered = app.after_scoped(window, trigger, self.inner.options.delay, move |_app| {
+        let registered = app.after_scoped(window, trigger, delay, move |_app| {
             if let Some(inner) = ready.upgrade() {
-                inner.delay_timer.set(None);
-                inner.delay_ready.set(true);
+                inner.timer.set(None);
+                inner.timer_ready.set(true);
             }
         });
         match registered {
-            Ok(id) => self.inner.delay_timer.set(Some(id)),
-            Err(_) => self.reset(app),
+            Ok(id) => self.inner.timer.set(Some(id)),
+            Err(_) => self.inner.timer_ready.set(true),
+        }
+    }
+
+    fn cancel_timer(&self, app: &mut App) {
+        self.inner.timer_ready.set(false);
+        if let Some(id) = self.inner.timer.take() {
+            let _ = app.cancel_timer(&id);
         }
     }
 
@@ -336,21 +402,39 @@ impl Tooltip {
         let theme = self.inner.theme.clone();
         let key = self.inner.key.clone();
         let max_width = self.inner.options.max_width;
-        self.inner
-            .overlay
-            .set_a11y(OverlayA11y::tooltip(content.label()));
+        let mut spec = PopupSpec::new(
+            Anchor::Node { node: trigger },
+            self.inner.options.placement.clone(),
+        );
+        spec.tier = PopupTier::Hint;
+        spec.focus = FocusPolicy::None;
+        spec.pointer_transparent = true;
+        spec.dismiss = DismissPolicy::Hint { escape: true };
+        spec.animation = self.inner.options.animation;
+        spec.opener = Some(trigger);
+        spec.a11y = PopupA11y {
+            role: Some(A11yRole::Tooltip),
+            label: Some(content.label()),
+            described_by: Some(trigger),
+            ..PopupA11y::default()
+        };
         let built = content.clone();
-        let opened =
-            self.inner
-                .overlay
-                .open(app, window, Anchor::node(trigger), move |tree, panel| {
-                    build_content(tree, panel, &key, &built, &theme, max_width)
-                });
+        let opened = self
+            .inner
+            .panel
+            .open(app, window, spec, move |app, window, body| {
+                let Some(target) = app.window_mut(window) else {
+                    return Err(EngineError::UnknownWindow { window });
+                };
+                build_content(target.tree_mut(), body, &key, &built, &theme, max_width)
+            });
         match opened {
-            Ok(opened) => {
+            Ok(_) => {
                 self.inner.phase.set(Phase::Shown);
+                self.inner.suppressed.set(false);
+                self.inner.watch.borrow_mut().reset();
                 *self.inner.shown.borrow_mut() = Some(content);
-                opened
+                true
             }
             Err(_) => {
                 self.reset(app);
@@ -359,28 +443,33 @@ impl Tooltip {
         }
     }
 
-    fn hide(&self, app: &mut App) {
-        if self.inner.phase.get() == Phase::Shown {
-            let _ = self.inner.overlay.close(app);
-        }
-        self.inner.phase.set(Phase::Idle);
-        *self.inner.shown.borrow_mut() = None;
-        self.cancel_delay(app);
-    }
-
-    fn reset(&self, app: &mut App) {
+    fn abandon(&self, app: &mut App) {
         self.inner.phase.set(Phase::Idle);
         *self.inner.shown.borrow_mut() = None;
         self.inner.pending_restart.set(false);
-        self.cancel_delay(app);
-        let _ = self.inner.overlay.close_now(app);
+        self.cancel_timer(app);
     }
 
-    fn cancel_delay(&self, app: &mut App) {
-        self.inner.delay_ready.set(false);
-        if let Some(id) = self.inner.delay_timer.take() {
-            let _ = app.cancel_timer(&id);
+    fn begin_close(&self, app: &mut App) {
+        let close_delay = self.inner.options.close_delay;
+        if close_delay.is_zero() {
+            self.close_panel(app);
+            return;
         }
+        self.start_timer(app, Phase::WaitingClose, close_delay);
+    }
+
+    fn close_panel(&self, app: &mut App) {
+        self.cancel_timer(app);
+        self.inner.phase.set(Phase::Idle);
+        let _ = self.inner.panel.close(app);
+    }
+
+    fn reset(&self, app: &mut App) {
+        self.abandon(app);
+        self.inner.suppressed.set(false);
+        self.inner.watch.borrow_mut().reset();
+        let _ = self.inner.panel.close_now(app);
     }
 }
 
@@ -458,32 +547,27 @@ fn theme_role(theme: &ThemeHandle, role: Role) -> ui_core::paint::color::Color {
 
 #[cfg(test)]
 mod tests {
-
     use std::{cell::Cell, collections::BTreeSet, rc::Rc, time::Duration};
 
     use smol_str::format_smolstr;
     use ui_core::{
-        a11y::A11yRole,
+        a11y::{A11yAction, A11yRole, A11yTreeSnapshot},
         error::EngineError,
         event::{Action, InputEvent, KeyCode, Modifiers},
+        interaction::ScrollConfig,
         math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::style_builder::StyleBuilder,
+        popup::{
+            Alignment, DismissPolicy, FocusPolicy, InitialFocus, PlacementSpec, PopupId, PopupSpec,
+            PopupTier, RestoreFocus, Side,
+        },
         test_support::app::TestApp,
         window::{FrameOutcome, WindowId},
     };
 
     use super::{Tooltip, TooltipContent, TooltipOptions};
-    use crate::{
-        kit::{
-            layer::{Band, Layer},
-            overlay::{
-                Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayA11y, OverlayOptions,
-                OverlaySurface, Placement,
-            },
-        },
-        theme::{appearance::Appearance, handle::ThemeHandle},
-    };
+    use crate::theme::{appearance::Appearance, handle::ThemeHandle};
 
     const TRIGGER: LogicalRect = LogicalRect::from_origin_size(
         LogicalPoint::new(px(300.0), px(200.0)),
@@ -495,25 +579,14 @@ mod tests {
         window: WindowId,
         trigger: NodeId,
         tip: Tooltip,
-        layer: Layer,
-        router: AnimationRouter,
-        theme: ThemeHandle,
     }
 
     impl Harness {
         fn new(options: TooltipOptions) -> Self {
-            Self::with_layer(options, Layer::new())
+            Self::with_content(options, TooltipContent::new("保存").shortcut("Ctrl+S"))
         }
 
-        fn with_layer(options: TooltipOptions, layer: Layer) -> Self {
-            Self::with_content(
-                options,
-                layer,
-                TooltipContent::new("保存").shortcut("Ctrl+S"),
-            )
-        }
-
-        fn with_content(options: TooltipOptions, layer: Layer, content: TooltipContent) -> Self {
+        fn with_content(options: TooltipOptions, content: TooltipContent) -> Self {
             let mut app = TestApp::new();
             let window = app.window_id();
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
@@ -527,15 +600,7 @@ mod tests {
                     .build(tree, root)
                     .expect("触发器")
             };
-            let router = AnimationRouter::new();
-            let tip = Tooltip::new(
-                app.app_mut(),
-                theme.clone(),
-                layer.clone(),
-                router.clone(),
-                "tip",
-                options,
-            );
+            let tip = Tooltip::new(app.app_mut(), theme, "tip", options);
             tip.attach(app.app_mut(), window, trigger);
             tip.set_content(Some(content));
             let _ = app.drain().expect("首帧");
@@ -544,9 +609,6 @@ mod tests {
                 window,
                 trigger,
                 tip,
-                layer,
-                router,
-                theme,
             }
         }
 
@@ -561,15 +623,15 @@ mod tests {
             self.tip.sync(self.app.app_mut())
         }
 
-        fn advance(&mut self, by: Duration) {
+        fn advance(&mut self, by: Duration) -> ui_core::test_support::record::FrameRecord {
             self.app.advance(by);
-            let _ = self.app.drain().expect("帧");
+            self.app.drain().expect("帧").clone()
         }
 
-        fn pump(&mut self, by: Duration) {
+        fn pump(&mut self, by: Duration) -> ui_core::test_support::record::FrameRecord {
             self.app.advance(by);
             let _ = self.sync();
-            let _ = self.app.drain().expect("帧");
+            self.app.drain().expect("帧").clone()
         }
 
         fn settle(&mut self) {
@@ -580,41 +642,6 @@ mod tests {
             let _ = self.app.drain().expect("帧");
         }
 
-        fn open_modal(
-            &mut self,
-            content: impl FnOnce(&mut NodeTree, NodeId) -> Result<(), EngineError>,
-        ) -> Overlay {
-            let dialog = Overlay::new(
-                self.app.app_mut(),
-                self.theme.clone(),
-                self.layer.clone(),
-                self.router.clone(),
-                "dialog",
-                OverlayOptions {
-                    modal: true,
-                    dismiss: DismissPolicy::Explicit,
-                    surface: OverlaySurface::dialog(),
-                    a11y: OverlayA11y::dialog("对话框"),
-                    fade: false,
-                    ..OverlayOptions::default()
-                },
-            );
-            assert!(
-                dialog
-                    .open(
-                        self.app.app_mut(),
-                        self.window,
-                        Anchor::point(LogicalPoint::new(px(50.0), px(50.0))),
-                        content
-                    )
-                    .expect("打开模态对话框")
-            );
-            let _ = self.app.drain().expect("帧");
-            let _ = dialog.sync(self.app.app_mut());
-            let _ = self.app.drain().expect("帧");
-            dialog
-        }
-
         fn trigger_center(&self) -> LogicalPoint {
             let bounds = self.app.probe().bounds(self.trigger).expect("触发器布局");
             LogicalPoint::new(
@@ -622,12 +649,110 @@ mod tests {
                 bounds.origin.y + bounds.size.height * 0.5,
             )
         }
+
+        fn panel_rect(&self) -> LogicalRect {
+            let panel = self.tip.panel_node().expect("面板");
+            self.app.probe().bounds(panel).expect("面板布局")
+        }
+
+        fn pump_until_unloaded(&mut self, frames: usize) -> bool {
+            for _ in 0..frames {
+                self.pump(Duration::from_millis(16));
+                if self.tip.popup_node().is_none() {
+                    return true;
+                }
+            }
+            self.tip.popup_node().is_none()
+        }
+
+        fn texts_of(&self, root: NodeId) -> BTreeSet<String> {
+            let mut texts = BTreeSet::new();
+            collect_texts(
+                self.app.app().window(self.window).expect("窗口").tree(),
+                root,
+                &mut texts,
+            );
+            texts
+        }
+
+        fn modal_open(&self) -> bool {
+            self.app.app().modal_scope(self.window).is_some()
+        }
+
+        fn stack(&self) -> Vec<(PopupId, PopupTier, u64)> {
+            self.app
+                .app()
+                .popup_stack(self.window)
+                .expect("栈")
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry.tier, entry.z))
+                .collect()
+        }
+
+        fn open_modal(
+            &mut self,
+            build: impl FnOnce(&mut NodeTree, NodeId) -> Result<(), EngineError>,
+        ) -> PopupId {
+            let mut spec = PopupSpec::new(
+                ui_core::popup::Anchor::WindowRect(LogicalRect::from_origin_size(
+                    LogicalPoint::new(px(40.0), px(40.0)),
+                    LogicalSize::new(px(1.0), px(1.0)),
+                )),
+                PlacementSpec::default(),
+            );
+            spec.tier = PopupTier::Modal;
+            spec.focus = FocusPolicy::Trap {
+                restore: RestoreFocus::Opener,
+                initial: InitialFocus::Container,
+            };
+            spec.dismiss = DismissPolicy::Explicit {
+                outside: false,
+                escape: true,
+            };
+            spec.animation = ui_core::popup::PopupAnimation::None;
+            let app = self.app.app_mut();
+            let window = self.window;
+            let id = app
+                .open_popup(
+                    window,
+                    spec,
+                    move |app, window, node| {
+                        let Some(target) = app.window_mut(window) else {
+                            return Err(EngineError::UnknownWindow { window });
+                        };
+                        build(target.tree_mut(), node)
+                    },
+                    None,
+                )
+                .expect("打开模态");
+            let _ = self.app.drain().expect("帧");
+            id
+        }
+
+        fn a11y(&mut self) -> A11yTreeSnapshot {
+            self.app.enable_a11y_capture();
+            let _ = self.app.drain().expect("a11y 帧");
+            self.app.a11y().expect("a11y 快照").clone()
+        }
+    }
+
+    fn collect_texts(tree: &NodeTree, node: NodeId, out: &mut BTreeSet<String>) {
+        let Ok(target) = tree.get(node) else {
+            return;
+        };
+        if let ui_core::node::tree::NodeKind::Text(content) = target.kind() {
+            out.insert(content.text.to_string());
+        }
+        for child in target.children() {
+            collect_texts(tree, *child, out);
+        }
     }
 
     #[test]
     fn a_tooltip_opens_only_after_its_delay() {
         let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::from_millis(500),
+            show_delay: Duration::from_millis(500),
             ..TooltipOptions::default()
         });
         harness.hover(harness.trigger_center());
@@ -638,7 +763,7 @@ mod tests {
         );
         assert!(
             !harness.app.app().animations_running(harness.window),
-            "延迟不得用动画驱动（E10 定时器；旧写法会在延迟期每帧 tick）"
+            "延迟不得用动画驱动"
         );
 
         harness.app.advance(Duration::from_millis(250));
@@ -648,11 +773,7 @@ mod tests {
             .frame(harness.window)
             .expect("窗口")
             .expect("帧");
-        assert_eq!(
-            outcome,
-            FrameOutcome::Idle,
-            "定时器等待期不得按帧空转（旧动画延迟会每帧 tick，这里会红）"
-        );
+        assert_eq!(outcome, FrameOutcome::Idle, "定时器等待期不得按帧空转");
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
@@ -663,31 +784,23 @@ mod tests {
         let _ = harness.app.drain().expect("到期帧");
         assert!(
             !harness.tip.is_visible(harness.app.app()),
-            "定时器回调只置位，打开动作由下一轮钩子做（状态机单一入口）"
+            "定时器回调只置位，打开动作由下一轮钩子做"
         );
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()), "延迟结束后显示");
         harness.settle();
-        assert!(harness.tip.overlay().overlay_node().is_some());
+        assert!(harness.tip.popup_node().is_some());
     }
 
     #[test]
-    fn leaving_the_trigger_hides_the_tooltip_and_the_fade_completion_unloads_it() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+    fn leaving_the_trigger_hides_the_tooltip_and_the_close_animation_unloads_it() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()), "零延迟立即显示");
         harness.advance(Duration::from_millis(200));
         let _ = harness.app.drain().expect("淡入帧");
         let _ = harness.sync();
-        assert_eq!(
-            harness.tip.overlay().progress(harness.app.app()),
-            1.0,
-            "淡入完成"
-        );
 
         harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = harness.sync();
@@ -696,36 +809,52 @@ mod tests {
             "离开触发器即收起"
         );
         assert!(
-            harness.tip.overlay().overlay_node().is_some(),
-            "淡出期间节点保留"
+            harness.tip.popup_node().is_some(),
+            "淡出期间节点保留（关闭动画由引擎驱动）"
         );
-        let mut unloaded_in_the_completion_frame = false;
-        for _ in 0..20 {
-            harness.pump(Duration::from_millis(16));
-            if !harness.app.app().animations_running(harness.window) {
-                assert!(
-                    harness.tip.overlay().overlay_node().is_none(),
-                    "动画完成的那一轮 drain 之后节点必须已卸载（完成回调同帧收尾；\
-                     等下一轮 sync 的旧形态会在这里变红）"
-                );
-                unloaded_in_the_completion_frame = true;
-                break;
-            }
-        }
         assert!(
-            unloaded_in_the_completion_frame,
-            "淡出必须在 20 轮内走完并触发完成回调"
+            harness.pump_until_unloaded(20),
+            "淡出必须在 20 轮内走完并卸载节点"
         );
         assert!(!harness.tip.is_visible(harness.app.app()));
-        assert!(!harness.tip.overlay().is_open(harness.app.app()));
+        assert!(harness.stack().is_empty(), "关闭后浮层栈清空");
+    }
+
+    #[test]
+    fn the_close_delay_keeps_the_tooltip_during_a_quick_pointer_jump() {
+        let mut harness = Harness::new(TooltipOptions {
+            show_delay: Duration::ZERO,
+            close_delay: Duration::from_millis(100),
+            ..TooltipOptions::default()
+        });
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(harness.tip.is_visible(harness.app.app()));
+
+        harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
+        let _ = harness.sync();
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "关闭延迟窗口内不得立即收起（离开触发器的宽限）"
+        );
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "宽限内移回：保持显示"
+        );
+
+        harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
+        let _ = harness.sync();
+        harness.advance(Duration::from_millis(120));
+        let _ = harness.app.drain().expect("到期帧");
+        let _ = harness.sync();
+        assert!(!harness.tip.is_visible(harness.app.app()), "宽限到期后收起");
     }
 
     #[test]
     fn focusing_the_trigger_opens_the_tooltip() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness
             .app
             .app_mut()
@@ -738,23 +867,15 @@ mod tests {
     }
 
     #[test]
-    fn the_tooltip_is_placed_above_the_trigger_by_the_overlay_placement() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            placement: Placement::TOP,
-            ..TooltipOptions::default()
-        });
+    fn the_tooltip_is_placed_below_the_trigger_by_the_engine_placement() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         harness.settle();
-        let panel = harness
-            .app
-            .probe()
-            .bounds(harness.tip.overlay().overlay_node().expect("浮层节点"))
-            .expect("面板布局");
+        let panel = harness.panel_rect();
         assert!(
-            (panel.max().y - (TRIGGER.origin.y - 4.0)).value().abs() < 0.5,
-            "Top 定位：面板底边 = 触发器顶边 − gap，实际 {panel:?}"
+            (panel.origin.y - (TRIGGER.max().y + 4.0)).value().abs() < 0.5,
+            "Bottom 定位：面板顶边 = 触发器底边 + gap，实际 {panel:?}"
         );
         assert!(
             (panel.origin.x + panel.size.width * 0.5
@@ -762,31 +883,45 @@ mod tests {
                 .value()
                 .abs()
                 < 0.5,
-            "Top 居中：面板中心应贴触发器中心，实际 {panel:?}"
+            "Bottom 居中：面板中心应贴触发器中心，实际 {panel:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_top_placement_puts_the_tooltip_above_the_trigger() {
+        let placement = PlacementSpec {
+            side: Side::Top,
+            align: Alignment::Center,
+            ..PlacementSpec::default()
+        };
+        let gap = placement.gap;
+        let mut harness = Harness::new(TooltipOptions::default().immediate().placement(placement));
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        harness.settle();
+        let panel = harness.panel_rect();
+        assert!(
+            (panel.max().y - (TRIGGER.origin.y - gap)).value().abs() < 0.5,
+            "TOP 定位：面板底边 = 触发器顶边 - gap，实际 {panel:?}"
+        );
+        assert!(
+            (panel.origin.x + panel.size.width * 0.5
+                - (TRIGGER.origin.x + TRIGGER.size.width * 0.5))
+                .value()
+                .abs()
+                < 0.5,
+            "TOP 居中：面板中心应贴触发器中心，实际 {panel:?}"
         );
     }
 
     #[test]
     fn the_tooltip_renders_its_text_and_shortcut() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         harness.settle();
-        let panel = harness.tip.overlay().panel_node().expect("面板");
-        let mut texts = BTreeSet::new();
-        collect_texts(
-            harness
-                .app
-                .app()
-                .window(harness.window)
-                .expect("窗口")
-                .tree(),
-            panel,
-            &mut texts,
-        );
+        let panel = harness.tip.panel_node().expect("面板");
+        let texts = harness.texts_of(panel);
         assert!(texts.contains("保存"), "提示文本渲染，实际 {texts:?}");
         assert!(texts.contains("Ctrl+S"), "快捷键渲染，实际 {texts:?}");
     }
@@ -796,20 +931,18 @@ mod tests {
         const LONG: &str = "迁移期的提示内容在窄面板里必须按配置的宽度上限换行，而不是把浮层撑成一条横跨整个窗口的细长条。";
 
         fn panel_size(options: TooltipOptions) -> (f32, f32) {
-            let mut harness =
-                Harness::with_content(options.immediate(), Layer::new(), TooltipContent::new(LONG));
+            let mut harness = Harness::with_content(options.immediate(), TooltipContent::new(LONG));
             harness.hover(harness.trigger_center());
             let _ = harness.sync();
             harness.settle();
-            let panel = harness.tip.overlay().panel_node().expect("面板");
-            let bounds = harness.app.probe().bounds(panel).expect("面板布局");
+            let bounds = harness.panel_rect();
             (f32::from(bounds.size.width), f32::from(bounds.size.height))
         }
 
         assert_eq!(
             TooltipOptions::default().max_width,
             px(320.0),
-            "默认恢复旧实现的 320 px 内容上限（W3a F6）"
+            "默认 320 px 内容上限"
         );
         let (default_width, default_height) = panel_size(TooltipOptions::default());
         assert!(
@@ -842,19 +975,15 @@ mod tests {
 
     #[test]
     fn a_tooltip_is_not_interactive_and_declares_the_tooltip_role() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
-        harness.app.enable_a11y_capture();
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         let _ = harness.app.drain().expect("帧");
 
-        let wrapper = harness.tip.overlay().overlay_node().expect("浮层包装节点");
-        let panel = harness.tip.overlay().panel_node().expect("面板");
-        let snapshot = harness.app.a11y().expect("a11y 快照");
-        let record = snapshot.node_for(wrapper).expect("包装节点 a11y");
+        let wrapper = harness.tip.popup_node().expect("浮层内容节点");
+        let panel = harness.tip.panel_node().expect("面板");
+        let snapshot = harness.a11y();
+        let record = snapshot.node_for(wrapper).expect("浮层 a11y");
         assert_eq!(record.role, A11yRole::Tooltip, "提示角色");
         assert_eq!(
             record.label_text(),
@@ -862,23 +991,173 @@ mod tests {
             "可访问名含文本与快捷键"
         );
         assert!(
-            record.actions.is_empty(),
-            "提示没有任何 a11y 动作（不可交互）"
+            record.actions.contains(&A11yAction::HideTooltip),
+            "Tooltip 只暴露 AT 的隐藏动作（dismiss 语义），实际 {:?}",
+            record.actions
+        );
+        assert!(
+            !record.actions.iter().any(|action| matches!(
+                action,
+                A11yAction::Click | A11yAction::Focus | A11yAction::Dismiss
+            )),
+            "提示不得暴露点击 / 聚焦 / dismiss 动作，实际 {:?}",
+            record.actions
         );
         let panel_record = snapshot.node_for(panel).expect("面板 a11y");
         assert_eq!(
             panel_record.role,
             A11yRole::GenericContainer,
-            "面板不得重复声明 Tooltip（E12-R1：AT 不读两层同名角色）"
+            "面板不得重复声明 Tooltip"
+        );
+    }
+
+    #[test]
+    fn a_tooltip_does_not_take_focus() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
+        let other = {
+            let root = harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(harness.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id("focusable")
+                .layout_override(LogicalRect::from_origin_size(
+                    LogicalPoint::new(px(10.0), px(10.0)),
+                    LogicalSize::new(px(20.0), px(20.0)),
+                ))
+                .tab_stop(true)
+                .on_click(Action::Custom(format_smolstr!("focusable.click")))
+                .build(tree, root)
+                .expect("可聚焦节点")
+        };
+        assert!(harness.app.app_mut().set_focus(harness.window, Some(other)));
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        harness.settle();
+        assert!(harness.tip.is_visible(harness.app.app()));
+        assert_eq!(
+            harness.app.app().focused(harness.window),
+            Some(other),
+            "提示打开不得夺走焦点（FocusPolicy::None）"
+        );
+    }
+
+    #[test]
+    fn moving_the_pointer_onto_the_tooltip_keeps_it_shown() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        harness.settle();
+        assert!(harness.tip.is_visible(harness.app.app()));
+        let panel = harness.panel_rect();
+        let center = LogicalPoint::new(
+            panel.origin.x + panel.size.width * 0.5,
+            panel.origin.y + panel.size.height * 0.5,
+        );
+        assert!(!TRIGGER.contains(center), "前置：指针不在触发器内");
+        harness.hover(center);
+        let _ = harness.sync();
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "hover 区域必须包含提示自身 rect（WCAG 1.4.13）"
+        );
+    }
+
+    #[test]
+    fn a_tooltip_does_not_intercept_pointer_input() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
+        let target_rect = LogicalRect::from_origin_size(
+            LogicalPoint::new(px(240.0), px(240.0)),
+            LogicalSize::new(px(260.0), px(120.0)),
+        );
+        let clicks = Rc::new(Cell::new(0_u32));
+        let action = Action::Custom(format_smolstr!("target.click"));
+        let counter = Rc::clone(&clicks);
+        harness
+            .app
+            .app_mut()
+            .on_action(action.clone(), move |_ctx| {
+                counter.set(counter.get() + 1);
+            });
+        let target = {
+            let root = harness
+                .app
+                .app()
+                .window(harness.window)
+                .expect("窗口")
+                .tree()
+                .root();
+            let tree = harness
+                .app
+                .app_mut()
+                .window_mut(harness.window)
+                .expect("窗口")
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id("target")
+                .layout_override(target_rect)
+                .on_click(action)
+                .build(tree, root)
+                .expect("下层控件")
+        };
+
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        harness.settle();
+        assert!(harness.tip.is_visible(harness.app.app()));
+        let panel = harness.panel_rect();
+        let point = LogicalPoint::new(
+            panel.origin.x + panel.size.width * 0.5,
+            panel.origin.y + panel.size.height * 0.5,
+        );
+        assert!(
+            target_rect.contains(point),
+            "前置：提示覆盖在下层控件之上，panel={panel:?} target={target_rect:?}"
+        );
+        let hit = harness
+            .app
+            .app()
+            .window(harness.window)
+            .expect("窗口")
+            .tree()
+            .hit_test(point)
+            .map(|hit| hit.node);
+        assert_eq!(
+            hit,
+            Some(target),
+            "pointer_transparent 提示不得参与指针命中"
+        );
+
+        let _ = harness.app.inject(InputEvent::pointer_down(
+            point,
+            ui_core::event::PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let _ = harness.app.inject(InputEvent::pointer_up(
+            point,
+            ui_core::event::PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let _ = harness.app.drain().expect("帧");
+        assert_eq!(clicks.get(), 1, "提示上的点击必须穿透到下层控件");
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "穿透点击不得关闭提示"
         );
     }
 
     #[test]
     fn withdrawing_the_content_hides_an_open_tooltip() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()));
@@ -887,16 +1166,13 @@ mod tests {
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
-            "撤回内容 = 收起已显示的提示（旧实现的 hover 语义）"
+            "撤回内容 = 收起已显示的提示"
         );
     }
 
     #[test]
     fn re_hovering_during_the_fade_out_shows_the_tooltip_again() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         harness.advance(Duration::from_millis(200));
@@ -906,25 +1182,20 @@ mod tests {
         harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()));
-        assert!(
-            harness.tip.overlay().overlay_node().is_some(),
-            "淡出期间节点还活着"
-        );
+        assert!(harness.tip.popup_node().is_some(), "淡出期间节点还活着");
 
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(
             harness.tip.is_visible(harness.app.app()),
-            "淡出中移回指针：提示立即淡回（撤销关闭）"
+            "淡出中移回指针：提示重新显示"
         );
+        assert!(harness.tip.popup_node().is_some(), "重开后面板节点存在");
     }
 
     #[test]
     fn a_missing_trigger_resets_the_tooltip() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()));
@@ -940,24 +1211,21 @@ mod tests {
         let _ = harness.app.drain().expect("帧");
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()));
-        assert!(harness.tip.overlay().overlay_node().is_none());
+        assert!(
+            harness.pump_until_unloaded(20),
+            "触发器消失后锚点丢失，提示关闭动画结束后卸载"
+        );
     }
 
     #[test]
     fn losing_focus_hides_the_tooltip() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness
             .app
             .app_mut()
             .set_focus(harness.window, Some(harness.trigger));
         let _ = harness.sync();
-        assert!(
-            harness.tip.is_visible(harness.app.app()),
-            "焦点在触发器上时显示"
-        );
+        assert!(harness.tip.is_visible(harness.app.app()), "焦点显示");
 
         harness.app.app_mut().set_focus(harness.window, None);
         let _ = harness.sync();
@@ -968,11 +1236,8 @@ mod tests {
     }
 
     #[test]
-    fn escape_closes_the_tooltip() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+    fn escape_closes_only_the_tooltip() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()));
@@ -983,50 +1248,35 @@ mod tests {
         let _ = harness.app.drain().expect("帧");
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()), "Esc 关闭提示");
-        assert!(harness.tip.overlay().overlay_node().is_none());
+        assert!(harness.pump_until_unloaded(20), "Esc 关闭动画结束后卸载");
+        assert!(harness.stack().is_empty(), "Esc 只关自身且清空提示栈");
     }
 
     #[test]
     fn changing_the_content_while_shown_rebuilds_the_panel() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         harness.advance(Duration::from_millis(200));
-        let _ = harness.app.drain().expect("淡入帧");
         let _ = harness.sync();
-        assert_eq!(
-            harness.tip.overlay().progress(harness.app.app()),
-            1.0,
-            "前置：淡入已完成（否则内容变化走 close_now 立即卸载路径，覆盖不到 pending_restart）"
-        );
-        let old_panel = harness.tip.overlay().panel_node().expect("旧面板");
+        assert!(harness.tip.is_visible(harness.app.app()));
+        let old_panel = harness.tip.panel_node().expect("旧面板");
         assert!(
-            texts_of(&harness, old_panel).contains("保存"),
+            harness.texts_of(old_panel).contains("保存"),
             "前置：屏上是旧文本"
         );
 
-        assert!(
-            harness.tip.set_content(Some(TooltipContent::new("新建"))),
-            "内容变化必须被感知"
-        );
+        assert!(harness.tip.set_content(Some(TooltipContent::new("新建"))));
         let _ = harness.sync();
         assert!(
-            harness.tip.overlay().overlay_node().is_some(),
+            harness.tip.popup_node().is_some(),
             "旧面板先淡出（节点暂时保留）"
         );
-
         harness.pump(Duration::from_millis(16));
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
-            "内容变化的淡出窗口内不得复活旧面板（M4 变异：这里会变可见）"
-        );
-        assert!(
-            harness.tip.overlay().overlay_node().is_some(),
-            "前置：仍在淡出窗口内，旧面板还没卸载"
+            "内容变化的淡出窗口内不得复活旧面板"
         );
 
         for _ in 0..20 {
@@ -1037,10 +1287,10 @@ mod tests {
         }
         assert!(
             harness.tip.is_visible(harness.app.app()),
-            "内容变化后按新内容重新显示"
+            "内容变化后重新显示"
         );
-        let panel = harness.tip.overlay().panel_node().expect("新面板");
-        let texts = texts_of(&harness, panel);
+        let panel = harness.tip.panel_node().expect("新面板");
+        let texts = harness.texts_of(panel);
         assert!(
             texts.contains("新建"),
             "新文本必须重建到屏上，实际 {texts:?}"
@@ -1050,36 +1300,24 @@ mod tests {
 
     #[test]
     fn restoring_content_during_the_fade_rebuilds_with_the_new_text() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         harness.advance(Duration::from_millis(200));
-        let _ = harness.app.drain().expect("淡入帧");
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()));
-        assert_eq!(harness.tip.overlay().progress(harness.app.app()), 1.0);
 
         assert!(harness.tip.set_content(None));
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()));
-        assert!(
-            harness.tip.overlay().overlay_node().is_some(),
-            "前置：撤回后进入淡出窗口"
-        );
+        assert!(harness.tip.popup_node().is_some(), "前置：进入淡出窗口");
         assert!(harness.tip.set_content(Some(TooltipContent::new("新建"))));
 
         harness.pump(Duration::from_millis(16));
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
-            "撤回→恢复不得在淡出窗口内撤销关闭（N1 变异：这里会复活旧面板）"
-        );
-        assert!(
-            harness.tip.overlay().overlay_node().is_some(),
-            "前置：仍在淡出窗口内"
+            "撤回→恢复不得在淡出窗口内撤销关闭"
         );
 
         for _ in 0..20 {
@@ -1088,64 +1326,37 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            harness.tip.is_visible(harness.app.app()),
-            "恢复内容后按新内容重新显示"
-        );
-        let panel = harness.tip.overlay().panel_node().expect("新面板");
-        let texts = texts_of(&harness, panel);
+        assert!(harness.tip.is_visible(harness.app.app()));
+        let panel = harness.tip.panel_node().expect("新面板");
+        let texts = harness.texts_of(panel);
         assert!(
             texts.contains("新建"),
-            "恢复的新文本必须重建到屏上，实际 {texts:?}"
+            "恢复的新文本必须重建，实际 {texts:?}"
         );
         assert!(!texts.contains("保存"), "旧文本不得残留，实际 {texts:?}");
     }
 
     #[test]
     fn re_entering_during_the_content_change_fade_still_rebuilds_the_new_text() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
-        assert!(
-            harness.tip.is_visible(harness.app.app()),
-            "前置：提示已显示"
-        );
         harness.advance(Duration::from_millis(200));
-        let _ = harness.app.drain().expect("淡入帧");
         let _ = harness.sync();
-        assert_eq!(harness.tip.overlay().progress(harness.app.app()), 1.0);
-        let old_panel = harness.tip.overlay().panel_node().expect("旧面板");
-        assert!(
-            texts_of(&harness, old_panel).contains("保存"),
-            "前置：屏上是旧文本"
-        );
+        assert!(harness.tip.is_visible(harness.app.app()));
 
         assert!(harness.tip.set_content(Some(TooltipContent::new("新建"))));
         let _ = harness.sync();
         assert!(!harness.tip.is_visible(harness.app.app()));
-        assert!(
-            harness.tip.overlay().overlay_node().is_some(),
-            "前置：仍在淡出窗口内"
-        );
 
         harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
         let _ = harness.sync();
-        assert!(
-            harness.tip.overlay().overlay_node().is_some(),
-            "前置：离开后仍在淡出窗口内"
-        );
+        assert!(harness.tip.popup_node().is_some(), "离开后仍在淡出窗口内");
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
             "内容变化的淡出窗口内重新进入不得复活旧面板"
-        );
-        assert!(
-            harness.tip.overlay().overlay_node().is_some(),
-            "前置：仍在淡出窗口内，旧面板尚未卸载"
         );
 
         for _ in 0..20 {
@@ -1154,12 +1365,9 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            harness.tip.is_visible(harness.app.app()),
-            "旧面板关闭后必须按新内容重新显示"
-        );
-        let panel = harness.tip.overlay().panel_node().expect("新面板");
-        let texts = texts_of(&harness, panel);
+        assert!(harness.tip.is_visible(harness.app.app()));
+        let panel = harness.tip.panel_node().expect("新面板");
+        let texts = harness.texts_of(panel);
         assert!(
             texts.contains("新建"),
             "重开的面板必须是新文本，实际 {texts:?}"
@@ -1169,10 +1377,7 @@ mod tests {
 
     #[test]
     fn leaving_during_the_delay_prevents_the_stale_deadline_from_showing() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::from_millis(500),
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
@@ -1184,7 +1389,7 @@ mod tests {
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
-            "离开后旧的到期点不得生效（否则提示会在没有悬停时弹出）"
+            "离开后旧的到期点不得生效"
         );
 
         harness.hover(harness.trigger_center());
@@ -1207,10 +1412,7 @@ mod tests {
 
     #[test]
     fn a_modal_scope_suppresses_a_background_tooltip() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         let _dialog = harness.open_modal(|tree, panel| {
             NodeBuilder::boxed()
                 .id("dialog-box")
@@ -1223,188 +1425,252 @@ mod tests {
                 .build(tree, panel)?;
             Ok(())
         });
+        assert!(harness.modal_open(), "前置：模态作用域存在");
+
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
         assert!(
-            harness.app.app().modal_scope(harness.window).is_some(),
-            "前置：模态作用域存在（E12 公开查询面）"
+            !harness.tip.is_visible(harness.app.app()),
+            "背景触发器不得在模态之上打开提示"
+        );
+        assert!(harness.tip.popup_node().is_none());
+        assert!(
+            harness.app.app().hovered(harness.window).is_none(),
+            "模态作用域外的 hover 必须读作 None"
+        );
+        assert!(harness.modal_open(), "提示被抑制后模态作用域保持不变");
+    }
+
+    #[test]
+    fn a_modal_hides_an_open_tooltip_and_blocks_new_ones_until_it_closes() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(harness.tip.is_visible(harness.app.app()));
+
+        let dialog = harness.open_modal(|_, _| Ok(()));
+        let _ = harness.app.drain().expect("帧");
+        let _ = harness.sync();
+        assert!(
+            !harness.tip.is_visible(harness.app.app()),
+            "Modal 打开时 Hint 必须隐藏/关闭"
+        );
+        for _ in 0..20 {
+            harness.pump(Duration::from_millis(16));
+            if harness.tip.popup_node().is_none() {
+                break;
+            }
+        }
+        assert!(harness.tip.popup_node().is_none(), "提示节点被引擎回收");
+        assert!(
+            harness.modal_open(),
+            "前置：模态仍打开（提示关闭不关闭模态）"
         );
 
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(
             !harness.tip.is_visible(harness.app.app()),
-            "背景触发器不得在模态之上打开提示（撤销 E12 的 hover 过滤时这里会红）"
+            "Modal 打开期间任何 Hint 都不得打开（引擎 HintBlockedByModal）"
         );
-        assert!(harness.tip.overlay().overlay_node().is_none());
-        assert!(
-            harness.app.app().hovered(harness.window).is_none(),
-            "模态作用域外的 hover 必须读作 None（E12/R07；引擎过滤是唯一口径）"
-        );
-        assert!(
-            harness.app.app().modal_scope(harness.window).is_some(),
-            "提示被抑制后模态作用域保持不变"
-        );
-    }
+        assert!(harness.tip.popup_node().is_none());
 
-    #[test]
-    fn a_tooltip_triggered_inside_the_modal_scope_still_works_and_stays_above_it() {
-        let mut harness = Harness::new(TooltipOptions {
-            delay: Duration::ZERO,
-            ..TooltipOptions::default()
-        });
-        let inner_slot = Rc::new(Cell::new(None));
-        let slot = Rc::clone(&inner_slot);
-        let dialog = harness.open_modal(move |tree, panel| {
-            let node = NodeBuilder::boxed()
-                .id("inner-trigger")
-                .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(40.0)))
-                .build(tree, panel)?;
-            slot.set(Some(node));
-            Ok(())
-        });
-        let inner = inner_slot.get().expect("模态内的触发器");
-        harness
-            .tip
-            .attach(harness.app.app_mut(), harness.window, inner);
-        let bounds = harness.app.probe().bounds(inner).expect("触发器布局");
-        let center = LogicalPoint::new(
-            bounds.origin.x + bounds.size.width * 0.5,
-            bounds.origin.y + bounds.size.height * 0.5,
-        );
-        harness.hover(center);
-        assert_eq!(
-            harness.app.app().hovered(harness.window),
-            Some(inner),
-            "模态作用域内的悬停必须可见"
-        );
+        assert!(harness.app.app_mut().close_popup(dialog).is_ok());
+        let _ = harness.app.drain().expect("帧");
+        assert!(!harness.modal_open());
+        harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(
             harness.tip.is_visible(harness.app.app()),
-            "模态内部的触发器照常显示提示"
-        );
-        let tip_node = harness.tip.overlay().overlay_node().expect("提示节点");
-        let dialog_node = dialog.overlay_node().expect("对话框节点");
-        let order: Vec<NodeId> = harness
-            .app
-            .app()
-            .overlays(harness.window)
-            .into_iter()
-            .map(|(node, _)| node)
-            .collect();
-        let tip_at = order
-            .iter()
-            .position(|node| *node == tip_node)
-            .expect("提示");
-        let dialog_at = order
-            .iter()
-            .position(|node| *node == dialog_node)
-            .expect("对话框");
-        assert!(
-            tip_at > dialog_at,
-            "提示必须画在对话框之上（Band::Tooltip 最高），实际 {order:?}"
+            "Modal 关闭后由 hover 重新触发提示"
         );
     }
 
     #[test]
-    fn immediate_disables_the_delay() {
-        assert_eq!(
-            TooltipOptions::default().delay,
-            Duration::from_millis(500),
-            "默认延迟 500 ms"
-        );
-        assert_eq!(
-            TooltipOptions::default().immediate().delay,
-            Duration::ZERO,
-            "immediate() 关闭延迟"
-        );
+    fn opening_and_closing_a_tooltip_never_forces_a_full_repaint() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        for _ in 0..3 {
+            let record = harness.pump(Duration::ZERO);
+            assert!(!record.damage_full, "打开提示不得全量重绘");
+        }
+        assert!(harness.tip.is_visible(harness.app.app()));
+
+        harness.hover(LogicalPoint::new(px(10.0), px(10.0)));
+        let _ = harness.sync();
+        for _ in 0..10 {
+            let record = harness.pump(Duration::from_millis(16));
+            assert!(!record.damage_full, "关闭提示不得全量重绘");
+        }
+        assert!(harness.tip.popup_node().is_none(), "关闭动画在 10 帧内走完");
     }
 
     #[test]
-    fn a_tooltip_is_above_a_context_menu_in_the_shared_layer() {
-        let mut harness = Harness::with_layer(
-            TooltipOptions {
-                delay: Duration::ZERO,
-                ..TooltipOptions::default()
-            },
-            Layer::new(),
-        );
+    fn releasing_a_visible_tooltip_unloads_it() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
         harness.hover(harness.trigger_center());
         let _ = harness.sync();
         assert!(harness.tip.is_visible(harness.app.app()));
-        let tip_node = harness.tip.overlay().overlay_node().expect("提示节点");
+        harness.tip.release(harness.app.app_mut());
+        assert!(harness.tip.popup_node().is_none(), "release 立即卸载面板");
+        assert!(harness.stack().is_empty(), "release 清空浮层栈");
+        let _ = harness.sync();
+        assert!(!harness.tip.is_visible(harness.app.app()));
+    }
 
-        let menu = Overlay::new(
-            harness.app.app_mut(),
-            harness.theme.clone(),
-            harness.layer.clone(),
-            harness.router.clone(),
-            "menu",
-            OverlayOptions {
-                band: Band::ContextMenu,
-                dismiss: DismissPolicy::Explicit,
-                fade: false,
-                ..OverlayOptions::default()
-            },
+    #[test]
+    fn immediate_disables_both_delays() {
+        assert_eq!(
+            TooltipOptions::default().show_delay,
+            Duration::from_millis(500),
+            "默认显示延迟 500 ms"
         );
-        assert!(
-            menu.open(
-                harness.app.app_mut(),
-                harness.window,
-                Anchor::point(LogicalPoint::new(px(20.0), px(20.0))),
-                |_, _| Ok(())
-            )
-            .expect("打开菜单")
+        assert_eq!(
+            TooltipOptions::default().close_delay,
+            Duration::from_millis(100),
+            "默认关闭延迟 100 ms"
         );
-        let menu_node = menu.overlay_node().expect("菜单节点");
-
-        let order: Vec<NodeId> = harness
-            .app
-            .app()
-            .overlays(harness.window)
-            .into_iter()
-            .map(|(node, _)| node)
-            .collect();
-        let menu_at = order
-            .iter()
-            .position(|node| *node == menu_node)
-            .expect("菜单");
-        let tip_at = order
-            .iter()
-            .position(|node| *node == tip_node)
-            .expect("提示");
-        assert!(
-            tip_at > menu_at,
-            "提示必须在 context menu 之上（共享层带 Tooltip > ContextMenu），实际 {order:?}"
+        let immediate = TooltipOptions::default().immediate();
+        assert_eq!(
+            immediate.show_delay,
+            Duration::ZERO,
+            "immediate() 关闭显示延迟"
+        );
+        assert_eq!(
+            immediate.close_delay,
+            Duration::ZERO,
+            "immediate() 关闭关闭延迟"
         );
     }
 
-    fn texts_of(harness: &Harness, root: NodeId) -> BTreeSet<String> {
-        let mut texts = BTreeSet::new();
-        collect_texts(
-            harness
-                .app
-                .app()
-                .window(harness.window)
-                .expect("窗口")
-                .tree(),
-            root,
-            &mut texts,
+    #[test]
+    fn a_tooltip_does_not_close_an_open_menu_and_stays_above_it() {
+        let mut harness = Harness::new(TooltipOptions::default().immediate());
+        let mut menu_spec = PopupSpec::new(
+            ui_core::popup::Anchor::WindowRect(LogicalRect::from_origin_size(
+                LogicalPoint::new(px(20.0), px(20.0)),
+                LogicalSize::new(px(1.0), px(1.0)),
+            )),
+            PlacementSpec::default(),
         );
-        texts
+        menu_spec.tier = PopupTier::Auto;
+        menu_spec.focus = FocusPolicy::None;
+        menu_spec.animation = ui_core::popup::PopupAnimation::None;
+        let app = harness.app.app_mut();
+        let window = harness.window;
+        let menu = app
+            .open_popup(window, menu_spec, |_, _, _| Ok(()), None)
+            .expect("打开菜单");
+        let _ = harness.app.drain().expect("菜单帧");
+
+        harness.hover(harness.trigger_center());
+        let _ = harness.sync();
+        assert!(
+            harness.tip.is_visible(harness.app.app()),
+            "提示可以叠加在菜单上"
+        );
+        let stack = harness.stack();
+        let menu_entry = stack
+            .iter()
+            .find(|(id, _, _)| *id == menu)
+            .copied()
+            .expect("菜单仍在栈里（Hint 不得关闭 Auto 根）");
+        let tip_node = harness.tip.popup_node().expect("提示节点");
+        let entries = harness.app.app().popup_stack(harness.window).expect("栈");
+        let tip_entry = entries
+            .entries
+            .iter()
+            .find(|entry| entry.node == tip_node)
+            .copied()
+            .expect("提示条目");
+        assert_eq!(menu_entry.1, PopupTier::Auto);
+        assert!(tip_entry.z > menu_entry.2, "提示 z 高于已打开的菜单");
     }
 
-    fn collect_texts(
-        tree: &ui_core::node::tree::NodeTree,
-        node: NodeId,
-        out: &mut BTreeSet<String>,
-    ) {
-        let Ok(target) = tree.get(node) else {
-            return;
+    #[test]
+    fn scrolling_the_anchor_repositions_the_tooltip_and_hides_it_when_it_leaves_the_view() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let page = {
+            let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
+            NodeBuilder::boxed()
+                .id("tooltip-page")
+                .style(
+                    StyleBuilder::new()
+                        .relative()
+                        .width(px(800.0))
+                        .height(px(300.0))
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("页面")
         };
-        if let ui_core::node::tree::NodeKind::Text(content) = target.kind() {
-            out.insert(content.text.to_string());
-        }
-        for child in target.children() {
-            collect_texts(tree, *child, out);
-        }
+        let trigger = {
+            let tree = app.app_mut().window_mut(window).expect("窗口").tree_mut();
+            NodeBuilder::boxed()
+                .id("tooltip-scroll-trigger")
+                .layout_override(LogicalRect::new(px(20.0), px(20.0), px(100.0), px(40.0)))
+                .build(tree, page)
+                .expect("触发器")
+        };
+        let scroll = app
+            .app_mut()
+            .make_scroll(window, page, ScrollConfig::default())
+            .expect("滚动容器");
+        app.app_mut()
+            .set_scroll_content(&scroll, LogicalSize::new(px(800.0), px(2400.0)))
+            .expect("滚动内容");
+        let tip = Tooltip::new(
+            app.app_mut(),
+            theme,
+            "scroll-tip",
+            TooltipOptions::default().immediate(),
+        );
+        tip.attach(app.app_mut(), window, trigger);
+        tip.set_content(Some(TooltipContent::new("保存")));
+        let _ = app.drain().expect("首帧");
+
+        let _ = app.inject(InputEvent::pointer_move(
+            LogicalPoint::new(px(70.0), px(40.0)),
+            Modifiers::empty(),
+        ));
+        let _ = app.drain().expect("悬停帧");
+        let _ = tip.sync(app.app_mut());
+        assert!(tip.is_visible(app.app()), "悬停后提示必须显示");
+        let node = tip.popup_node().expect("提示节点");
+        let id = app
+            .app()
+            .popup_stack(window)
+            .expect("栈")
+            .entries
+            .iter()
+            .find(|entry| entry.node == node)
+            .expect("提示条目")
+            .id;
+        let before = app.app().popup_rect(id).expect("提示 rect").hit;
+
+        app.app_mut()
+            .scroll_to(&scroll, LogicalPoint::new(px(0.0), px(10.0)))
+            .expect("滚动");
+        let _ = app.drain().expect("滚动帧");
+        let _ = tip.sync(app.app_mut());
+        assert!(tip.is_visible(app.app()), "锚点仍可见时提示保持显示");
+        let after = app.app().popup_rect(id).expect("提示 rect").hit;
+        assert_ne!(after.origin, before.origin, "滚动后提示必须重新定位");
+
+        app.app_mut()
+            .scroll_to(&scroll, LogicalPoint::new(px(0.0), px(200.0)))
+            .expect("滚出视口");
+        let _ = app.drain().expect("滚出帧");
+        let _ = tip.sync(app.app_mut());
+        assert!(!tip.is_visible(app.app()), "锚点滚出视口必须隐藏提示");
+        assert!(
+            tip.popup_node().is_none(),
+            "隐藏必须立即卸载提示（不得进入关闭延迟）"
+        );
     }
 }

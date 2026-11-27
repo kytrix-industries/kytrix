@@ -449,6 +449,7 @@ fn merge_a11y(base: &mut A11yPatch, over: A11yPatch) {
         checked,
         selected,
         expanded,
+        has_popup,
         live,
         pos_in_set,
         size_of_set,
@@ -492,6 +493,7 @@ struct ListInner {
     pending_text_measure: Cell<Option<FrameIndex>>,
     geometry: RefCell<Geometry>,
     select_action: Action,
+    row_action: RefCell<Option<Action>>,
     activate: RefCell<Option<Rc<dyn Fn(&mut App, usize)>>>,
     scrollbar: ScrollBar,
 }
@@ -535,6 +537,7 @@ impl List {
                 geometry: RefCell::new(Geometry::default()),
                 content: Rc::new(content),
                 select_action: Action::Custom(format_smolstr!("{key}.select")),
+                row_action: RefCell::new(None),
                 activate: RefCell::new(None),
                 scrollbar,
                 theme,
@@ -762,6 +765,10 @@ impl List {
 
     pub fn on_activate(&self, callback: impl Fn(&mut App, usize) + 'static) {
         *self.inner.activate.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    pub(crate) fn set_row_action(&self, action: Action) {
+        *self.inner.row_action.borrow_mut() = Some(action);
     }
 
     pub fn set_items(&self, app: &mut App, count: usize) -> Result<(), EngineError> {
@@ -1101,7 +1108,7 @@ impl List {
             };
             let row_theme = theme.clone();
             let a11y_inner = inner.clone();
-            NodeBuilder::boxed()
+            let mut row = NodeBuilder::boxed()
                 .id(format_smolstr!("{key}:row:{index}"))
                 .style(row_style)
                 .bind_style(move |cx| {
@@ -1132,7 +1139,11 @@ impl List {
                         merge_a11y(&mut patch, row_a11y(cx, index));
                     }
                     patch
-                })
+                });
+            if let Some(action) = inner.row_action.borrow().clone() {
+                row = row.on_click(action);
+            }
+            row
         }
     }
 

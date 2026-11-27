@@ -6,14 +6,14 @@ use market_participants_connector::{
 };
 use market_participants_model::display::lexical::scope_display_code;
 use smol_str::SmolStr;
-use ui_core::error::EngineError;
-use ui_kit::kit::{brand::BrandError, dialog::DialogError, icon::IconError, overlay::OverlayError};
+use ui_core::{error::EngineError, popup::PopupError};
+use ui_kit::kit::{brand::BrandError, dialog::DialogError, icon::IconError};
 use widget::{error::TranslatedError, venue::VenueDisplay};
 
 #[derive(Debug)]
 pub enum MenuError {
     Engine(EngineError),
-    Overlay(OverlayError),
+    Popup(PopupError),
     Dialog(DialogError),
     Icon(IconError),
     Brand(BrandError),
@@ -25,9 +25,9 @@ impl From<EngineError> for MenuError {
     }
 }
 
-impl From<OverlayError> for MenuError {
-    fn from(error: OverlayError) -> Self {
-        Self::Overlay(error)
+impl From<PopupError> for MenuError {
+    fn from(error: PopupError) -> Self {
+        Self::Popup(error)
     }
 }
 
@@ -53,7 +53,7 @@ impl fmt::Display for MenuError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Engine(error) => write!(formatter, "engine error: {error}"),
-            Self::Overlay(error) => write!(formatter, "panel overlay error: {error}"),
+            Self::Popup(error) => write!(formatter, "panel popup error: {error}"),
             Self::Dialog(error) => write!(formatter, "alert dialog error: {error}"),
             Self::Icon(error) => write!(formatter, "menu icon error: {error}"),
             Self::Brand(error) => write!(formatter, "venue brand error: {error}"),
@@ -65,7 +65,7 @@ impl std::error::Error for MenuError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Engine(error) => Some(error),
-            Self::Overlay(error) => Some(error),
+            Self::Popup(error) => Some(error),
             Self::Dialog(error) => Some(error),
             Self::Icon(error) => Some(error),
             Self::Brand(error) => Some(error),

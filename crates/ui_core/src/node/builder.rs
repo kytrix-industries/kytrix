@@ -38,6 +38,7 @@ pub struct NodeBuilder {
     a11y: Option<crate::a11y::A11yOverride>,
     bind_a11y: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> crate::a11y::A11yPatch>>,
     tab_stop: bool,
+    hit_focus_skip: crate::node::tree::HitFocusSkip,
 }
 
 impl Default for NodeBuilder {
@@ -66,6 +67,7 @@ impl NodeBuilder {
             a11y: None,
             bind_a11y: None,
             tab_stop: true,
+            hit_focus_skip: crate::node::tree::HitFocusSkip::None,
         }
     }
 
@@ -89,6 +91,12 @@ impl NodeBuilder {
     #[must_use]
     pub fn tab_stop(mut self, tab_stop: bool) -> Self {
         self.tab_stop = tab_stop;
+        self
+    }
+
+    #[must_use]
+    pub fn hit_focus_skip(mut self, skip: crate::node::tree::HitFocusSkip) -> Self {
+        self.hit_focus_skip = skip;
         self
     }
 
@@ -316,6 +324,9 @@ impl NodeBuilder {
         }
         if !self.tab_stop {
             spec = spec.with_tab_stop(false);
+        }
+        if self.hit_focus_skip != crate::node::tree::HitFocusSkip::None {
+            spec = spec.with_hit_focus_skip(self.hit_focus_skip);
         }
         tree.insert_child(parent, spec)
     }

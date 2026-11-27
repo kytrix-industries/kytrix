@@ -25,9 +25,8 @@ use ui_core::{
 use ui_kit::{
     kit::{
         button::Button,
-        dialog::{Dialog, DialogBuilder, DialogError},
+        dialog::{Dialog, DialogBuilder},
         markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
-        overlay::OverlayError,
         progress::Progress,
         scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
         separator::Separator,
@@ -36,7 +35,7 @@ use ui_kit::{
     },
     theme::{handle::ThemeHandle, role::Role},
 };
-use widget::services::WidgetServices;
+use widget::{error::dialog_engine_error, services::WidgetServices};
 
 use crate::{
     publish,
@@ -152,7 +151,6 @@ impl Built {
 
 pub(crate) struct UpdateDialog {
     key: SmolStr,
-    services: Rc<WidgetServices>,
     theme: ThemeHandle,
     translate: Translate,
     view: Signal<Option<UpdaterView>>,
@@ -180,7 +178,6 @@ impl UpdateDialog {
             theme: services.theme.clone(),
             translate: services.translate.clone(),
             language: services.language,
-            services,
             view,
             shown,
             updater,
@@ -250,13 +247,9 @@ impl UpdateDialog {
             .build(
                 app,
                 self.theme.clone(),
-                (*self.services.layer).clone(),
-                (*self.services.animation_router).clone(),
                 format_smolstr!("{}.dialog", self.key),
             );
-        dialog
-            .open(app, window)
-            .map_err(|error| dialog_error(error, window))?;
+        dialog.open(app, window).map_err(dialog_engine_error)?;
         self.dialog = Some(dialog);
         Ok(())
     }
@@ -269,7 +262,7 @@ impl UpdateDialog {
             return Ok(());
         };
         if dialog.is_open(app) {
-            if !dialog.is_closing() {
+            if !dialog.is_closing(app) {
                 let live = *app.read(&self.view);
                 if *app.read(&self.shown) != live {
                     let _ = app.write(&self.shown, live);
@@ -298,10 +291,8 @@ impl UpdateDialog {
                 }
             }
         }
-        dialog
-            .sync(app)
-            .map_err(|error| dialog_error(error, window))?;
-        if !dialog.is_open(app) && !dialog.is_closing() {
+        dialog.sync(app).map_err(dialog_engine_error)?;
+        if !dialog.is_open(app) && !dialog.is_closing(app) {
             self.release_built(app);
         }
         Ok(())
@@ -319,10 +310,10 @@ impl UpdateDialog {
             .is_some_and(|dialog| dialog.is_open(app))
     }
 
-    pub(crate) fn is_closing(&self) -> bool {
+    pub(crate) fn is_closing(&self, app: &App) -> bool {
         self.dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.is_closing())
+            .is_some_and(|dialog| dialog.is_closing(app))
     }
 
     pub(crate) fn release(&mut self, app: &mut App) -> usize {
@@ -957,14 +948,6 @@ fn tree_mut(app: &mut App, window: WindowId) -> Result<&mut NodeTree, EngineErro
         .tree_mut())
 }
 
-fn dialog_error(error: DialogError, window: WindowId) -> EngineError {
-    match error {
-        DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
-        DialogError::Overlay(OverlayError::PlacementConfig { .. }) | DialogError::NotOpen => {
-            EngineError::UnknownWindow { window }
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1032,7 +1015,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "the dialog draws its content (overlays: {}, text: {:?})",
-                    harness.layer.len(harness.window()),
+                    harness.popup_count(),
                     harness.text_of(harness.root())
                 )
             })
@@ -1380,7 +1363,7 @@ mod tests {
             "cancelling offers the release again straight away"
         );
         assert!(
-            updater.test_dialog_closing(),
+            updater.test_dialog_closing(harness.app.app()),
             "the dialog keeps drawing while its exit plays"
         );
         let content_after = content(&harness);
@@ -1437,15 +1420,20 @@ mod tests {
         harness.settle(4);
         assert!(updater.test_dialog_open(harness.app.app()));
         assert!(
-            !harness.layer.is_empty(harness.window()),
-            "the dialog's overlay is in the composition root's layer stack"
+            harness.popup_count() > 0,
+            "the dialog is in the window's popup stack"
         );
 
         updater.release(harness.app.app_mut());
 
         assert!(
-            harness.layer.is_empty(harness.window()),
-            "releasing removes the overlay from the same stack"
+            harness.popup_count() == 0,
+            "releasing removes the dialog from the same stack"
+        );
+        assert_eq!(
+            harness.popup_total(),
+            0,
+            "releasing removes the dialog's scrim together with it"
         );
         assert_eq!(harness.router.len(), routes);
         assert_eq!(

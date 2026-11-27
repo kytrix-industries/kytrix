@@ -26,10 +26,7 @@ use settings_ui::{
 };
 use tokio::runtime::Handle;
 use ui_core::{app::App, node::signal::Signal};
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
+use ui_kit::theme::{appearance::Appearance, handle::ThemeHandle};
 use updater_ui::updater::UpdaterDeps;
 use widget::{frame::FrameRouter, services::WidgetServices};
 use widget_registry::{catalogue, registry::WidgetRegistry};
@@ -146,23 +143,13 @@ impl ConfigHub {
         let theme = ThemeHandle::new(app, appearance_of(initial.appearance));
         let translate = crate::test_support::translate(i18n::language::codes::LanguageCode::En);
         let runtime = app.runtime_handle().clone();
-        let layer = Rc::new(Layer::new());
         let frame_router =
             Rc::new(FrameRouter::new(app).expect("the test host installs the route"));
-        let animation_router = Rc::new(AnimationRouter::new());
         let services = Rc::new(
-            WidgetServices::builder(
-                app,
-                runtime,
-                translate.clone(),
-                theme.clone(),
-                layer,
-                frame_router,
-                animation_router,
-            )
-            .language(i18n::language::codes::LanguageCode::En)
-            .config(initial.as_ref().clone())
-            .build(),
+            WidgetServices::builder(app, runtime, translate.clone(), theme.clone(), frame_router)
+                .language(i18n::language::codes::LanguageCode::En)
+                .config(initial.as_ref().clone())
+                .build(),
         );
         let network: ConfigNotification<NetworkConfig> =
             ConfigNotification::new(Arc::new(initial.as_ref().network_config()));
@@ -209,9 +196,7 @@ pub(crate) struct Composition {
     pub theme: ThemeHandle,
     pub translate: Translate,
     pub services: Rc<WidgetServices>,
-    pub layer: Rc<Layer>,
     pub frame_router: Rc<FrameRouter>,
-    pub animation_router: Rc<AnimationRouter>,
     pub catalogue: Rc<WidgetRegistry>,
     pub market_participants: Option<MarketParticipantsConnector>,
     accounts: Arc<KytrixServiceConnector>,
@@ -270,9 +255,7 @@ impl Composition {
             crate::language::code(initial.language),
         );
 
-        let layer = Rc::new(Layer::new());
         let frame_router = Rc::new(FrameRouter::new(app)?);
-        let animation_router = Rc::new(AnimationRouter::new());
 
         let transport = Arc::new(TransportHub::new(transport_policy()));
         let network: ConfigNotification<NetworkConfig> =
@@ -294,9 +277,7 @@ impl Composition {
                 runtime.clone(),
                 translate.clone(),
                 theme.clone(),
-                Rc::clone(&layer),
                 Rc::clone(&frame_router),
-                Rc::clone(&animation_router),
             )
             .language(crate::language::code(initial.language))
             .config(initial.as_ref().clone())
@@ -352,9 +333,7 @@ impl Composition {
             theme,
             translate,
             services,
-            layer,
             frame_router,
-            animation_router,
             catalogue: Rc::new(catalogue::registry()?),
             market_participants,
             accounts,

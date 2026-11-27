@@ -1,0 +1,5277 @@
+use std::time::Duration;
+
+use ui_core::{
+    event::{Action, Event, ImeEvent, InputEvent, KeyCode, Modifiers, PointerButton},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
+    node::{builder::NodeBuilder, id::NodeId},
+    paint::{
+        color::Color,
+        style::{Clip, PaintSpec},
+        style_builder::StyleBuilder,
+    },
+    popup::{
+        Alignment, Anchor, DismissOutcome, DismissPolicy, DismissReason, EscapePolicy, FocusPolicy,
+        InitialFocus, Placement, PlacementSpec, PopupA11y, PopupAnimation, PopupId, PopupSpec,
+        PopupState, PopupTier, RestoreFocus, ScrimSpec, Side,
+    },
+    test_support::app::TestApp,
+    window::WindowId,
+};
+
+fn rect(x: f32, y: f32, width: f32, height: f32) -> LogicalRect {
+    LogicalRect::new(px(x), px(y), px(width), px(height))
+}
+
+fn point(x: f32, y: f32) -> LogicalPoint {
+    LogicalPoint::new(px(x), px(y))
+}
+
+fn win(app: &TestApp) -> WindowId {
+    app.window_id()
+}
+
+fn build_box(app: &mut TestApp, parent: NodeId, size: (f32, f32), background: Color) -> NodeId {
+    let window = win(app);
+    NodeBuilder::boxed()
+        .style(StyleBuilder::new().size(px(size.0), px(size.1)).build())
+        .paint(PaintSpec {
+            background,
+            ..PaintSpec::default()
+        })
+        .build(
+            app.app_mut().window_mut(window).expect("window").tree_mut(),
+            parent,
+        )
+        .expect("box")
+}
+
+fn build_button(
+    app: &mut TestApp,
+    parent: NodeId,
+    size: (f32, f32),
+    action: &'static str,
+) -> NodeId {
+    let window = win(app);
+    NodeBuilder::boxed()
+        .style(StyleBuilder::new().size(px(size.0), px(size.1)).build())
+        .paint(PaintSpec {
+            background: Color::WHITE,
+            ..PaintSpec::default()
+        })
+        .on_click(Action::custom(action))
+        .build(
+            app.app_mut().window_mut(window).expect("window").tree_mut(),
+            parent,
+        )
+        .expect("button")
+}
+
+fn root_node(app: &TestApp) -> NodeId {
+    let window = win(app);
+    app.app().window(window).expect("window").tree().root()
+}
+
+fn root_box(app: &mut TestApp, size: (f32, f32), background: Color) -> NodeId {
+    let parent = root_node(app);
+    build_box(app, parent, size, background)
+}
+
+fn root_button(app: &mut TestApp, size: (f32, f32), action: &'static str) -> NodeId {
+    let parent = root_node(app);
+    build_button(app, parent, size, action)
+}
+
+fn base_spec(anchor: Anchor) -> PopupSpec {
+    let mut spec = PopupSpec::new(anchor, PlacementSpec::default());
+    spec.animation = PopupAnimation::None;
+    spec.focus = FocusPolicy::None;
+    spec
+}
+
+fn menu_placement() -> PlacementSpec {
+    PlacementSpec::submenu()
+}
+
+fn open_sized(
+    app: &mut TestApp,
+    spec: PopupSpec,
+    size: (f32, f32),
+    on_dismiss: Option<
+        Box<dyn Fn(&mut ui_core::app::App, ui_core::popup::PopupDismiss) -> DismissOutcome>,
+    >,
+) -> PopupId {
+    let window = win(app);
+    app.app_mut()
+        .open_popup(
+            window,
+            spec,
+            move |app, window, node| {
+                let target = app.window_mut(window).expect("window");
+                NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(size.0), px(size.1)).build())
+                    .paint(PaintSpec {
+                        background: Color::WHITE,
+                        ..PaintSpec::default()
+                    })
+                    .build(target.tree_mut(), node)?;
+                Ok(())
+            },
+            on_dismiss,
+        )
+        .expect("open popup")
+}
+
+fn open_child(app: &mut TestApp, parent: PopupId, anchor: Anchor, size: (f32, f32)) -> PopupId {
+    let mut spec = base_spec(anchor);
+    spec.parent = Some(parent);
+    spec.placement = menu_placement();
+    open_sized(app, spec, size, None)
+}
+
+fn popup_node(app: &TestApp, id: PopupId) -> NodeId {
+    app.app()
+        .popup_stack(win(app))
+        .expect("stack")
+        .entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .map_or_else(|| panic!("popup {id:?} missing"), |entry| entry.node)
+}
+
+fn frame(app: &mut TestApp) {
+    app.drain().expect("frame");
+}
+
+fn stable_frame(app: &mut TestApp) {
+    let id = app
+        .app()
+        .popup_stack(win(app))
+        .expect("stack")
+        .entries
+        .first()
+        .map(|entry| entry.id);
+    if let Some(id) = id {
+        let node = popup_node(app, id);
+        let w = win(app);
+        app.app_mut()
+            .request_node_repaint(w, node)
+            .expect("repaint");
+    }
+    frame(app);
+}
+
+fn press(app: &mut TestApp, position: LogicalPoint) -> (ui_core::event::InputOutcome, bool) {
+    let window = win(app);
+    app.app_mut().dispatch_input_tracked_for_test(
+        window,
+        InputEvent::pointer_down(position, PointerButton::Primary, Modifiers::empty()),
+    )
+}
+
+fn release(app: &mut TestApp, position: LogicalPoint) -> (ui_core::event::InputOutcome, bool) {
+    let window = win(app);
+    app.app_mut().dispatch_input_tracked_for_test(
+        window,
+        InputEvent::pointer_up(position, PointerButton::Primary, Modifiers::empty()),
+    )
+}
+
+fn escape(app: &mut TestApp) -> (ui_core::event::InputOutcome, bool) {
+    let window = win(app);
+    app.app_mut().dispatch_input_tracked_for_test(
+        window,
+        InputEvent::key_down(KeyCode::Escape, Modifiers::empty()),
+    )
+}
+
+#[test]
+fn opening_a_popup_settles_geometry_in_the_first_frame() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0))),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    let first = app.app().popup_rect(id).expect("rect");
+    assert_eq!(first.hit, rect(100.0, 124.0, 120.0, 80.0));
+    assert_eq!(first.a11y, first.hit);
+    assert!(!first.paint.is_empty());
+    assert_eq!(
+        app.frame_record().stats.popup_settle_rounds,
+        2,
+        "首帧必须完成尺寸轮与定位轮"
+    );
+    assert!(!app.frame_record().stats.popup_unsettled);
+    stable_frame(&mut app);
+    assert_eq!(
+        app.app().popup_rect(id).expect("rect").hit,
+        first.hit,
+        "首可见帧 rect 必须等于稳定帧"
+    );
+    assert_eq!(app.frame_record().stats.popup_settle_rounds, 0);
+}
+
+#[test]
+fn content_growth_settles_in_one_frame_without_a_second_displacement() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0))),
+        (80.0, 40.0),
+        None,
+    );
+    frame(&mut app);
+    let node = popup_node(&app, id);
+    let window = win(&app);
+    NodeBuilder::boxed()
+        .style(StyleBuilder::new().size(px(200.0), px(40.0)).build())
+        .build(
+            app.app_mut().window_mut(window).expect("window").tree_mut(),
+            node,
+        )
+        .expect("child");
+    frame(&mut app);
+    let grown = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(grown.size, LogicalSize::new(px(280.0), px(40.0)));
+    assert!(!app.frame_record().stats.popup_unsettled);
+    stable_frame(&mut app);
+    assert_eq!(app.app().popup_rect(id).expect("rect").hit, grown);
+}
+
+#[test]
+fn a_scrolled_anchor_carries_the_popup_in_the_same_frame() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let container = {
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        let mut style = StyleBuilder::new().size(px(200.0), px(100.0)).build();
+        style.clip = Clip::Bounds;
+        let container = NodeBuilder::boxed()
+            .style(style)
+            .build(tree, tree.root())
+            .expect("container");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(200.0), px(600.0)).build())
+            .build(tree, container)
+            .expect("content");
+        container
+    };
+    app.app_mut()
+        .make_scroll(
+            window,
+            container,
+            ui_core::interaction::ScrollConfig::default(),
+        )
+        .expect("scroll");
+    let handle = app
+        .app()
+        .scroll_handle(window, container)
+        .expect("scroll handle");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(600.0)))
+        .expect("content");
+    frame(&mut app);
+    let content_node = app
+        .app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(container)
+        .expect("container")
+        .children()[0];
+    let item = {
+        let window = win(&app);
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(200.0), px(40.0))
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(200.0))
+                    .build(),
+            )
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                content_node,
+            )
+            .expect("item")
+    };
+    frame(&mut app);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::Node { node: item }),
+        (100.0, 40.0),
+        None,
+    );
+    frame(&mut app);
+    let before = app.app().popup_rect(id).expect("rect").hit;
+    let handle = app
+        .app()
+        .scroll_handle(window, container)
+        .expect("scroll handle");
+    app.app_mut()
+        .scroll_to(&handle, point(0.0, 120.0))
+        .expect("scroll");
+    frame(&mut app);
+    let after = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(after.origin.y, before.origin.y - 120.0);
+    assert_eq!(after.origin.x, before.origin.x);
+    stable_frame(&mut app);
+    assert_eq!(app.app().popup_rect(id).expect("rect").hit, after);
+}
+
+#[test]
+fn a_popup_flips_above_when_the_bottom_does_not_fit() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 540.0, 60.0, 20.0))),
+        (120.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    let hit = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(
+        hit,
+        rect(100.0, 416.0, 120.0, 120.0),
+        "flip 到锚点上方并保留 gap"
+    );
+}
+
+#[test]
+fn a_window_resize_reclamps_the_popup() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(400.0, 100.0, 60.0, 20.0))),
+        (200.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    let before = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(before, rect(400.0, 124.0, 200.0, 80.0));
+    let window = win(&app);
+    app.app_mut()
+        .window_mut(window)
+        .expect("window")
+        .set_size(LogicalSize::new(px(500.0), px(400.0)));
+    frame(&mut app);
+    let after = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(after.max().x, px(496.0), "必须按 viewport margin 夹取");
+    assert!(after.origin.x < before.origin.x);
+}
+
+#[test]
+fn three_menu_levels_follow_the_parent_without_a_frame_lag() {
+    let mut app = TestApp::new();
+    let first = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0))),
+        (120.0, 160.0),
+        None,
+    );
+    frame(&mut app);
+    let first_node = popup_node(&app, first);
+    let item = {
+        let window = win(&app);
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(120.0), px(24.0))
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(32.0))
+                    .build(),
+            )
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                first_node,
+            )
+            .expect("item")
+    };
+    frame(&mut app);
+    let second = open_child(&mut app, first, Anchor::Node { node: item }, (80.0, 60.0));
+    frame(&mut app);
+    let second_node = popup_node(&app, second);
+    let sub_item = {
+        let window = win(&app);
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(80.0), px(24.0))
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(8.0))
+                    .build(),
+            )
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                second_node,
+            )
+            .expect("sub item")
+    };
+    frame(&mut app);
+    let third = open_child(
+        &mut app,
+        second,
+        Anchor::Node { node: sub_item },
+        (70.0, 40.0),
+    );
+    frame(&mut app);
+    let origin_first = app.app().popup_rect(first).expect("rect").hit;
+    let origin_second = app.app().popup_rect(second).expect("rect").hit;
+    let origin_third = app.app().popup_rect(third).expect("rect").hit;
+    assert_eq!(origin_second.origin.y, origin_first.origin.y + 32.0);
+    assert_eq!(origin_second.origin.x, origin_first.origin.x + 120.0 + 4.0);
+    assert_eq!(origin_third.origin.y, origin_second.origin.y + 8.0);
+    assert_eq!(origin_third.origin.x, origin_second.origin.x + 80.0 + 4.0);
+    app.app_mut()
+        .set_popup_anchor(first, Anchor::WindowRect(rect(300.0, 260.0, 60.0, 20.0)))
+        .expect("re-anchor");
+    frame(&mut app);
+    let moved_first = app.app().popup_rect(first).expect("rect").hit;
+    let moved_second = app.app().popup_rect(second).expect("rect").hit;
+    let moved_third = app.app().popup_rect(third).expect("rect").hit;
+    let delta = LogicalPoint::new(
+        moved_first.origin.x - origin_first.origin.x,
+        moved_first.origin.y - origin_first.origin.y,
+    );
+    assert_ne!(delta, LogicalPoint::ZERO);
+    assert_eq!(
+        moved_second.origin,
+        LogicalPoint::new(
+            origin_second.origin.x + delta.x,
+            origin_second.origin.y + delta.y
+        ),
+        "第二级必须同帧跟随父级位移"
+    );
+    assert_eq!(
+        moved_third.origin,
+        LogicalPoint::new(
+            origin_third.origin.x + delta.x,
+            origin_third.origin.y + delta.y
+        ),
+        "第三级必须同帧跟随父级位移（不得逐层滞后）"
+    );
+    stable_frame(&mut app);
+    assert_eq!(app.app().popup_rect(third).expect("rect").hit, moved_third);
+}
+
+#[test]
+fn idle_frames_do_no_popup_settle_work() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0))),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    stable_frame(&mut app);
+    let window = win(&app);
+    let outcome = app.app_mut().frame(window).expect("window").expect("frame");
+    assert!(
+        matches!(outcome, ui_core::window::FrameOutcome::Idle),
+        "空闲帧必须 Idle"
+    );
+    let _ = id;
+}
+
+#[test]
+fn a_removed_anchor_propagates_the_anchor_lost_dismissal() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let anchor = root_box(&mut app, (60.0, 20.0), Color::WHITE);
+    frame(&mut app);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::Node { node: anchor }),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    assert!(app.app().popup_rect(id).is_some());
+    app.app_mut().remove_node(window, anchor).expect("remove");
+    frame(&mut app);
+    assert!(
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .is_empty(),
+        "默认 dismiss 策略必须关闭 anchor 丢失的链"
+    );
+}
+
+#[test]
+fn window_deactivation_closes_auto_but_keeps_modal() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let auto = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (60.0, 30.0),
+        None,
+    );
+    frame(&mut app);
+    assert!(app.app().popup_rect(auto).is_some());
+    app.app_mut().window_focus_lost(window);
+    frame(&mut app);
+    assert!(
+        app.app().popup_rect(auto).is_none(),
+        "窗口失焦必须关闭 Auto 链"
+    );
+    let mut modal_spec = base_spec(Anchor::WindowRect(rect(300.0, 100.0, 20.0, 20.0)));
+    modal_spec.tier = PopupTier::Modal;
+    modal_spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    let modal = open_sized(&mut app, modal_spec, (200.0, 120.0), None);
+    frame(&mut app);
+    app.app_mut().window_focus_lost(window);
+    frame(&mut app);
+    assert!(
+        app.app().popup_rect(modal).is_some(),
+        "窗口失焦必须保留 Modal"
+    );
+}
+
+#[test]
+fn opening_and_closing_a_non_modal_popup_never_forces_a_full_repaint() {
+    let mut app = TestApp::new();
+    let background = root_box(&mut app, (400.0, 300.0), Color::BLACK);
+    frame(&mut app);
+    let before = app.probe().bounds(background).expect("bounds");
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0))),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    assert!(
+        !app.frame_record().damage_full,
+        "打开非模态 popup 不得整帧重绘"
+    );
+    assert_eq!(app.probe().bounds(background).expect("bounds"), before);
+    assert!(app.app().popup_rect(id).is_some());
+    app.app_mut().close_popup(id).expect("close");
+    frame(&mut app);
+    assert!(
+        !app.frame_record().damage_full,
+        "关闭非模态 popup 不得整帧重绘"
+    );
+    assert!(app.app().popup_rect(id).is_none());
+    assert_eq!(
+        app.probe().bounds(background).expect("bounds"),
+        before,
+        "I9：popup 开关不得改变主树布局"
+    );
+}
+
+#[test]
+fn pointer_down_on_the_opener_toggles_the_chain_and_consumes_the_press() {
+    let mut app = TestApp::new();
+    let trigger = root_button(&mut app, (100.0, 30.0), "open");
+    frame(&mut app);
+    let mut spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    spec.opener = Some(trigger);
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let center = point(20.0, 15.0);
+    let (_, down_consumed) = press(&mut app, center);
+    assert!(down_consumed, "同一 opener 的 Toggle 必须消费按下");
+    let (_, up_consumed) = release(&mut app, center);
+    assert!(up_consumed, "被消费的按下必须同时消费抬起");
+    assert!(app.app().popup_rect(id).is_none());
+}
+
+#[test]
+fn outside_press_replays_the_click_to_the_background() {
+    let mut app = TestApp::new();
+    let background = root_button(&mut app, (300.0, 300.0), "background");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("background"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(600.0, 500.0, 20.0, 20.0))),
+        (60.0, 30.0),
+        None,
+    );
+    frame(&mut app);
+    let center = point(100.0, 100.0);
+    let (_, down_consumed) = press(&mut app, center);
+    assert!(!down_consumed, "默认 Replay 不得消费按下");
+    let (_, up_consumed) = release(&mut app, center);
+    assert!(!up_consumed, "默认 Replay 不得消费抬起");
+    assert_eq!(hits.get(), 1, "press+release 必须重派发给下层控件");
+    assert!(app.app().popup_rect(id).is_none());
+    let _ = background;
+}
+
+#[test]
+fn escape_closes_exactly_one_open_level() {
+    let mut app = TestApp::new();
+    let first = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 160.0),
+        None,
+    );
+    frame(&mut app);
+    let first_node = popup_node(&app, first);
+    let item = {
+        let window = win(&app);
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(24.0)).build())
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                first_node,
+            )
+            .expect("item")
+    };
+    frame(&mut app);
+    let second = open_child(&mut app, first, Anchor::Node { node: item }, (80.0, 60.0));
+    frame(&mut app);
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed, "Esc 必须返回 consumed");
+    assert!(app.app().popup_rect(second).is_none());
+    assert!(app.app().popup_rect(first).is_some(), "Esc 只关最上层");
+}
+
+#[test]
+fn a_tooltip_escape_closes_only_the_tooltip() {
+    let mut app = TestApp::new();
+    let menu = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 120.0),
+        None,
+    );
+    let mut hint_spec = base_spec(Anchor::WindowRect(rect(300.0, 100.0, 20.0, 20.0)));
+    hint_spec.tier = PopupTier::Hint;
+    hint_spec.dismiss = DismissPolicy::Hint { escape: true };
+    let hint = open_sized(&mut app, hint_spec, (80.0, 30.0), None);
+    frame(&mut app);
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed);
+    assert!(app.app().popup_rect(hint).is_none(), "Hint 优先关闭");
+    assert!(
+        app.app().popup_rect(menu).is_some(),
+        "Hint 的 Esc 不得关闭菜单"
+    );
+}
+
+#[test]
+fn opening_a_take_popup_moves_focus_and_closing_restores_it_once() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let trigger = root_button(&mut app, (100.0, 30.0), "trigger");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(trigger)));
+    assert_eq!(app.app().focused(window), Some(trigger));
+    let mut spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Opener,
+    };
+    spec.opener = Some(trigger);
+    let target = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            |app, window, node| {
+                NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(120.0), px(80.0)).build())
+                    .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                Ok(())
+            },
+            None,
+        )
+        .expect("open");
+    frame(&mut app);
+    let popup_focus = app.app().focused(window);
+    assert!(popup_focus.is_some());
+    assert_ne!(popup_focus, Some(trigger), "Take 必须取走焦点");
+    app.app_mut().close_popup(target).expect("close");
+    frame(&mut app);
+    assert_eq!(
+        app.app().focused(window),
+        Some(trigger),
+        "关闭必须恢复 opener 焦点"
+    );
+}
+
+#[test]
+fn dialog_tab_cycles_inside_the_modal_scope() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let background = root_button(&mut app, (100.0, 30.0), "background");
+    frame(&mut app);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::FirstFocusable,
+    };
+    let _dialog = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            |app, window, node| {
+                for action in ["first", "second"] {
+                    NodeBuilder::boxed()
+                        .style(StyleBuilder::new().size(px(100.0), px(30.0)).build())
+                        .on_click(Action::custom(action))
+                        .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                }
+                Ok(())
+            },
+            None,
+        )
+        .expect("dialog");
+    frame(&mut app);
+    let first = app.app().focused(window).expect("initial focus");
+    app.app_mut().focus_next(window);
+    let second = app.app().focused(window).expect("second");
+    assert_ne!(second, first);
+    app.app_mut().focus_next(window);
+    let wrapped = app.app().focused(window).expect("wrapped");
+    assert_eq!(wrapped, first, "Tab 必须在 modal scope 内闭环");
+    assert_ne!(wrapped, background);
+    app.app_mut().focus_prev(window);
+    assert_eq!(app.app().focused(window), Some(second));
+}
+
+#[test]
+fn opening_a_popup_from_an_editable_cancels_ime_composition() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let editable = ui_core::text_edit::EditableSpec {
+        role: ui_core::a11y::A11yRole::TextInput,
+        label: "".into(),
+        placeholder: "".into(),
+        multiline: false,
+        masked: false,
+        readonly: false,
+        disabled: false,
+        max_length: None,
+        submit: None,
+        text_style: ui_core::text::TextStyle::new(px(16.0)),
+        caret_color: Color::BLACK,
+        selection_color: Color::BLACK,
+        placeholder_color: Color::BLACK,
+        composition_color: Color::BLACK,
+    };
+    let node = {
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        NodeBuilder::editable_text(editable)
+            .build(tree, tree.root())
+            .expect("editable")
+    };
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    app.dispatch_event(Event::Ime(ImeEvent::Preedit {
+        text: "ni".into(),
+        caret: None,
+        clauses: Default::default(),
+        replace: None,
+    }));
+    assert!(
+        app.app()
+            .text_edit_composition(window, node)
+            .expect("composition")
+            .is_some(),
+        "前置条件：必须先进入组合"
+    );
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Opener,
+    };
+    let id = open_sized(&mut app, spec, (60.0, 30.0), None);
+    frame(&mut app);
+    assert!(app.app().popup_rect(id).is_some());
+    assert_ne!(app.app().focused(window), Some(node));
+    assert!(
+        app.app()
+            .text_edit_composition(window, node)
+            .expect("composition")
+            .is_none(),
+        "打开 popup 抢焦必须取消 composition"
+    );
+}
+
+#[test]
+fn slide_animation_offsets_paint_and_hit_without_moving_the_settle_rect() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::FadeSlide;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let settled = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(settled, rect(100.0, 124.0, 120.0, 80.0));
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    let entry = app.app().popup_stack(win(&app)).expect("stack").entries[0];
+    assert!(
+        entry.paint_offset.y > px(0.0) && entry.paint_offset.y < px(4.0),
+        "paint_offset 必须随动画收敛：{:?}",
+        entry.paint_offset
+    );
+    let offset = entry.paint_offset;
+    let content = popup_node(&app, id);
+    let painted_node = {
+        let window = win(&app);
+        let tree = app.app().window(window).expect("window").tree();
+        tree.get(content).expect("content").children()[0]
+    };
+    let painted = app
+        .rendered()
+        .expect("rendered frame")
+        .quads
+        .iter()
+        .find(|quad| quad.node == painted_node)
+        .map(|quad| quad.bounds)
+        .expect("动画帧必须绘制 popup 内容");
+    assert_eq!(
+        painted.size, settled.size,
+        "动画不得改变绘制尺寸（paint_offset 不参与 layout）"
+    );
+    assert_eq!(
+        painted.origin,
+        LogicalPoint::new(settled.origin.x + offset.x, settled.origin.y + offset.y),
+        "FrameRecord 的绘制位置必须跟随 paint_offset"
+    );
+    assert!(
+        damage_covers(&app, settled.translate(offset)),
+        "动画帧 damage 必须覆盖偏移后的绘制区域"
+    );
+    let background = {
+        let window = win(&app);
+        app.app().window(window).expect("window").tree().root()
+    };
+    let shifted_only = point(
+        (settled.origin.x + 10.0).value(),
+        (settled.max().y + offset.y.value() * 0.5).value(),
+    );
+    let shifted_hit = app
+        .probe()
+        .hit(shifted_only)
+        .map(|result| result.node)
+        .expect("偏移绘制区域必须可命中");
+    assert_ne!(
+        shifted_hit, background,
+        "hit 必须跟随带 paint_offset 的绘制区域"
+    );
+    let settled_only = point(
+        (settled.origin.x + 10.0).value(),
+        (settled.origin.y + offset.y.value() * 0.5).value(),
+    );
+    assert_eq!(
+        app.probe().hit(settled_only).map(|result| result.node),
+        Some(background),
+        "动画期间命中不得停留在最终位置"
+    );
+    app.advance(Duration::from_millis(120));
+    frame(&mut app);
+    let entry = app.app().popup_stack(win(&app)).expect("stack").entries[0];
+    assert_eq!(entry.paint_offset, LogicalPoint::ZERO);
+    assert_eq!(entry.state, PopupState::Open);
+    assert_eq!(app.app().popup_rect(id).expect("rect").hit, settled);
+}
+
+#[test]
+fn closing_animation_blocks_hit_immediately_then_removes_the_node() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::Fade;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    app.advance(Duration::from_millis(130));
+    frame(&mut app);
+    let hit = app.app().popup_rect(id).expect("rect").hit;
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed);
+    let content = popup_node(&app, id);
+    let stack = app.app().popup_stack(win(&app)).expect("stack");
+    assert_eq!(stack.entries.len(), 1, "关闭动画期间节点保留");
+    assert_eq!(stack.entries[0].state, PopupState::DismissPending);
+    assert_ne!(
+        app.probe()
+            .hit(point(
+                (hit.origin.x + 10.0).value(),
+                (hit.origin.y + 10.0).value(),
+            ))
+            .map(|result| result.node),
+        Some(content),
+        "Closing/DismissPending 必须立即不可命中"
+    );
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(
+        app.app()
+            .popup_stack(win(&app))
+            .expect("stack")
+            .entries
+            .is_empty(),
+        "关闭动画结束后必须移除节点"
+    );
+}
+
+#[test]
+fn a_modal_scrim_closes_with_the_modal() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    spec.scrim = Some(ScrimSpec {
+        density: 0.5,
+        ..ScrimSpec::default()
+    });
+    spec.animation = PopupAnimation::Fade;
+    let _modal = open_sized(&mut app, spec, (200.0, 120.0), None);
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_stack(window).expect("stack").entries.len(),
+        2,
+        "modal + scrim"
+    );
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed);
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .is_empty(),
+        "scrim 与 modal 生命周期绑定"
+    );
+}
+
+#[test]
+fn a_dialog_blocks_background_openers() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    frame(&mut app);
+    let mut modal_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    modal_spec.tier = PopupTier::Modal;
+    modal_spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    let _modal = open_sized(&mut app, modal_spec, (200.0, 120.0), None);
+    frame(&mut app);
+    let (_, down_consumed) = press(&mut app, point(20.0, 15.0));
+    assert!(down_consumed, "模态 scope 外的按下必须被消费");
+    let (_, up_consumed) = release(&mut app, point(20.0, 15.0));
+    assert!(up_consumed, "模态 scope 外的抬起必须被消费");
+    assert!(
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .iter()
+            .all(|entry| entry.tier == PopupTier::Modal),
+        "背景 opener 不得被触发"
+    );
+}
+
+#[test]
+fn dismiss_topmost_keeps_its_programmatic_close_semantics() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (60.0, 30.0),
+        Some(Box::new(|_app, dismiss| {
+            assert_eq!(dismiss.reason, DismissReason::Programmatic);
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    let w = win(&app);
+    assert!(
+        app.app_mut()
+            .dismiss_topmost(w, DismissReason::Programmatic)
+    );
+    assert!(app.app().popup_rect(id).is_none());
+}
+
+fn damage_covers(app: &TestApp, area: LogicalRect) -> bool {
+    let mut union = ui_core::math::DeviceRect::default();
+    for rect in &app.frame_record().damage {
+        union = union.union(*rect);
+    }
+    let window = win(app);
+    let dpr = app
+        .app()
+        .window(window)
+        .expect("window")
+        .device_pixel_ratio();
+    let target = dpr.to_covering_device_rect(area);
+    !target.is_empty()
+        && union.x0 <= target.x0
+        && union.y0 <= target.y0
+        && union.x1 >= target.x1
+        && union.y1 >= target.y1
+}
+
+#[test]
+fn outside_press_consume_is_explicit_opt_in() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(600.0, 500.0, 20.0, 20.0)));
+    spec.dismiss = DismissPolicy::Chain {
+        outside: ui_core::popup::OutsidePress::Consume,
+        escape: EscapePolicy::CloseTopmost,
+        anchor_lost: true,
+        focus_lost: true,
+    };
+    let id = open_sized(&mut app, spec, (60.0, 30.0), None);
+    frame(&mut app);
+    let center = point(100.0, 100.0);
+    let (_, down_consumed) = press(&mut app, center);
+    assert!(down_consumed, "Consume 策略必须消费按下");
+    let (_, up_consumed) = release(&mut app, center);
+    assert!(up_consumed, "Consume 策略必须消费抬起");
+    assert!(app.app().popup_rect(id).is_none());
+}
+
+#[test]
+fn a_different_opener_closes_the_old_chain_and_dispatches_the_press() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first_trigger = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        let parent = tree.tree().root();
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(100.0), px(30.0))
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .build(),
+            )
+            .build(tree.tree_mut(), parent)
+            .expect("first trigger")
+    };
+    let second_trigger = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        let parent = tree.tree().root();
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(100.0), px(30.0))
+                    .absolute()
+                    .left(px(200.0))
+                    .top(px(0.0))
+                    .build(),
+            )
+            .on_click(Action::custom("second"))
+            .build(tree.tree_mut(), parent)
+            .expect("second trigger")
+    };
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("second"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let mut spec = base_spec(Anchor::NodeRect {
+        node: first_trigger,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    spec.opener = Some(first_trigger);
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let second_center = point(250.0, 15.0);
+    let (_, down_consumed) = press(&mut app, second_center);
+    assert!(!down_consumed, "不同 opener 的按下不得被消费");
+    let (_, up_consumed) = release(&mut app, second_center);
+    assert!(!up_consumed);
+    assert!(app.app().popup_rect(id).is_none(), "旧链必须先关闭");
+    assert_eq!(hits.get(), 1, "按下必须正常派发给新 opener");
+    let _ = second_trigger;
+}
+
+#[test]
+fn pressing_inside_an_ancestor_menu_closes_only_its_descendants() {
+    let mut app = TestApp::new();
+    let first = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 160.0),
+        None,
+    );
+    frame(&mut app);
+    let first_node = popup_node(&app, first);
+    let item = {
+        let window = win(&app);
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(24.0)).build())
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                first_node,
+            )
+            .expect("item")
+    };
+    frame(&mut app);
+    let second = open_child(&mut app, first, Anchor::Node { node: item }, (80.0, 60.0));
+    frame(&mut app);
+    let second_node = popup_node(&app, second);
+    let sub_item = {
+        let window = win(&app);
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(80.0), px(24.0)).build())
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                second_node,
+            )
+            .expect("sub item")
+    };
+    frame(&mut app);
+    let third = open_child(
+        &mut app,
+        second,
+        Anchor::Node { node: sub_item },
+        (70.0, 40.0),
+    );
+    frame(&mut app);
+    assert!(app.app().popup_rect(third).is_some());
+    let first_rect = app.app().popup_rect(first).expect("rect").hit;
+    let inside_first = point(
+        (first_rect.origin.x + 5.0).value(),
+        (first_rect.origin.y + 5.0).value(),
+    );
+    let (_, down_consumed) = press(&mut app, inside_first);
+    assert!(!down_consumed, "祖先面板内的按下正常派发");
+    let (_, _) = release(&mut app, inside_first);
+    assert!(app.app().popup_rect(third).is_none(), "必须关闭后代");
+    assert!(app.app().popup_rect(second).is_none(), "必须关闭后代");
+    assert!(app.app().popup_rect(first).is_some(), "祖先保持打开");
+}
+
+#[test]
+fn opening_a_modal_closes_auto_roots_and_hints() {
+    let mut app = TestApp::new();
+    let auto = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 80.0),
+        None,
+    );
+    let mut hint_spec = base_spec(Anchor::WindowRect(rect(300.0, 100.0, 20.0, 20.0)));
+    hint_spec.tier = PopupTier::Hint;
+    hint_spec.dismiss = DismissPolicy::Hint { escape: true };
+    let hint = open_sized(&mut app, hint_spec, (80.0, 30.0), None);
+    frame(&mut app);
+    let mut modal_spec = base_spec(Anchor::WindowRect(rect(200.0, 200.0, 20.0, 20.0)));
+    modal_spec.tier = PopupTier::Modal;
+    modal_spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    let modal = open_sized(&mut app, modal_spec, (200.0, 120.0), None);
+    frame(&mut app);
+    assert!(
+        app.app().popup_rect(auto).is_none(),
+        "Modal 必须关闭无关 Auto 链"
+    );
+    assert!(app.app().popup_rect(hint).is_none(), "Modal 必须关闭 Hint");
+    assert!(app.app().popup_rect(modal).is_some());
+}
+
+#[test]
+fn modal_outside_true_closes_the_chain_and_consumes_the_press() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: true,
+        escape: true,
+    };
+    let modal = open_sized(&mut app, spec, (200.0, 120.0), None);
+    frame(&mut app);
+    let (_, down_consumed) = press(&mut app, point(700.0, 500.0));
+    assert!(down_consumed, "Modal scope 外按下必须消费");
+    let (_, up_consumed) = release(&mut app, point(700.0, 500.0));
+    assert!(up_consumed);
+    assert!(
+        app.app().popup_rect(modal).is_none(),
+        "Explicit{{outside:true}} 必须关闭整链"
+    );
+}
+
+#[test]
+fn a_scrim_click_behaves_like_an_outside_press() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(200.0, 200.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    spec.dismiss = DismissPolicy::Explicit {
+        outside: true,
+        escape: true,
+    };
+    spec.scrim = Some(ScrimSpec {
+        density: 0.5,
+        ..ScrimSpec::default()
+    });
+    let modal = open_sized(&mut app, spec, (200.0, 120.0), None);
+    frame(&mut app);
+    let (_, down_consumed) = press(&mut app, point(700.0, 500.0));
+    assert!(down_consumed);
+    let (_, _) = release(&mut app, point(700.0, 500.0));
+    assert!(
+        app.app().popup_rect(modal).is_none(),
+        "scrim 点击等价 OutsidePress"
+    );
+}
+
+#[test]
+fn closing_a_modal_closes_owner_modal_descendants() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut modal_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    modal_spec.tier = PopupTier::Modal;
+    modal_spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    let modal = app
+        .app_mut()
+        .open_popup(
+            window,
+            modal_spec,
+            |app, window, node| {
+                NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(200.0), px(120.0)).build())
+                    .on_click(Action::custom("inside"))
+                    .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                Ok(())
+            },
+            None,
+        )
+        .expect("modal");
+    frame(&mut app);
+    let content = popup_node(&app, modal);
+    let inside = app
+        .app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(content)
+        .expect("content")
+        .children()[0];
+    let select = {
+        let mut spec = base_spec(Anchor::NodeRect {
+            node: inside,
+            rect: rect(0.0, 0.0, 100.0, 30.0),
+        });
+        spec.opener = Some(inside);
+        open_sized(&mut app, spec, (100.0, 80.0), None)
+    };
+    frame(&mut app);
+    assert!(app.app().popup_rect(select).is_some());
+    app.app_mut().close_popup(modal).expect("close modal");
+    assert!(
+        app.app().popup_rect(select).is_none(),
+        "关闭 Modal 必须递归关闭 owner_modal 后代"
+    );
+}
+
+#[test]
+fn escape_skips_closing_entries_and_closes_the_next_open_level() {
+    let mut app = TestApp::new();
+    let mut first_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    first_spec.animation = PopupAnimation::Fade;
+    let first = open_sized(&mut app, first_spec, (120.0, 160.0), None);
+    frame(&mut app);
+    let first_node = popup_node(&app, first);
+    let item = {
+        let window = win(&app);
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(24.0)).build())
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                first_node,
+            )
+            .expect("item")
+    };
+    frame(&mut app);
+    let mut second_spec = base_spec(Anchor::Node { node: item });
+    second_spec.parent = Some(first);
+    second_spec.placement = menu_placement();
+    second_spec.animation = PopupAnimation::Fade;
+    let second = open_sized(&mut app, second_spec, (80.0, 60.0), None);
+    frame(&mut app);
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed);
+    assert_eq!(
+        app.app()
+            .popup_stack(win(&app))
+            .expect("stack")
+            .entries
+            .iter()
+            .find(|entry| entry.id == second)
+            .expect("second")
+            .state,
+        PopupState::DismissPending
+    );
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed, "第二次 Esc 必须跳过 Closing 并关闭下一层");
+    assert_eq!(
+        app.app()
+            .popup_stack(win(&app))
+            .expect("stack")
+            .entries
+            .iter()
+            .find(|entry| entry.id == first)
+            .expect("first")
+            .state,
+        PopupState::DismissPending
+    );
+}
+
+#[test]
+fn default_button_wins_the_trap_initial_focus() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::DefaultButton,
+    };
+    let first_button = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            |app, window, node| {
+                let roles = [
+                    ui_core::a11y::A11yRole::Button,
+                    ui_core::a11y::A11yRole::Button,
+                ];
+                for (index, role) in roles.into_iter().enumerate() {
+                    NodeBuilder::boxed()
+                        .style(StyleBuilder::new().size(px(100.0), px(30.0)).build())
+                        .a11y(ui_core::a11y::A11yOverride {
+                            role: Some(role),
+                            ..Default::default()
+                        })
+                        .on_click(Action::custom(if index == 0 { "first" } else { "second" }))
+                        .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                }
+                Ok(())
+            },
+            None,
+        )
+        .expect("dialog");
+    frame(&mut app);
+    let content = popup_node(&app, first_button);
+    let children = app
+        .app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(content)
+        .expect("content")
+        .children()
+        .to_vec();
+    assert_eq!(
+        app.app().focused(window),
+        Some(children[0]),
+        "DefaultButton 必须取第一个可聚焦按钮"
+    );
+}
+
+#[test]
+fn closing_a_popup_does_not_steal_the_newer_popup_focus() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let trigger = root_button(&mut app, (100.0, 30.0), "trigger");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(trigger)));
+    let mut first_spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    first_spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Opener,
+    };
+    first_spec.opener = Some(trigger);
+    first_spec.animation = PopupAnimation::Fade;
+    let first = open_sized(&mut app, first_spec, (120.0, 80.0), None);
+    frame(&mut app);
+    assert_ne!(app.app().focused(window), Some(trigger));
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed, "Esc 启动第一个 popup 的关闭事务");
+    let mut second_spec = base_spec(Anchor::WindowRect(rect(500.0, 100.0, 20.0, 20.0)));
+    second_spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Opener,
+    };
+    let second = open_sized(&mut app, second_spec, (100.0, 40.0), None);
+    frame(&mut app);
+    let second_focus = app.app().focused(window);
+    assert!(second_focus.is_some());
+    app.advance(Duration::from_millis(120));
+    frame(&mut app);
+    assert!(app.app().popup_rect(first).is_none(), "旧 popup 已移除");
+    assert_eq!(
+        app.app().focused(window),
+        second_focus,
+        "关闭事务结束不得抢走新 popup 的焦点"
+    );
+    let _ = second;
+}
+
+#[test]
+fn removing_the_opener_falls_back_to_the_root() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let trigger = root_button(&mut app, (100.0, 30.0), "trigger");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(trigger)));
+    let mut spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Opener,
+    };
+    spec.opener = Some(trigger);
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    app.app_mut().remove_node(window, trigger).expect("remove");
+    app.app_mut().close_popup(id).expect("close");
+    frame(&mut app);
+    assert_eq!(
+        app.app().focused(window),
+        None,
+        "opener 失效时关闭必须回落到 root（None）"
+    );
+}
+
+#[test]
+fn escape_during_ime_composition_cancels_it_and_keeps_the_popup() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let editable = ui_core::text_edit::EditableSpec {
+        role: ui_core::a11y::A11yRole::TextInput,
+        label: "".into(),
+        placeholder: "".into(),
+        multiline: false,
+        masked: false,
+        readonly: false,
+        disabled: false,
+        max_length: None,
+        submit: None,
+        text_style: ui_core::text::TextStyle::new(px(16.0)),
+        caret_color: Color::BLACK,
+        selection_color: Color::BLACK,
+        placeholder_color: Color::BLACK,
+        composition_color: Color::BLACK,
+    };
+    let node = {
+        let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+        NodeBuilder::editable_text(editable)
+            .build(tree, tree.root())
+            .expect("editable")
+    };
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(node)));
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(600.0, 500.0, 20.0, 20.0))),
+        (60.0, 30.0),
+        None,
+    );
+    frame(&mut app);
+    app.dispatch_event(Event::Ime(ImeEvent::Preedit {
+        text: "ni".into(),
+        caret: None,
+        clauses: Default::default(),
+        replace: None,
+    }));
+    assert!(
+        app.app()
+            .text_edit_composition(window, node)
+            .expect("composition")
+            .is_some()
+    );
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed, "composing 时 Esc 必须由文本编辑消费");
+    assert!(
+        app.app()
+            .text_edit_composition(window, node)
+            .expect("composition")
+            .is_none(),
+        "Esc 必须先取消组合"
+    );
+    assert!(app.app().popup_rect(id).is_some(), "取消组合不得关闭 popup");
+}
+
+#[test]
+fn slide_animation_damage_covers_the_offset_and_the_final_rect() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::FadeSlide;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let rect = app.app().popup_rect(id).expect("rect").hit;
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    let offset = app.app().popup_stack(win(&app)).expect("stack").entries[0].paint_offset;
+    assert!(offset.y > px(0.0) && offset.y < px(4.0));
+    assert!(
+        damage_covers(&app, rect.translate(LogicalPoint::new(px(0.0), px(4.0)))),
+        "damage 必须覆盖起始偏移位置"
+    );
+    assert!(
+        damage_covers(&app, rect.translate(offset)),
+        "damage 必须覆盖当前偏移位置"
+    );
+    let painted = app
+        .frame_record()
+        .frame
+        .as_ref()
+        .expect("rendered frame")
+        .quads
+        .iter()
+        .any(|quad| {
+            (quad.bounds.origin.y - (rect.origin.y + offset.y))
+                .value()
+                .abs()
+                < 0.01
+                && quad.bounds.size.height > px(0.0)
+        });
+    assert!(painted, "绘制必须跟随 paint_offset（而非只改命中）");
+    assert!(!app.frame_record().damage_full, "动画帧不得整帧重绘");
+}
+
+#[test]
+fn closing_animation_frames_never_force_a_full_repaint() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0)));
+    spec.animation = PopupAnimation::FadeSlide;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    app.advance(Duration::from_millis(130));
+    frame(&mut app);
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed);
+    app.advance(Duration::from_millis(45));
+    frame(&mut app);
+    assert!(!app.frame_record().damage_full, "关闭动画帧不得整帧重绘");
+    app.advance(Duration::from_millis(60));
+    frame(&mut app);
+    assert!(!app.frame_record().damage_full, "关闭移除帧不得整帧重绘");
+    assert!(app.app().popup_rect(id).is_none());
+}
+
+#[test]
+fn modal_animation_is_fade_only() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.animation = PopupAnimation::FadeSlide;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    let id = open_sized(&mut app, spec, (200.0, 120.0), None);
+    frame(&mut app);
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    let offset = app
+        .app()
+        .popup_stack(win(&app))
+        .expect("stack")
+        .entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("modal")
+        .paint_offset;
+    assert_eq!(offset, LogicalPoint::ZERO, "Modal 只允许 fade，不得 slide");
+}
+
+#[test]
+fn anchor_lost_policy_false_keeps_the_popup() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let anchor = root_box(&mut app, (60.0, 20.0), Color::WHITE);
+    frame(&mut app);
+    let mut spec = base_spec(Anchor::Node { node: anchor });
+    spec.dismiss = DismissPolicy::Chain {
+        outside: ui_core::popup::OutsidePress::Replay,
+        escape: EscapePolicy::CloseTopmost,
+        anchor_lost: false,
+        focus_lost: true,
+    };
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    app.app_mut().remove_node(window, anchor).expect("remove");
+    frame(&mut app);
+    assert!(
+        app.app().popup_rect(id).is_some(),
+        "anchor_lost=false 必须保留 popup"
+    );
+}
+
+#[test]
+fn hint_is_hidden_on_window_deactivation() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut hint_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    hint_spec.tier = PopupTier::Hint;
+    hint_spec.dismiss = DismissPolicy::Hint { escape: true };
+    let hint = open_sized(&mut app, hint_spec, (80.0, 30.0), None);
+    frame(&mut app);
+    app.app_mut().window_focus_lost(window);
+    frame(&mut app);
+    assert!(
+        app.app().popup_rect(hint).is_none(),
+        "窗口失焦必须隐藏 Hint"
+    );
+}
+
+#[test]
+fn popup_settle_rounds_never_exceed_two() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0))),
+        (80.0, 40.0),
+        None,
+    );
+    frame(&mut app);
+    assert!(app.frame_record().stats.popup_settle_rounds <= 2);
+    let node = popup_node(&app, id);
+    let window = win(&app);
+    NodeBuilder::boxed()
+        .style(StyleBuilder::new().size(px(300.0), px(200.0)).build())
+        .build(
+            app.app_mut().window_mut(window).expect("window").tree_mut(),
+            node,
+        )
+        .expect("child");
+    frame(&mut app);
+    assert!(app.frame_record().stats.popup_settle_rounds <= 2);
+    app.app_mut()
+        .window_mut(window)
+        .expect("window")
+        .set_size(LogicalSize::new(px(320.0), px(240.0)));
+    frame(&mut app);
+    assert!(app.frame_record().stats.popup_settle_rounds <= 2);
+}
+
+#[test]
+fn closing_a_popup_ends_the_editable_composition() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let editable = ui_core::text_edit::EditableSpec {
+        role: ui_core::a11y::A11yRole::TextInput,
+        label: "".into(),
+        placeholder: "".into(),
+        multiline: false,
+        masked: false,
+        readonly: false,
+        disabled: false,
+        max_length: None,
+        submit: None,
+        text_style: ui_core::text::TextStyle::new(px(16.0)),
+        caret_color: Color::BLACK,
+        selection_color: Color::BLACK,
+        placeholder_color: Color::BLACK,
+        composition_color: Color::BLACK,
+    };
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Opener,
+    };
+    spec.animation = PopupAnimation::Fade;
+    let id = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            move |app, window, node| {
+                NodeBuilder::editable_text(editable)
+                    .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                Ok(())
+            },
+            None,
+        )
+        .expect("popup");
+    frame(&mut app);
+    let content = popup_node(&app, id);
+    let editable = app
+        .app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(content)
+        .expect("content")
+        .children()[0];
+    assert!(app.app_mut().set_focus(window, Some(editable)));
+    app.dispatch_event(Event::Ime(ImeEvent::Preedit {
+        text: "ni".into(),
+        caret: None,
+        clauses: Default::default(),
+        replace: None,
+    }));
+    assert!(
+        app.app()
+            .text_edit_composition(window, editable)
+            .expect("composition")
+            .is_some()
+    );
+    let (_, _) = press(&mut app, point(600.0, 500.0));
+    let (_, _) = release(&mut app, point(600.0, 500.0));
+    assert!(
+        app.app().popup_rect(id).is_some(),
+        "关闭动画期间节点仍在（可观测组合状态）"
+    );
+    assert!(
+        app.app()
+            .text_edit_composition(window, editable)
+            .expect("composition")
+            .is_none(),
+        "关闭 popup 必须结束其内 editable 的组合状态"
+    );
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(id).is_none());
+}
+
+#[test]
+fn programmatic_begin_close_animates_the_fade_and_removes_after_it() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let trigger = root_button(&mut app, (100.0, 30.0), "trigger");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(trigger)));
+    let reasons = std::rc::Rc::new(std::cell::Cell::new(None));
+    let recorded = std::rc::Rc::clone(&reasons);
+    let mut spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    spec.animation = PopupAnimation::Fade;
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Previous,
+    };
+    spec.opener = Some(trigger);
+    let id = open_sized(
+        &mut app,
+        spec,
+        (120.0, 80.0),
+        Some(Box::new(move |_app, dismiss| {
+            recorded.set(Some(dismiss.reason));
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Open));
+    assert!(
+        app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .expect("begin close")
+    );
+    assert_eq!(app.app().popup_state(id), Some(PopupState::DismissPending));
+    assert!(
+        app.app().popup_rect(id).is_some(),
+        "Closing 事务必须保留节点/几何"
+    );
+    assert_eq!(reasons.get(), Some(DismissReason::Programmatic));
+    assert_eq!(
+        app.app().focused(window),
+        Some(trigger),
+        "关闭事务必须先释放焦点"
+    );
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(id).is_none());
+    assert_eq!(app.app().popup_state(id), None);
+}
+
+#[test]
+fn begin_close_is_idempotent_while_the_transaction_runs() {
+    let mut app = TestApp::new();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&calls);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.animation = PopupAnimation::Fade;
+    let id = open_sized(
+        &mut app,
+        spec,
+        (120.0, 80.0),
+        Some(Box::new(move |_app, _dismiss| {
+            counter.set(counter.get() + 1);
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    assert!(
+        app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .expect("first")
+    );
+    assert!(
+        !app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .expect("second")
+    );
+    assert_eq!(calls.get(), 1, "重复 begin_close 不得再次回调 on_dismiss");
+    assert_eq!(app.app().popup_state(id), Some(PopupState::DismissPending));
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(id).is_none());
+}
+
+#[test]
+fn begin_close_honours_an_ignore_handler() {
+    let mut app = TestApp::new();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&calls);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 80.0),
+        Some(Box::new(move |_app, _dismiss| {
+            counter.set(counter.get() + 1);
+            DismissOutcome::Ignore
+        })),
+    );
+    frame(&mut app);
+    assert!(
+        !app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .expect("ignored")
+    );
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Open));
+    assert!(app.app().popup_rect(id).is_some());
+    assert!(
+        !app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .expect("ignored again")
+    );
+    assert_eq!(calls.get(), 2, "Ignore 必须保留 handler 供下次调用");
+}
+
+#[test]
+fn begin_close_rejects_an_unknown_popup() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    app.app_mut().close_popup(id).expect("immediate close");
+    assert!(
+        app.app_mut()
+            .begin_close_popup(id, DismissReason::Programmatic)
+            .is_err(),
+        "未知 popup 必须返回强类型错误"
+    );
+    assert_eq!(app.app().popup_state(id), None);
+}
+
+fn open_take_for_restore(
+    app: &mut TestApp,
+    trigger: NodeId,
+    opener: NodeId,
+    restore: RestoreFocus,
+) -> PopupId {
+    let mut spec = base_spec(Anchor::NodeRect {
+        node: opener,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    spec.focus = FocusPolicy::Take { restore };
+    spec.opener = Some(opener);
+    let id = open_sized(app, spec, (120.0, 80.0), None);
+    frame(app);
+    let _ = trigger;
+    id
+}
+
+#[test]
+fn restore_previous_ignores_the_opener() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let second = root_button(&mut app, (100.0, 30.0), "second");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let id = open_take_for_restore(&mut app, first, second, RestoreFocus::Previous);
+    assert_ne!(app.app().focused(window), Some(first));
+    app.app_mut().close_popup(id).expect("close");
+    assert_eq!(
+        app.app().focused(window),
+        Some(first),
+        "Previous 必须恢复关闭前焦点而不是 opener"
+    );
+}
+
+#[test]
+fn restore_opener_wins_over_the_previous_focus() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let second = root_button(&mut app, (100.0, 30.0), "second");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let id = open_take_for_restore(&mut app, first, second, RestoreFocus::Opener);
+    app.app_mut().close_popup(id).expect("close");
+    assert_eq!(
+        app.app().focused(window),
+        Some(second),
+        "Opener 必须恢复到 opener 节点"
+    );
+}
+
+#[test]
+fn restore_opener_falls_back_to_the_previous_when_it_disappears() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let second = root_button(&mut app, (100.0, 30.0), "second");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let id = open_take_for_restore(&mut app, first, second, RestoreFocus::Opener);
+    app.app_mut()
+        .remove_node(window, second)
+        .expect("remove opener");
+    app.app_mut().close_popup(id).expect("close");
+    assert_eq!(
+        app.app().focused(window),
+        Some(first),
+        "opener 已被移除时必须回落到关闭前焦点"
+    );
+}
+
+#[test]
+fn restore_opener_walks_to_the_nearest_focusable_ancestor() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let outer = root_button(&mut app, (100.0, 30.0), "outer");
+    frame(&mut app);
+    let label = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(20.0), px(20.0)).build())
+            .build(tree.tree_mut(), outer)
+            .expect("label")
+    };
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let id = open_take_for_restore(&mut app, first, label, RestoreFocus::Opener);
+    app.app_mut().close_popup(id).expect("close");
+    assert_eq!(
+        app.app().focused(window),
+        Some(outer),
+        "不可聚焦 opener 必须回落到最近可聚焦祖先"
+    );
+}
+
+#[test]
+fn restore_root_fallback_clears_the_focus() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let second = root_button(&mut app, (100.0, 30.0), "second");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let id = open_take_for_restore(&mut app, first, second, RestoreFocus::RootFallback);
+    app.app_mut().close_popup(id).expect("close");
+    assert_eq!(
+        app.app().focused(window),
+        None,
+        "RootFallback 必须把焦点交还 root"
+    );
+}
+
+#[test]
+fn set_popup_a11y_updates_the_live_projection() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.a11y.role = Some(ui_core::a11y::A11yRole::Dialog);
+    spec.a11y.label = Some("Title A".into());
+    let id = open_sized(&mut app, spec, (200.0, 120.0), None);
+    frame(&mut app);
+    app.enable_a11y_capture();
+    app.drain_pump().expect("a11y frame");
+    let node = popup_node(&app, id);
+    let snapshot = app.a11y().expect("a11y snapshot");
+    let record = snapshot.node_for(node).expect("popup a11y record");
+    assert_eq!(record.role, ui_core::a11y::A11yRole::Dialog);
+    assert_eq!(record.label_text(), Some("Title A"));
+    assert!(
+        app.app_mut()
+            .set_popup_a11y(
+                id,
+                PopupA11y {
+                    role: Some(ui_core::a11y::A11yRole::Dialog),
+                    label: Some("Title B".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("update a11y")
+    );
+    app.advance(Duration::from_millis(150));
+    app.drain_pump().expect("a11y frame");
+    assert!(
+        app.a11y_update().is_some(),
+        "set_popup_a11y 必须标脏并向 a11y 端投递"
+    );
+    let record = app
+        .a11y()
+        .expect("a11y snapshot")
+        .node_for(node)
+        .expect("popup a11y record");
+    assert_eq!(record.label_text(), Some("Title B"));
+    assert!(
+        !app.app_mut()
+            .set_popup_a11y(
+                id,
+                PopupA11y {
+                    role: Some(ui_core::a11y::A11yRole::Dialog),
+                    label: Some("Title B".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("idempotent update"),
+        "相同元数据不得重复标脏"
+    );
+    app.advance(Duration::from_millis(150));
+    app.drain_pump().expect("idle frame");
+    assert!(app.a11y_update().is_none(), "相同元数据不得产生 a11y 投递");
+}
+
+fn abs_button(
+    app: &mut TestApp,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    action: &'static str,
+) -> NodeId {
+    let window = win(app);
+    let tree = app.app_mut().window_mut(window).expect("window");
+    let parent = tree.tree().root();
+    NodeBuilder::boxed()
+        .style(
+            StyleBuilder::new()
+                .size(px(width), px(height))
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .build(),
+        )
+        .on_click(Action::custom(action))
+        .build(tree.tree_mut(), parent)
+        .expect("button")
+}
+
+fn tooltip_spec(button: NodeId) -> PopupSpec {
+    let mut spec = base_spec(Anchor::WindowRect(rect(0.0, 0.0, 10.0, 10.0)));
+    spec.tier = PopupTier::Hint;
+    spec.dismiss = DismissPolicy::Hint { escape: true };
+    spec.pointer_transparent = true;
+    spec.opener = Some(button);
+    spec.a11y = PopupA11y {
+        role: Some(ui_core::a11y::A11yRole::Tooltip),
+        described_by: Some(button),
+        ..Default::default()
+    };
+    spec
+}
+
+#[test]
+fn pointer_transparent_popup_lets_clicks_and_hover_reach_the_content_below() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let button = abs_button(&mut app, 0.0, 0.0, 100.0, 40.0, "under");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("under"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let id = open_sized(&mut app, tooltip_spec(button), (300.0, 200.0), None);
+    frame(&mut app);
+    let tip = app.app().popup_rect(id).expect("tooltip rect").hit;
+    let point = point(50.0, 20.0);
+    assert!(tip.contains(point), "测试点必须同时落在 tooltip 与按钮内");
+    assert_eq!(
+        app.probe().hit(point).map(|hit| hit.node),
+        Some(button),
+        "pointer_transparent 子树不得参与命中"
+    );
+    app.move_pointer(point);
+    assert_eq!(
+        app.app().hovered(window),
+        Some(button),
+        "hover 必须穿透到下层按钮"
+    );
+    let (_, _) = press(&mut app, point);
+    let (_, _) = release(&mut app, point);
+    assert_eq!(hits.get(), 1, "点击必须落到下层按钮");
+    assert!(
+        app.app().popup_rect(id).is_some(),
+        "穿透点击不得关闭 Hint/Tooltip"
+    );
+}
+
+#[test]
+fn a_non_transparent_popup_still_intercepts_the_pointer() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let _button = abs_button(&mut app, 0.0, 0.0, 100.0, 40.0, "under");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("under"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(0.0, 0.0, 10.0, 10.0))),
+        (300.0, 200.0),
+        None,
+    );
+    frame(&mut app);
+    let content = popup_node(&app, id);
+    let child = app
+        .app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(content)
+        .expect("content")
+        .children()[0];
+    let point = point(50.0, 20.0);
+    assert_eq!(
+        app.probe().hit(point).map(|hit| hit.node),
+        Some(child),
+        "非透明 popup 必须拦截命中"
+    );
+    app.move_pointer(point);
+    assert_eq!(app.app().hovered(window), Some(child));
+    let (_, _) = press(&mut app, point);
+    let (_, _) = release(&mut app, point);
+    assert_eq!(hits.get(), 0, "非透明 popup 不得把点击漏给下层");
+}
+
+#[test]
+fn only_the_topmost_transparent_popup_passes_the_pointer_through() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let button = abs_button(&mut app, 0.0, 0.0, 100.0, 40.0, "under");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("under"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let lower = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(0.0, 0.0, 10.0, 10.0))),
+        (300.0, 200.0),
+        None,
+    );
+    frame(&mut app);
+    let lower_child = {
+        let content = popup_node(&app, lower);
+        app.app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(content)
+            .expect("content")
+            .children()[0]
+    };
+    let upper = open_sized(&mut app, tooltip_spec(button), (300.0, 200.0), None);
+    frame(&mut app);
+    let upper_child = {
+        let content = popup_node(&app, upper);
+        app.app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(content)
+            .expect("content")
+            .children()[0]
+    };
+    assert_ne!(lower_child, upper_child);
+    let point = point(50.0, 20.0);
+    assert_eq!(
+        app.probe().hit(point).map(|hit| hit.node),
+        Some(lower_child),
+        "透明顶层必须把命中让给下层 popup，而不是漏到更下层"
+    );
+    app.move_pointer(point);
+    assert_eq!(app.app().hovered(window), Some(lower_child));
+    let (_, _) = press(&mut app, point);
+    let (_, _) = release(&mut app, point);
+    assert_eq!(hits.get(), 0, "命中下层 popup 时不得触发更下层按钮");
+    app.app_mut().close_popup(upper).expect("close tooltip");
+    frame(&mut app);
+    assert_eq!(
+        app.probe().hit(point).map(|hit| hit.node),
+        Some(lower_child),
+        "移除透明顶层后下层 popup 仍正常命中"
+    );
+}
+
+#[test]
+fn pointer_transparent_tooltip_keeps_focus_and_a11y_intact() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let button = abs_button(&mut app, 0.0, 0.0, 100.0, 40.0, "under");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(button)));
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("under"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    app.enable_a11y_capture();
+    let id = open_sized(&mut app, tooltip_spec(button), (300.0, 200.0), None);
+    frame(&mut app);
+    assert_eq!(
+        app.app().focused(window),
+        Some(button),
+        "Hint/Tooltip 的 FocusPolicy::None 不得改变焦点"
+    );
+    let content = popup_node(&app, id);
+    let snapshot = app.a11y().expect("a11y snapshot");
+    let tooltip = snapshot.node_for(content).expect("tooltip record");
+    assert_eq!(tooltip.role, ui_core::a11y::A11yRole::Tooltip);
+    assert!(!tooltip.hidden, "可关闭的 Tooltip 不得对 a11y 隐藏");
+    assert!(
+        !snapshot
+            .node_for(button)
+            .expect("button record")
+            .described_by
+            .is_empty(),
+        "Tooltip 的 described_by 必须保留"
+    );
+    let point = point(50.0, 20.0);
+    let (_, _) = press(&mut app, point);
+    let (_, _) = release(&mut app, point);
+    assert_eq!(hits.get(), 1);
+    assert_eq!(
+        app.app().focused(window),
+        Some(button),
+        "穿透点击不得改变焦点"
+    );
+    assert_eq!(
+        app.a11y()
+            .expect("a11y snapshot")
+            .node_for(content)
+            .map(|node| node.role),
+        Some(ui_core::a11y::A11yRole::Tooltip)
+    );
+}
+
+fn scrim_id(app: &TestApp) -> PopupId {
+    app.app()
+        .popup_stack(win(app))
+        .expect("stack")
+        .entries
+        .iter()
+        .find(|entry| entry.tier == PopupTier::Scrim)
+        .map_or_else(|| panic!("scrim missing"), |entry| entry.id)
+}
+
+fn modal_spec(anchor: Anchor, scrim: bool) -> PopupSpec {
+    let mut spec = base_spec(anchor);
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    spec.scrim = scrim.then_some(ScrimSpec {
+        density: 0.5,
+        ..ScrimSpec::default()
+    });
+    spec.animation = PopupAnimation::Fade;
+    spec
+}
+
+#[test]
+fn a_modal_scrim_covers_the_full_viewport_and_damages_it() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 30.0)), true),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    assert!(
+        app.frame_record().damage_full,
+        "modal 打开必须全视口 damage"
+    );
+    let viewport = app.app().window(window).expect("window").size();
+    let scrim = scrim_id(&app);
+    let rect = app.app().popup_rect(scrim).expect("scrim rect");
+    assert_eq!(
+        rect.hit,
+        LogicalRect::from_origin_size(LogicalPoint::ZERO, viewport),
+        "scrim 必须全视口（不能被 settle 的 margin 夹小）"
+    );
+    assert_eq!(rect.paint, rect.hit);
+    assert!(
+        app.app_mut()
+            .begin_close_popup(modal, DismissReason::Programmatic)
+            .expect("begin close")
+    );
+    assert_eq!(
+        app.app().popup_state(scrim),
+        Some(PopupState::DismissPending),
+        "scrim 与 modal 同帧进入关闭"
+    );
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(modal).is_none());
+    assert_eq!(
+        app.app().popup_state(scrim),
+        None,
+        "modal 移除时 scrim 一并回收"
+    );
+    assert!(
+        app.frame_record().damage_full,
+        "modal 关闭移除帧必须全视口 damage"
+    );
+}
+
+#[test]
+fn window_deactivation_keeps_a_modal_with_scrim() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 30.0)), true),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    let scrim = scrim_id(&app);
+    app.app_mut().window_focus_lost(window);
+    frame(&mut app);
+    assert!(
+        app.app().popup_rect(modal).is_some(),
+        "窗口失焦必须保留 Modal（即使有 scrim）"
+    );
+    assert_eq!(app.app().popup_state(scrim), Some(PopupState::Open));
+}
+
+#[test]
+fn window_deactivation_emits_focus_lost() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+    let recorded = std::rc::Rc::clone(&seen);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 80.0),
+        Some(Box::new(move |_app, dismiss| {
+            recorded.set(Some(dismiss.reason));
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    app.app_mut().window_focus_lost(window);
+    frame(&mut app);
+    assert_eq!(seen.get(), Some(DismissReason::FocusLost));
+    assert!(app.app().popup_rect(id).is_none());
+}
+
+#[test]
+fn parent_close_emits_parent_closed_for_children() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let root_reason = std::rc::Rc::new(std::cell::Cell::new(None));
+    let child_reason = std::rc::Rc::new(std::cell::Cell::new(None));
+    let root_record = std::rc::Rc::clone(&root_reason);
+    let child_record = std::rc::Rc::clone(&child_reason);
+    let root = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 160.0),
+        Some(Box::new(move |_app, dismiss| {
+            root_record.set(Some(dismiss.reason));
+            DismissOutcome::CloseChain
+        })),
+    );
+    frame(&mut app);
+    let root_node = popup_node(&app, root);
+    let item = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(24.0)).build())
+            .build(tree.tree_mut(), root_node)
+            .expect("item")
+    };
+    frame(&mut app);
+    let mut child_spec = base_spec(Anchor::Node { node: item });
+    child_spec.parent = Some(root);
+    child_spec.placement = menu_placement();
+    let child = open_sized(
+        &mut app,
+        child_spec,
+        (80.0, 60.0),
+        Some(Box::new(move |_app, dismiss| {
+            child_record.set(Some(dismiss.reason));
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    let (_, _) = press(&mut app, point(700.0, 500.0));
+    let (_, _) = release(&mut app, point(700.0, 500.0));
+    assert_eq!(root_reason.get(), Some(DismissReason::OutsidePress));
+    assert_eq!(
+        child_reason.get(),
+        Some(DismissReason::ParentClosed),
+        "父级级联关闭必须派发 ParentClosed"
+    );
+    assert_eq!(app.app().popup_state(child), None);
+}
+
+#[test]
+fn escape_close_chain_policy_closes_the_whole_chain() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut first_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    first_spec.animation = PopupAnimation::Fade;
+    let first = open_sized(&mut app, first_spec, (120.0, 160.0), None);
+    frame(&mut app);
+    let root_node = popup_node(&app, first);
+    let item = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(24.0)).build())
+            .build(tree.tree_mut(), root_node)
+            .expect("item")
+    };
+    frame(&mut app);
+    let mut second_spec = base_spec(Anchor::Node { node: item });
+    second_spec.parent = Some(first);
+    second_spec.placement = menu_placement();
+    second_spec.animation = PopupAnimation::Fade;
+    second_spec.dismiss = DismissPolicy::Chain {
+        outside: ui_core::popup::OutsidePress::Replay,
+        escape: EscapePolicy::CloseChain,
+        anchor_lost: true,
+        focus_lost: true,
+    };
+    let second = open_sized(&mut app, second_spec, (80.0, 60.0), None);
+    frame(&mut app);
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed);
+    assert_eq!(
+        app.app().popup_state(first),
+        Some(PopupState::DismissPending),
+        "CloseChain 必须真实关闭整链（非 CloseTopmost）"
+    );
+    assert_eq!(
+        app.app().popup_state(second),
+        Some(PopupState::DismissPending)
+    );
+}
+
+#[test]
+fn pressing_the_opener_while_closing_cancels_the_close() {
+    let mut app = TestApp::new();
+    let trigger = root_button(&mut app, (100.0, 30.0), "trigger");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("trigger"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let mut spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    spec.opener = Some(trigger);
+    spec.animation = PopupAnimation::Fade;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed);
+    assert_eq!(app.app().popup_state(id), Some(PopupState::DismissPending));
+    let (_, down_consumed) = press(&mut app, point(20.0, 10.0));
+    assert!(down_consumed, "Closing 中命中 opener 必须取消关闭并消费");
+    let (_, _) = release(&mut app, point(20.0, 10.0));
+    assert_eq!(
+        app.app().popup_state(id),
+        Some(PopupState::Opening),
+        "取消关闭必须回到 Opening"
+    );
+    assert!(app.app().popup_rect(id).is_some());
+    app.advance(Duration::from_millis(130));
+    frame(&mut app);
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Open));
+    assert_eq!(hits.get(), 0, "取消关闭不得触发 opener 的点击 action");
+}
+
+#[test]
+fn closing_an_opening_popup_keeps_later_nodes_clean() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = open_sized(
+        &mut app,
+        {
+            let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+            spec.animation = PopupAnimation::Fade;
+            spec
+        },
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    app.app_mut().close_popup(first).expect("immediate close");
+    let second = open_sized(
+        &mut app,
+        {
+            let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+            spec.animation = PopupAnimation::Fade;
+            spec
+        },
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    let rect = app.app().popup_rect(second).expect("rect").hit;
+    let center = point(
+        (rect.origin.x + 10.0).value(),
+        (rect.origin.y + 10.0).value(),
+    );
+    let hit = app.probe().hit(center).map(|result| result.node);
+    let content = popup_node(&app, second);
+    assert!(
+        hit == Some(content)
+            || app
+                .app()
+                .window(window)
+                .expect("window")
+                .tree()
+                .get(content)
+                .expect("content")
+                .children()
+                .contains(&hit.expect("hit")),
+        "立即关闭 Opening 中的 popup 后，新 popup 必须可命中（槽位复用不继承 blocked）"
+    );
+}
+
+fn open_text_popup(app: &mut TestApp) -> PopupId {
+    let window = win(app);
+    app.app_mut()
+        .open_popup(
+            window,
+            base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+            |app, window, node| {
+                let tree = app.window_mut(window).expect("window").tree_mut();
+                NodeBuilder::text(
+                    "a tooltip style sentence that must wrap onto several lines of text",
+                    ui_core::text::TextStyle::new(px(16.0)),
+                )
+                .style(StyleBuilder::new().width(px(120.0)).build())
+                .build(tree, node)?;
+                Ok(())
+            },
+            None,
+        )
+        .expect("text popup")
+}
+
+#[test]
+fn text_dominated_height_is_stable_on_the_first_frame() {
+    let mut app = TestApp::new();
+    let id = open_text_popup(&mut app);
+    frame(&mut app);
+    let first = app.app().popup_rect(id).expect("rect").hit;
+    assert!(
+        first.size.height > px(20.0),
+        "文本必须在首帧完成 layout_text 并撑出多行高度"
+    );
+    assert_eq!(app.frame_record().stats.popup_settle_rounds, 2);
+    assert!(app.frame_record().repainted, "首帧必须真正绘制");
+    assert!(
+        !app.frame_record().damage.is_empty() || app.frame_record().damage_full,
+        "首帧必须产生 damage"
+    );
+    stable_frame(&mut app);
+    assert_eq!(
+        app.app().popup_rect(id).expect("rect").hit,
+        first,
+        "文本主导高度在首帧即必须等于稳定帧"
+    );
+}
+
+#[test]
+fn a_virtual_list_inside_a_popup_settles_after_item_changes() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (140.0, 100.0),
+        None,
+    );
+    frame(&mut app);
+    let content = popup_node(&app, id);
+    let mut rows_style = StyleBuilder::new()
+        .relative()
+        .size(px(120.0), px(80.0))
+        .build();
+    rows_style.clip = Clip::Bounds;
+    let container = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(rows_style)
+            .build(tree.tree_mut(), content)
+            .expect("rows")
+    };
+    let list = app
+        .app_mut()
+        .make_virtual_list(
+            window,
+            container,
+            ui_core::interaction::VirtualListConfig {
+                extent: px(20.0),
+                extents: None,
+                overscan: 1,
+            },
+        )
+        .expect("virtual list");
+    app.app_mut()
+        .set_virtual_items(&list, 400, |_| {
+            NodeBuilder::boxed().style(StyleBuilder::new().size(px(120.0), px(20.0)).build())
+        })
+        .expect("items");
+    frame(&mut app);
+    let mounted = app.app().virtual_list_state(&list).expect("state").mounted;
+    assert!(mounted < 400, "虚拟列表只能挂载可见窗口");
+    assert!(
+        app.app().popup_diagnostics(window).is_empty(),
+        "虚拟列表窗口化后 popup 不得 Unsettled"
+    );
+    let first = app.app().popup_rect(id).expect("rect").hit;
+    app.app_mut()
+        .set_virtual_items(&list, 5, |_| {
+            NodeBuilder::boxed().style(StyleBuilder::new().size(px(120.0), px(20.0)).build())
+        })
+        .expect("items");
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_rect(id).expect("rect").hit,
+        first,
+        "虚拟列表增删不得改变 popup 尺寸"
+    );
+}
+
+#[test]
+fn a_dpi_change_keeps_the_popup_logical_geometry_stable() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 60.0, 20.0))),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    let placed = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(placed, rect(100.0, 124.0, 120.0, 80.0));
+    let dpr = ui_core::math::DevicePixelRatio::new(2.0).expect("dpr");
+    app.app_mut()
+        .window_mut(window)
+        .expect("window")
+        .set_device_pixel_ratio(dpr);
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_rect(id).expect("rect").hit,
+        placed,
+        "DPI 变化后逻辑几何不得改变"
+    );
+    let center = point(
+        (placed.origin.x + 10.0).value(),
+        (placed.origin.y + 10.0).value(),
+    );
+    assert!(app.probe().hit(center).is_some(), "DPI 变化后命中必须工作");
+    let back = ui_core::math::DevicePixelRatio::new(1.0).expect("dpr");
+    app.app_mut()
+        .window_mut(window)
+        .expect("window")
+        .set_device_pixel_ratio(back);
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_rect(id).expect("rect").hit,
+        placed,
+        "回到 1x 后逻辑几何仍保持"
+    );
+    assert!(app.probe().hit(center).is_some());
+}
+
+#[test]
+fn an_oversized_popup_is_clamped_to_the_viewport_margin() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (2000.0, 2000.0),
+        None,
+    );
+    frame(&mut app);
+    let clamped = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(
+        clamped.size,
+        LogicalSize::new(px(792.0), px(592.0)),
+        "超出 viewport 的内容必须被 max_size 钳制"
+    );
+    assert!(clamped.origin.x >= px(4.0) && clamped.origin.y >= px(4.0));
+    assert!(
+        clamped.max().x <= px(796.0) && clamped.max().y <= px(596.0),
+        "钳制后必须落在 viewport margin 内"
+    );
+    assert_eq!(app.frame_record().stats.popup_settle_rounds, 2);
+    assert!(
+        !app.app()
+            .popup_diagnostics(win(&app))
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                ui_core::popup::PopupDiagnostic::Unsettled { .. }
+            ))
+    );
+}
+
+#[test]
+fn a_modal_blocks_background_hover_and_scroll() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut container_style = StyleBuilder::new()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .size(px(200.0), px(100.0))
+        .build();
+    container_style.clip = Clip::Bounds;
+    let container = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        let root = tree.tree().root();
+        NodeBuilder::boxed()
+            .style(container_style)
+            .build(tree.tree_mut(), root)
+            .expect("container")
+    };
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            container,
+            ui_core::interaction::ScrollConfig::default(),
+        )
+        .expect("scroll");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(600.0)))
+        .expect("content");
+    frame(&mut app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(300.0, 200.0, 40.0, 30.0)), false),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    let background = point(50.0, 50.0);
+    app.move_pointer(background);
+    assert_eq!(
+        app.app().hovered(window),
+        None,
+        "Modal 外不得产生背景 hover"
+    );
+    app.inject(InputEvent::scroll_lines(
+        background,
+        LogicalPoint::new(px(0.0), px(-120.0)),
+        Modifiers::empty(),
+    ));
+    frame(&mut app);
+    let offset = app.app().scroll_state(&handle).expect("state").offset;
+    assert_eq!(offset.y, px(0.0), "Modal 外不得滚动背景");
+    app.app_mut().close_popup(modal).expect("close modal");
+    frame(&mut app);
+    app.inject(InputEvent::scroll_lines(
+        background,
+        LogicalPoint::new(px(0.0), px(-120.0)),
+        Modifiers::empty(),
+    ));
+    app.advance(Duration::from_millis(400));
+    frame(&mut app);
+    assert!(
+        app.app().scroll_state(&handle).expect("state").offset.y > px(0.0),
+        "关闭 modal 后背景恢复滚动"
+    );
+}
+
+#[test]
+fn an_owner_modal_popup_stays_interactive_and_closes_from_inside_the_dialog() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 30.0)), false),
+        (300.0, 200.0),
+        None,
+    );
+    frame(&mut app);
+    let dialog = popup_node(&app, modal);
+    let trigger = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(80.0), px(32.0))
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(10.0))
+                    .build(),
+            )
+            .on_click(Action::custom("trigger"))
+            .build(tree.tree_mut(), dialog)
+            .expect("trigger")
+    };
+    let inside_hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let inside_counter = std::rc::Rc::clone(&inside_hits);
+    app.app_mut()
+        .on_action(Action::custom("inside"), move |_ctx| {
+            inside_counter.set(inside_counter.get() + 1);
+        });
+    frame(&mut app);
+    let mut select_spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 80.0, 32.0),
+    });
+    select_spec.opener = Some(trigger);
+    select_spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Opener,
+    };
+    let select = app
+        .app_mut()
+        .open_popup(
+            window,
+            select_spec,
+            |app, window, node| {
+                NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(100.0), px(80.0)).build())
+                    .on_click(Action::custom("inside"))
+                    .build(app.window_mut(window).expect("window").tree_mut(), node)?;
+                Ok(())
+            },
+            None,
+        )
+        .expect("select");
+    frame(&mut app);
+    assert_eq!(
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .iter()
+            .find(|entry| entry.id == select)
+            .expect("select")
+            .owner_modal,
+        Some(modal),
+        "Dialog 内打开的 Select 必须归属该 modal scope"
+    );
+    let select_rect = app.app().popup_rect(select).expect("rect").hit;
+    let inside_point = point(
+        (select_rect.origin.x + 10.0).value(),
+        (select_rect.origin.y + 10.0).value(),
+    );
+    let (_, down_consumed) = press(&mut app, inside_point);
+    assert!(!down_consumed, "scope 内 Select 上的按下必须正常派发");
+    let (_, _) = release(&mut app, inside_point);
+    assert_eq!(inside_hits.get(), 1, "owner_modal popup 内容必须可交互");
+    let dialog_point = point(
+        (app.app()
+            .popup_rect(modal)
+            .expect("modal rect")
+            .hit
+            .origin
+            .x
+            + 1.0)
+            .value(),
+        (app.app()
+            .popup_rect(modal)
+            .expect("modal rect")
+            .hit
+            .origin
+            .y
+            + 1.0)
+            .value(),
+    );
+    app.app_mut()
+        .close_popup(select)
+        .expect("select must be closable from inside dialog");
+    let _ = dialog_point;
+    assert_eq!(app.app().popup_state(select), None);
+    assert!(
+        app.app().popup_rect(modal).is_some(),
+        "关闭 Select 不得关闭 Dialog"
+    );
+}
+
+#[test]
+fn popup_stack_rects_are_finite_and_respect_z_and_scope_invariants() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 30.0)), true),
+        (300.0, 200.0),
+        None,
+    );
+    frame(&mut app);
+    let dialog = popup_node(&app, modal);
+    let trigger = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(80.0), px(32.0))
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(10.0))
+                    .build(),
+            )
+            .build(tree.tree_mut(), dialog)
+            .expect("trigger")
+    };
+    frame(&mut app);
+    let mut select_spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 80.0, 32.0),
+    });
+    select_spec.opener = Some(trigger);
+    let select = open_sized(&mut app, select_spec, (100.0, 60.0), None);
+    frame(&mut app);
+    let stack = app.app().popup_stack(window).expect("stack");
+    let viewport = app.app().window(window).expect("window").size();
+    for entry in &stack.entries {
+        assert!(entry.hit_rect.is_finite(), "popup rect 必须有限");
+        assert!(entry.paint_rect.is_finite(), "paint rect 必须有限");
+        assert!(
+            entry.hit_rect.origin.x >= LogicalPoint::ZERO.x
+                && entry.hit_rect.origin.y >= LogicalPoint::ZERO.y,
+            "popup 不得越出左上边界"
+        );
+        assert!(
+            entry.hit_rect.max().x <= viewport.width && entry.hit_rect.max().y <= viewport.height,
+            "popup 不得越出 viewport"
+        );
+    }
+    let modal_z = stack
+        .entries
+        .iter()
+        .find(|entry| entry.id == modal)
+        .expect("modal")
+        .z;
+    let select_z = stack
+        .entries
+        .iter()
+        .find(|entry| entry.id == select)
+        .expect("select")
+        .z;
+    assert!(select_z > modal_z, "owner_modal 后代必须高于 modal");
+}
+
+#[test]
+fn invalid_z_policy_open_leaves_no_residue_and_next_open_works() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    app.app_mut().close_popup(first).expect("close first");
+    let popup_root = app.app().popup_stack(window).expect("stack").root;
+    let children_before = app
+        .app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(popup_root)
+        .expect("popup root")
+        .children()
+        .len();
+    let stale = first;
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.z = ui_core::popup::ZPolicy::Above(stale);
+    let failed = app
+        .app_mut()
+        .open_popup(window, spec, |_app, _window, _node| Ok(()), None);
+    assert!(failed.is_err(), "stale ZPolicy::Above 必须返回错误");
+    let children_after = app
+        .app()
+        .window(window)
+        .expect("window")
+        .tree()
+        .get(popup_root)
+        .expect("popup root")
+        .children()
+        .len();
+    assert_eq!(
+        children_before, children_after,
+        "open 失败不得在 popup root 留下孤儿节点"
+    );
+    let recovered = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    let rect = app.app().popup_rect(recovered).expect("rect").hit;
+    let center = point(
+        (rect.origin.x + 10.0).value(),
+        (rect.origin.y + 10.0).value(),
+    );
+    assert!(
+        app.probe().hit(center).is_some(),
+        "失败后下一次 open 必须正常"
+    );
+}
+
+#[test]
+fn a_modal_blocks_new_hints_until_it_closes() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 30.0)), false),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    let mut hint_spec = base_spec(Anchor::WindowRect(rect(400.0, 100.0, 20.0, 20.0)));
+    hint_spec.tier = PopupTier::Hint;
+    hint_spec.dismiss = DismissPolicy::Hint { escape: true };
+    let blocked = app.app_mut().open_popup(
+        window,
+        hint_spec.clone(),
+        |_app, _window, _node| Ok(()),
+        None,
+    );
+    assert!(
+        matches!(
+            blocked,
+            Err(ui_core::popup::PopupError::HintBlockedByModal { .. })
+        ),
+        "Modal 打开期间不得打开 Hint（含 z 叠高）"
+    );
+    app.app_mut().close_popup(modal).expect("close modal");
+    frame(&mut app);
+    let hint = app
+        .app_mut()
+        .open_popup(window, hint_spec, |_app, _window, _node| Ok(()), None)
+        .expect("hint after modal closes");
+    frame(&mut app);
+    assert!(app.app().popup_rect(hint).is_some());
+}
+
+#[test]
+fn a_submenu_ignores_vertical_fallbacks_and_opens_horizontally() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let parent = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (120.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.parent = Some(parent);
+    spec.placement = PlacementSpec::default();
+    let child = app
+        .app_mut()
+        .open_popup(window, spec, |_app, _window, _node| Ok(()), None)
+        .expect("submenu coerces vertical primary to horizontal");
+    frame(&mut app);
+    let rect = app.app().popup_rect(child).expect("rect").hit;
+    assert_eq!(
+        rect.origin,
+        LogicalPoint::new(px(224.0), px(100.0)),
+        "子菜单必须水平开在 parent 面板右侧（垂直候选被忽略）"
+    );
+}
+
+#[test]
+fn submenu_placement_flips_right_to_left_with_exact_geometry() {
+    let spec = PlacementSpec::submenu();
+    let result = ui_core::popup::placement::solve_placement(ui_core::popup::PlacementInput {
+        anchor: rect(760.0, 100.0, 20.0, 100.0),
+        size: LogicalSize::new(px(120.0), px(60.0)),
+        viewport: LogicalSize::new(px(800.0), px(600.0)),
+        avoid: None,
+        spec,
+    })
+    .expect("placement");
+    assert_eq!(result.side, Side::Left, "右侧溢出必须翻到左侧");
+    assert_eq!(
+        result.rect.origin,
+        LogicalPoint::new(px(760.0 - 4.0 - 120.0), px(100.0)),
+        "翻到左侧后的几何必须是确定值（而不是被 clamp 在右侧）"
+    );
+    assert!(result.rect.max().x <= px(800.0));
+}
+
+#[test]
+fn a_user_supplied_scrim_tier_is_rejected() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Scrim;
+    let result = app
+        .app_mut()
+        .open_popup(window, spec, |_app, _window, _node| Ok(()), None);
+    assert!(
+        matches!(result, Err(ui_core::popup::PopupError::InvalidScrim { .. })),
+        "Scrim 只能由引擎合成，公开 spec 不得伪造 Scrim tier"
+    );
+    assert!(
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .is_empty()
+    );
+}
+
+#[test]
+fn an_orphaned_scrim_is_reaped_when_the_modal_node_disappears() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 30.0)), true),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    let scrim = scrim_id(&app);
+    let modal_node = popup_node(&app, modal);
+    app.app_mut()
+        .remove_node(window, modal_node)
+        .expect("external remove modal content");
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_state(scrim),
+        None,
+        "modal 内容节点被外部删除后 scrim 必须被回收，不能留下全屏孤儿层"
+    );
+    let background = point(400.0, 300.0);
+    assert_ne!(
+        app.probe().hit(background).map(|hit| hit.node),
+        Some(
+            app.app()
+                .popup_stack(window)
+                .expect("stack")
+                .entries
+                .iter()
+                .find(|entry| entry.tier == PopupTier::Scrim)
+                .map(|entry| entry.node)
+                .unwrap_or_else(|| app.app().popup_stack(window).expect("stack").root)
+        ),
+        "背景命中不得落在孤儿 scrim 上"
+    );
+}
+
+#[test]
+fn an_anchor_lost_chain_closes_the_whole_chain() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let anchor = root_box(&mut app, (60.0, 20.0), Color::WHITE);
+    frame(&mut app);
+    let mut root_spec = base_spec(Anchor::Node { node: anchor });
+    root_spec.dismiss = DismissPolicy::Chain {
+        outside: ui_core::popup::OutsidePress::Replay,
+        escape: EscapePolicy::CloseTopmost,
+        anchor_lost: true,
+        focus_lost: true,
+    };
+    let root = open_sized(&mut app, root_spec, (120.0, 120.0), None);
+    frame(&mut app);
+    let root_node = popup_node(&app, root);
+    let item = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(24.0)).build())
+            .build(tree.tree_mut(), root_node)
+            .expect("item")
+    };
+    frame(&mut app);
+    let mut child_spec = base_spec(Anchor::Node { node: item });
+    child_spec.parent = Some(root);
+    child_spec.placement = menu_placement();
+    let child = open_sized(&mut app, child_spec, (80.0, 60.0), None);
+    frame(&mut app);
+    app.app_mut()
+        .remove_node(window, anchor)
+        .expect("remove anchor");
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_state(root),
+        None,
+        "anchor_lost 必须关闭整条链"
+    );
+    assert_eq!(app.app().popup_state(child), None);
+}
+
+#[test]
+fn a_popup_opened_inside_an_owner_modal_popup_keeps_the_modal_scope() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 30.0)), false),
+        (300.0, 200.0),
+        None,
+    );
+    frame(&mut app);
+    let dialog = popup_node(&app, modal);
+    let trigger = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(80.0), px(32.0))
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(10.0))
+                    .build(),
+            )
+            .build(tree.tree_mut(), dialog)
+            .expect("trigger")
+    };
+    frame(&mut app);
+    let mut select_spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 80.0, 32.0),
+    });
+    select_spec.opener = Some(trigger);
+    let select = open_sized(&mut app, select_spec, (100.0, 60.0), None);
+    frame(&mut app);
+    let select_node = popup_node(&app, select);
+    let inside = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(60.0), px(24.0)).build())
+            .build(tree.tree_mut(), select_node)
+            .expect("inside")
+    };
+    frame(&mut app);
+    let mut nested_spec = base_spec(Anchor::NodeRect {
+        node: inside,
+        rect: rect(0.0, 0.0, 60.0, 24.0),
+    });
+    nested_spec.tier = PopupTier::Modal;
+    nested_spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    nested_spec.opener = Some(inside);
+    let nested = open_sized(&mut app, nested_spec, (80.0, 40.0), None);
+    frame(&mut app);
+    let owner = app
+        .app()
+        .popup_stack(window)
+        .expect("stack")
+        .entries
+        .iter()
+        .find(|entry| entry.id == nested)
+        .expect("nested")
+        .owner_modal;
+    assert_eq!(
+        owner,
+        Some(modal),
+        "经由 owner_modal popup 内 opener 打开的新 popup 必须继承 modal scope"
+    );
+}
+
+fn dialog_with_button(app: &mut TestApp) -> (PopupId, NodeId) {
+    let window = win(app);
+    let modal = open_sized(
+        app,
+        modal_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 30.0)), false),
+        (300.0, 200.0),
+        None,
+    );
+    frame(app);
+    let dialog = popup_node(app, modal);
+    let button = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(80.0), px(32.0))
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(10.0))
+                    .build(),
+            )
+            .on_click(Action::custom("dialog-button"))
+            .build(tree.tree_mut(), dialog)
+            .expect("button")
+    };
+    frame(app);
+    (modal, button)
+}
+
+#[test]
+fn a_tooltip_opened_from_dialog_content_is_allowed_above_the_modal() {
+    let mut app = TestApp::new();
+    app.enable_a11y_capture();
+    let window = win(&app);
+    let (modal, button) = dialog_with_button(&mut app);
+    let mut hint_spec = base_spec(Anchor::NodeRect {
+        node: button,
+        rect: rect(0.0, 0.0, 80.0, 32.0),
+    });
+    hint_spec.tier = PopupTier::Hint;
+    hint_spec.dismiss = DismissPolicy::Hint { escape: true };
+    hint_spec.opener = Some(button);
+    hint_spec.a11y = PopupA11y {
+        role: Some(ui_core::a11y::A11yRole::Tooltip),
+        described_by: Some(button),
+        ..Default::default()
+    };
+    let hint = app
+        .app_mut()
+        .open_popup(window, hint_spec, |_app, _window, _node| Ok(()), None)
+        .expect("in-scope tooltip");
+    frame(&mut app);
+    let modal_z = app
+        .app()
+        .popup_stack(window)
+        .expect("stack")
+        .entries
+        .iter()
+        .find(|entry| entry.id == modal)
+        .expect("modal")
+        .z;
+    let snapshot = app.app().popup_stack(window).expect("stack");
+    let hint_entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.id == hint)
+        .expect("hint");
+    assert!(
+        hint_entry.z > modal_z,
+        "Dialog 内 tooltip 必须显示在 modal 之上"
+    );
+    assert_eq!(hint_entry.owner_modal, Some(modal));
+    let hint_node = hint_entry.node;
+    let record = app
+        .a11y()
+        .expect("a11y snapshot")
+        .node_for(hint_node)
+        .expect("tooltip record");
+    assert_eq!(record.role, ui_core::a11y::A11yRole::Tooltip);
+    assert!(!record.hidden);
+    assert!(
+        !app.a11y()
+            .expect("a11y snapshot")
+            .node_for(button)
+            .expect("button record")
+            .described_by
+            .is_empty(),
+        "Dialog 内 tooltip 的 described_by 必须保留"
+    );
+}
+
+#[test]
+fn a_background_tooltip_is_rejected_while_a_modal_is_open() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let background = root_button(&mut app, (100.0, 30.0), "background");
+    frame(&mut app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(500.0, 400.0, 40.0, 30.0)), false),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    let mut hint_spec = base_spec(Anchor::NodeRect {
+        node: background,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    hint_spec.tier = PopupTier::Hint;
+    hint_spec.dismiss = DismissPolicy::Hint { escape: true };
+    hint_spec.opener = Some(background);
+    let blocked = app.app_mut().open_popup(
+        window,
+        hint_spec.clone(),
+        |_app, _window, _node| Ok(()),
+        None,
+    );
+    assert!(
+        matches!(
+            blocked,
+            Err(ui_core::popup::PopupError::HintBlockedByModal { .. })
+        ),
+        "背景 tooltip 在 modal 打开期间必须被拒绝"
+    );
+    app.app_mut().close_popup(modal).expect("close modal");
+    frame(&mut app);
+    let hint = app
+        .app_mut()
+        .open_popup(window, hint_spec, |_app, _window, _node| Ok(()), None)
+        .expect("background tooltip after modal closes");
+    frame(&mut app);
+    assert!(app.app().popup_rect(hint).is_some());
+}
+
+#[test]
+fn opening_a_modal_closes_background_hints() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let background = root_button(&mut app, (100.0, 30.0), "background");
+    frame(&mut app);
+    let mut hint_spec = base_spec(Anchor::NodeRect {
+        node: background,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    hint_spec.tier = PopupTier::Hint;
+    hint_spec.dismiss = DismissPolicy::Hint { escape: true };
+    hint_spec.opener = Some(background);
+    let hint = app
+        .app_mut()
+        .open_popup(window, hint_spec, |_app, _window, _node| Ok(()), None)
+        .expect("hint");
+    frame(&mut app);
+    assert!(app.app().popup_rect(hint).is_some());
+    let _ = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(400.0, 300.0, 40.0, 30.0)), false),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_state(hint),
+        None,
+        "modal 打开必须关闭背景 Hint"
+    );
+}
+
+#[test]
+fn dismiss_topmost_runs_the_closing_transaction() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let reasons = std::rc::Rc::new(std::cell::Cell::new(None));
+    let recorded = std::rc::Rc::clone(&reasons);
+    let mut spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    spec.animation = PopupAnimation::Fade;
+    let id = open_sized(
+        &mut app,
+        spec,
+        (120.0, 80.0),
+        Some(Box::new(move |_app, dismiss| {
+            recorded.set(Some(dismiss.reason));
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    assert!(
+        app.app_mut()
+            .dismiss_topmost(window, DismissReason::Programmatic)
+    );
+    assert_eq!(
+        app.app().popup_state(id),
+        Some(PopupState::DismissPending),
+        "程序化 dismiss 必须走 Closing 事务而不是立即删节点"
+    );
+    assert!(app.app().popup_rect(id).is_some());
+    assert_eq!(reasons.get(), Some(DismissReason::Programmatic));
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(id).is_none());
+}
+
+#[test]
+fn a_constrained_popup_exposes_its_applied_size_without_unsettled_churn() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    app.app_mut()
+        .window_mut(window)
+        .expect("window")
+        .set_size(LogicalSize::new(px(300.0), px(200.0)));
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(10.0, 10.0, 20.0, 20.0))),
+        (2000.0, 2000.0),
+        None,
+    );
+    frame(&mut app);
+    let snapshot = app.app().popup_stack(window).expect("stack");
+    let entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .expect("entry");
+    assert_eq!(
+        entry.constrained_size,
+        Some(LogicalSize::new(px(292.0), px(192.0))),
+        "resized 结果必须通过 constrained_size 暴露给 kit"
+    );
+    let diagnostics = app.app().popup_diagnostics(window);
+    assert!(
+        diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ui_core::popup::PopupDiagnostic::Resized { .. }
+        )),
+        "placement resize 必须记录 Resized 诊断"
+    );
+    assert!(
+        !diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic,
+            ui_core::popup::PopupDiagnostic::Unsettled { .. }
+        )),
+        "已应用的 resize 不得误报 Unsettled"
+    );
+    assert_eq!(app.app().popup_state(id), Some(PopupState::Open));
+    frame(&mut app);
+    assert_eq!(
+        app.frame_record().stats.popup_settle_rounds,
+        0,
+        "resize 收敛后不得每帧重 settle"
+    );
+    assert!(
+        app.app()
+            .popup_diagnostics(window)
+            .iter()
+            .all(|diagnostic| !matches!(
+                diagnostic,
+                ui_core::popup::PopupDiagnostic::Unsettled { .. }
+            )),
+        "稳定后不得出现 Unsettled 诊断"
+    );
+}
+
+#[test]
+fn raise_damages_descendant_painted_extent() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let lower = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 40.0, 20.0))),
+        (160.0, 60.0),
+        None,
+    );
+    frame(&mut app);
+    let lower_node = popup_node(&app, lower);
+    let shadowed = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(100.0), px(40.0)).build())
+            .paint(PaintSpec {
+                background: Color::WHITE,
+                shadows: ui_core::paint::style::Shadows::new([ui_core::paint::style::ShadowSpec {
+                    offset: LogicalPoint::new(px(0.0), px(40.0)),
+                    blur: px(20.0),
+                    spread: px(10.0),
+                    color: Color::BLACK,
+                }]),
+                ..PaintSpec::default()
+            })
+            .build(tree.tree_mut(), lower_node)
+            .expect("shadowed")
+    };
+    let _ = shadowed;
+    let mut upper_spec = base_spec(Anchor::WindowRect(rect(400.0, 100.0, 40.0, 20.0)));
+    upper_spec.tier = PopupTier::Hint;
+    upper_spec.dismiss = DismissPolicy::Hint { escape: true };
+    let upper = open_sized(&mut app, upper_spec, (160.0, 60.0), None);
+    frame(&mut app);
+    let _ = upper;
+    app.app_mut().raise_popup(lower).expect("raise");
+    frame(&mut app);
+    let lower_rect = app.app().popup_rect(lower).expect("rect").hit;
+    let expanded = LogicalRect::new(
+        lower_rect.origin.x,
+        lower_rect.origin.y,
+        lower_rect.size.width,
+        lower_rect.size.height + px(60.0),
+    );
+    assert!(
+        damage_covers(&app, expanded),
+        "reorder damage 必须包含后代 shadow 的 painted extent"
+    );
+}
+
+#[test]
+fn a_child_popup_anchor_follows_the_parent_paint_offset() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut parent_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    parent_spec.animation = PopupAnimation::FadeSlide;
+    let parent = open_sized(&mut app, parent_spec, (200.0, 160.0), None);
+    frame(&mut app);
+    let parent_node = popup_node(&app, parent);
+    let item = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(40.0), px(40.0))
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(10.0))
+                    .build(),
+            )
+            .build(tree.tree_mut(), parent_node)
+            .expect("item")
+    };
+    frame(&mut app);
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    let offset = app
+        .app()
+        .popup_stack(window)
+        .expect("stack")
+        .entries
+        .iter()
+        .find(|entry| entry.id == parent)
+        .expect("parent")
+        .paint_offset;
+    assert!(offset.y > px(0.0));
+    let parent_rect = app.app().popup_rect(parent).expect("rect").hit;
+    let mut child_spec = base_spec(Anchor::NodeRect {
+        node: item,
+        rect: rect(0.0, 0.0, 40.0, 40.0),
+    });
+    child_spec.parent = Some(parent);
+    child_spec.placement = menu_placement();
+    let child = open_sized(&mut app, child_spec, (80.0, 60.0), None);
+    frame(&mut app);
+    let child_rect = app.app().popup_rect(child).expect("rect").hit;
+    assert_eq!(
+        child_rect.origin,
+        LogicalPoint::new(
+            px(parent_rect.max().x.value() + 4.0),
+            px(parent_rect.origin.y.value() + 10.0 + offset.y.value()),
+        ),
+        "子 popup 锚点必须跟随父 paint_offset 的绘制位置"
+    );
+}
+
+#[test]
+fn external_max_size_writes_are_reapplied_by_the_next_settle() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (2000.0, 2000.0),
+        None,
+    );
+    frame(&mut app);
+    let content = popup_node(&app, id);
+    app.app_mut()
+        .window_mut(window)
+        .expect("window")
+        .set_max_size(content, ui_core::node::tree::MaxSize::default())
+        .expect("external max size");
+    frame(&mut app);
+    let rect = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(
+        rect.size,
+        LogicalSize::new(px(792.0), px(592.0)),
+        "外部写入 max_size 后 settle 必须重新施加 popup 约束"
+    );
+}
+
+#[test]
+fn an_anchor_lost_dismissal_records_a_diagnostic() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let anchor = root_box(&mut app, (60.0, 20.0), Color::WHITE);
+    frame(&mut app);
+    let mut spec = base_spec(Anchor::Node { node: anchor });
+    spec.dismiss = DismissPolicy::Chain {
+        outside: ui_core::popup::OutsidePress::Replay,
+        escape: EscapePolicy::CloseTopmost,
+        anchor_lost: true,
+        focus_lost: true,
+    };
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    app.app_mut().remove_node(window, anchor).expect("remove");
+    frame(&mut app);
+    assert_eq!(app.app().popup_state(id), None);
+    assert!(
+        app.app()
+            .popup_diagnostics(window)
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic,
+                ui_core::popup::PopupDiagnostic::AnchorLost { .. }
+            )),
+        "AnchorLost 必须进入诊断面"
+    );
+}
+
+fn node_placement(side: Side, align: Alignment) -> PlacementSpec {
+    PlacementSpec {
+        side,
+        align,
+        fallbacks: Default::default(),
+        ..PlacementSpec::default()
+    }
+}
+
+fn node_anchor(node: NodeId) -> Anchor {
+    Anchor::Node { node }
+}
+
+#[test]
+fn a_node_anchor_uses_the_full_border_box_for_all_four_sides() {
+    let mut app = TestApp::new();
+    let node = abs_button(&mut app, 100.0, 100.0, 80.0, 40.0, "anchor");
+    frame(&mut app);
+    for (side, align, expected) in [
+        (Side::Bottom, Alignment::Start, (100.0, 144.0)),
+        (Side::Bottom, Alignment::Center, (110.0, 144.0)),
+        (Side::Bottom, Alignment::End, (120.0, 144.0)),
+        (Side::Top, Alignment::Start, (100.0, 66.0)),
+        (Side::Top, Alignment::Center, (110.0, 66.0)),
+        (Side::Top, Alignment::End, (120.0, 66.0)),
+        (Side::Right, Alignment::Start, (184.0, 100.0)),
+        (Side::Right, Alignment::Center, (184.0, 105.0)),
+        (Side::Right, Alignment::End, (184.0, 110.0)),
+        (Side::Left, Alignment::Start, (36.0, 100.0)),
+        (Side::Left, Alignment::Center, (36.0, 105.0)),
+        (Side::Left, Alignment::End, (36.0, 110.0)),
+    ] {
+        let mut spec = base_spec(node_anchor(node));
+        spec.placement = node_placement(side, align);
+        let id = open_sized(&mut app, spec, (60.0, 30.0), None);
+        frame(&mut app);
+        let rect = app.app().popup_rect(id).expect("rect").hit;
+        assert_eq!(
+            (rect.origin.x.value(), rect.origin.y.value()),
+            expected,
+            "side={side:?} align={align:?} 必须以完整节点矩形定位"
+        );
+        app.app_mut().close_popup(id).expect("close");
+        frame(&mut app);
+    }
+}
+
+#[test]
+fn a_node_anchor_flip_never_overlaps_the_anchor_border_box() {
+    let mut app = TestApp::new();
+    let bottom = abs_button(&mut app, 100.0, 520.0, 80.0, 40.0, "bottom");
+    let top = abs_button(&mut app, 300.0, 10.0, 80.0, 40.0, "top");
+    let right = abs_button(&mut app, 700.0, 200.0, 80.0, 40.0, "right");
+    let left = abs_button(&mut app, 10.0, 300.0, 80.0, 40.0, "left");
+    frame(&mut app);
+    for (node, primary, fallback, size, expected_origin) in [
+        (
+            bottom,
+            Side::Bottom,
+            Side::Top,
+            (60.0, 100.0),
+            (100.0, 416.0),
+        ),
+        (top, Side::Top, Side::Bottom, (60.0, 100.0), (300.0, 54.0)),
+        (
+            right,
+            Side::Right,
+            Side::Left,
+            (100.0, 30.0),
+            (596.0, 200.0),
+        ),
+        (left, Side::Left, Side::Right, (100.0, 30.0), (94.0, 300.0)),
+    ] {
+        let mut spec = base_spec(node_anchor(node));
+        spec.placement = PlacementSpec {
+            side: primary,
+            align: Alignment::Start,
+            fallbacks: [Placement::new(fallback, Alignment::Start)]
+                .into_iter()
+                .collect(),
+            ..PlacementSpec::default()
+        };
+        let id = open_sized(&mut app, spec, size, None);
+        frame(&mut app);
+        let rect = app.app().popup_rect(id).expect("rect").hit;
+        let node_rect = app.probe().bounds(node).expect("node bounds");
+        assert_eq!(
+            app.app()
+                .popup_stack(win(&app))
+                .expect("stack")
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .expect("entry")
+                .state,
+            PopupState::Open
+        );
+        assert_eq!(
+            (rect.origin.x.value(), rect.origin.y.value()),
+            expected_origin,
+            "flip 到对侧必须使用完整矩形对侧边"
+        );
+        assert!(
+            !rect.intersects(node_rect),
+            "flip 后面板不得覆盖锚点节点：panel={rect:?} node={node_rect:?}"
+        );
+        app.app_mut().close_popup(id).expect("close");
+        frame(&mut app);
+    }
+}
+
+#[test]
+fn a_node_anchor_respects_gap_and_viewport_margin_clamp() {
+    let mut app = TestApp::new();
+    let node = abs_button(&mut app, 4.0, 300.0, 20.0, 20.0, "edge");
+    frame(&mut app);
+    let mut spec = base_spec(node_anchor(node));
+    spec.placement = PlacementSpec {
+        gap: px(10.0),
+        fallbacks: Default::default(),
+        ..node_placement(Side::Bottom, Alignment::Center)
+    };
+    let id = open_sized(&mut app, spec, (300.0, 30.0), None);
+    frame(&mut app);
+    let rect = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(rect.origin, LogicalPoint::new(px(4.0), px(330.0)));
+    assert!(rect.max().x <= px(796.0));
+    app.app_mut().close_popup(id).expect("close");
+    frame(&mut app);
+    let mut gap_spec = base_spec(node_anchor(node));
+    gap_spec.placement = node_placement(Side::Bottom, Alignment::Start);
+    gap_spec.placement.gap = px(12.0);
+    let id = open_sized(&mut app, gap_spec, (40.0, 20.0), None);
+    frame(&mut app);
+    let rect = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(rect.origin.y, px(332.0), "gap 必须从节点矩形 bottom 起算");
+}
+
+#[test]
+fn a_node_anchor_matches_the_equivalent_window_rect() {
+    let mut app = TestApp::new();
+    let node = abs_button(&mut app, 200.0, 150.0, 90.0, 44.0, "compare");
+    frame(&mut app);
+    let node_rect = app.probe().bounds(node).expect("bounds");
+    let mut node_spec = base_spec(node_anchor(node));
+    node_spec.tier = PopupTier::Hint;
+    node_spec.dismiss = DismissPolicy::Hint { escape: true };
+    node_spec.placement = node_placement(Side::Bottom, Alignment::End);
+    let node_popup = open_sized(&mut app, node_spec, (100.0, 50.0), None);
+    frame(&mut app);
+    let node_geometry = app.app().popup_rect(node_popup).expect("node").hit;
+    let mut rect_spec = base_spec(Anchor::WindowRect(node_rect));
+    rect_spec.tier = PopupTier::Hint;
+    rect_spec.dismiss = DismissPolicy::Hint { escape: true };
+    rect_spec.placement = node_placement(Side::Bottom, Alignment::End);
+    let rect_popup = open_sized(&mut app, rect_spec, (100.0, 50.0), None);
+    frame(&mut app);
+    let rect_geometry = app.app().popup_rect(rect_popup).expect("rect").hit;
+    assert_eq!(
+        node_geometry, rect_geometry,
+        "Anchor::Node 必须与等价 WindowRect 产生同一几何"
+    );
+}
+
+#[test]
+fn a_node_anchor_inside_a_nested_popup_follows_parent_and_paint_offset() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut parent_spec = base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0)));
+    parent_spec.animation = PopupAnimation::FadeSlide;
+    let parent = open_sized(&mut app, parent_spec, (200.0, 160.0), None);
+    frame(&mut app);
+    let parent_node = popup_node(&app, parent);
+    let item = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(40.0), px(40.0))
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(10.0))
+                    .build(),
+            )
+            .build(tree.tree_mut(), parent_node)
+            .expect("item")
+    };
+    frame(&mut app);
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    let offset = app
+        .app()
+        .popup_stack(window)
+        .expect("stack")
+        .entries
+        .iter()
+        .find(|entry| entry.id == parent)
+        .expect("parent")
+        .paint_offset;
+    let parent_rect = app.app().popup_rect(parent).expect("rect").hit;
+    let mut child_spec = base_spec(node_anchor(item));
+    child_spec.parent = Some(parent);
+    child_spec.placement = node_placement(Side::Bottom, Alignment::Start);
+    let child = open_sized(&mut app, child_spec, (80.0, 60.0), None);
+    frame(&mut app);
+    let child_rect = app.app().popup_rect(child).expect("rect").hit;
+    assert_eq!(
+        child_rect.origin,
+        LogicalPoint::new(
+            px(parent_rect.max().x.value() + 4.0),
+            px(parent_rect.origin.y.value() + 10.0 + offset.y.value()),
+        ),
+        "嵌套节点锚点（父级子菜单横向放置）必须跟随父内容位置与 paint_offset"
+    );
+    assert!(
+        !child_rect.intersects(LogicalRect::from_origin_size(
+            LogicalPoint::new(
+                parent_rect.origin.x + px(10.0),
+                parent_rect.origin.y + px(10.0) + offset.y
+            ),
+            LogicalSize::new(px(40.0), px(40.0))
+        )),
+        "子面板不得回叠到锚点项"
+    );
+}
+
+#[test]
+fn a_node_anchor_follows_scrolling_ancestors() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let container = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        let root = tree.tree().root();
+        let mut style = StyleBuilder::new()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size(px(200.0), px(100.0))
+            .build();
+        style.clip = Clip::Bounds;
+        NodeBuilder::boxed()
+            .style(style)
+            .build(tree.tree_mut(), root)
+            .expect("container")
+    };
+    let content = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(200.0), px(600.0)).build())
+            .build(tree.tree_mut(), container)
+            .expect("content")
+    };
+    let node = {
+        let tree = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(px(80.0), px(30.0))
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(50.0))
+                    .build(),
+            )
+            .build(tree.tree_mut(), content)
+            .expect("node")
+    };
+    frame(&mut app);
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            container,
+            ui_core::interaction::ScrollConfig {
+                axis: ui_core::interaction::ScrollAxis::Vertical,
+                line_height: px(48.0),
+            },
+        )
+        .expect("scroll handle");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(600.0)))
+        .unwrap_or_else(|error| panic!("scroll content: {error:?}"));
+    frame(&mut app);
+    let mut spec = base_spec(node_anchor(node));
+    spec.placement = node_placement(Side::Bottom, Alignment::Start);
+    let id = open_sized(&mut app, spec, (60.0, 30.0), None);
+    frame(&mut app);
+    let before = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(before.origin, LogicalPoint::new(px(10.0), px(84.0)));
+    app.app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(40.0)))
+        .expect("scroll");
+    frame(&mut app);
+    let after = app.app().popup_rect(id).expect("rect").hit;
+    assert_eq!(
+        after.origin,
+        LogicalPoint::new(px(10.0), px(44.0)),
+        "滚动后节点锚点必须同帧跟随"
+    );
+}
+
+const E01_MODAL_ANIMATION: Duration = Duration::from_millis(130);
+
+fn settled_modal(app: &mut TestApp, anchor: LogicalRect) -> PopupId {
+    let id = open_sized(
+        app,
+        modal_spec(Anchor::WindowRect(anchor), false),
+        (200.0, 120.0),
+        None,
+    );
+    frame(app);
+    app.advance(E01_MODAL_ANIMATION);
+    frame(app);
+    id
+}
+
+#[test]
+fn a_closing_modal_swallows_background_presses_until_it_is_removed() {
+    let mut app = TestApp::new();
+    let background = root_button(&mut app, (200.0, 40.0), "background");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("background"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let modal = settled_modal(&mut app, rect(400.0, 300.0, 20.0, 20.0));
+    assert!(
+        app.app_mut()
+            .begin_close_popup(modal, DismissReason::Escape)
+            .expect("begin close"),
+        "关闭事务必须启动"
+    );
+    assert_eq!(
+        app.app().popup_state(modal),
+        Some(PopupState::DismissPending),
+        "关闭开始即进入 DismissPending"
+    );
+    let center = point(100.0, 20.0);
+    let (_, down) = press(&mut app, center);
+    assert!(down, "DismissPending 的 modal 必须消费背景按下");
+    let (_, up) = release(&mut app, center);
+    assert!(up, "DismissPending 的 modal 必须消费背景抬起");
+    assert_eq!(hits.get(), 0, "淡出期点击背景不得执行 action（E-01）");
+    assert_eq!(
+        app.app().focused(win(&app)),
+        None,
+        "关闭期焦点已归还，但背景点击仍不得落到焦点控件"
+    );
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(modal).is_none(), "淡出结束必须移除");
+    let (_, down) = press(&mut app, center);
+    assert!(!down, "modal 移除后背景按下必须恢复派发");
+    let (_, up) = release(&mut app, center);
+    assert!(!up, "modal 移除后背景抬起必须恢复派发");
+    assert_eq!(hits.get(), 1, "modal 移除后点击必须执行 action");
+    let _ = background;
+}
+
+#[test]
+fn a_closing_modal_keeps_background_hover_and_scroll_blocked() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut container_style = StyleBuilder::new()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .size(px(200.0), px(100.0))
+        .build();
+    container_style.clip = Clip::Bounds;
+    let container = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        let root = state.tree().root();
+        NodeBuilder::boxed()
+            .style(container_style)
+            .build(state.tree_mut(), root)
+            .expect("container")
+    };
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            container,
+            ui_core::interaction::ScrollConfig::default(),
+        )
+        .expect("scroll");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(600.0)))
+        .expect("content");
+    frame(&mut app);
+    let modal = settled_modal(&mut app, rect(400.0, 300.0, 20.0, 20.0));
+    let background = point(50.0, 50.0);
+    app.app_mut()
+        .begin_close_popup(modal, DismissReason::Escape)
+        .expect("begin close");
+    app.move_pointer(background);
+    assert_eq!(
+        app.app().hovered(window),
+        None,
+        "DismissPending 的 modal 必须继续遮挡背景 hover"
+    );
+    app.inject(InputEvent::scroll_lines(
+        background,
+        LogicalPoint::new(px(0.0), px(-120.0)),
+        Modifiers::empty(),
+    ));
+    app.advance(Duration::from_millis(30));
+    frame(&mut app);
+    assert_eq!(
+        app.app().scroll_state(&handle).expect("state").offset.y,
+        px(0.0),
+        "DismissPending 的 modal 必须继续遮挡背景滚动"
+    );
+    app.advance(Duration::from_millis(80));
+    frame(&mut app);
+    assert!(app.app().popup_rect(modal).is_none());
+    app.inject(InputEvent::scroll_lines(
+        background,
+        LogicalPoint::new(px(0.0), px(-120.0)),
+        Modifiers::empty(),
+    ));
+    app.advance(Duration::from_millis(400));
+    frame(&mut app);
+    assert!(
+        app.app().scroll_state(&handle).expect("state").offset.y > px(0.0),
+        "modal 移除后背景滚动必须恢复"
+    );
+}
+
+#[test]
+fn a_nested_modal_escape_sequence_closes_topmost_then_the_parent() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let background = root_button(&mut app, (200.0, 40.0), "background");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("background"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let outer = settled_modal(&mut app, rect(200.0, 120.0, 20.0, 20.0));
+    let outer_content = popup_node(&app, outer);
+    let inner_button = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(32.0)).build())
+            .on_click(Action::custom("inner"))
+            .build(state.tree_mut(), outer_content)
+            .expect("inner button")
+    };
+    frame(&mut app);
+    let mut inner_spec = modal_spec(Anchor::Node { node: inner_button }, false);
+    inner_spec.opener = Some(inner_button);
+    let inner = open_sized(&mut app, inner_spec, (160.0, 100.0), None);
+    frame(&mut app);
+    app.advance(E01_MODAL_ANIMATION);
+    frame(&mut app);
+    assert_eq!(
+        app.app().focused(window),
+        Some(popup_node(&app, inner)),
+        "内层 modal 必须取焦"
+    );
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed, "Esc 必须关闭最上层 modal");
+    assert_eq!(
+        app.app().popup_state(inner),
+        Some(PopupState::DismissPending)
+    );
+    assert_eq!(
+        app.app().popup_state(outer),
+        Some(PopupState::Open),
+        "Esc 只关最上层，父 modal 保持打开"
+    );
+    let center = point(100.0, 20.0);
+    let (_, down) = press(&mut app, center);
+    assert!(down, "内层淡出期背景按下必须被吞");
+    let (_, up) = release(&mut app, center);
+    assert!(up, "内层淡出期背景抬起必须被吞");
+    assert_eq!(hits.get(), 0, "内层淡出期不得执行背景 action");
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(inner).is_none());
+    assert_eq!(
+        app.app().popup_state(outer),
+        Some(PopupState::Open),
+        "内层移除后父 modal 仍打开"
+    );
+    let (_, consumed) = escape(&mut app);
+    assert!(consumed, "父 modal 必须能被下一次 Esc 关闭");
+    assert_eq!(
+        app.app().popup_state(outer),
+        Some(PopupState::DismissPending)
+    );
+    let (_, down) = press(&mut app, center);
+    assert!(down, "父 modal 淡出期背景按下必须被吞");
+    let (_, up) = release(&mut app, center);
+    assert!(up, "父 modal 淡出期背景抬起必须被吞");
+    assert_eq!(hits.get(), 0);
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(outer).is_none());
+    let (_, down) = press(&mut app, center);
+    assert!(!down);
+    let (_, up) = release(&mut app, center);
+    assert!(!up);
+    assert_eq!(hits.get(), 1, "整条 modal 链移除后背景点击恢复");
+    let _ = background;
+}
+
+#[test]
+fn closing_the_lower_modal_cascades_and_keeps_input_blocked_until_all_leave() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let background = root_button(&mut app, (200.0, 40.0), "background");
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("background"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let outer = settled_modal(&mut app, rect(300.0, 200.0, 20.0, 20.0));
+    let outer_content = popup_node(&app, outer);
+    let item = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(100.0), px(30.0)).build())
+            .build(state.tree_mut(), outer_content)
+            .expect("item")
+    };
+    frame(&mut app);
+    let mut child_spec = base_spec(Anchor::NodeRect {
+        node: item,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    child_spec.parent = Some(outer);
+    child_spec.animation = PopupAnimation::Fade;
+    let child = open_sized(&mut app, child_spec, (120.0, 80.0), None);
+    frame(&mut app);
+    app.advance(E01_MODAL_ANIMATION);
+    frame(&mut app);
+    assert!(
+        app.app_mut()
+            .begin_close_popup(outer, DismissReason::Programmatic)
+            .expect("begin close")
+    );
+    assert_eq!(
+        app.app().popup_state(outer),
+        Some(PopupState::DismissPending)
+    );
+    assert_eq!(
+        app.app().popup_state(child),
+        Some(PopupState::DismissPending),
+        "modal 关闭必须级联其内容链"
+    );
+    let center = point(100.0, 20.0);
+    let (_, down) = press(&mut app, center);
+    assert!(down, "级联关闭期背景按下必须被吞");
+    let (_, up) = release(&mut app, center);
+    assert!(up, "级联关闭期背景抬起必须被吞");
+    assert_eq!(hits.get(), 0);
+    app.advance(Duration::from_millis(95));
+    frame(&mut app);
+    assert!(app.app().popup_rect(outer).is_none());
+    assert!(app.app().popup_rect(child).is_none());
+    let (_, down) = press(&mut app, center);
+    assert!(!down);
+    let (_, up) = release(&mut app, center);
+    assert!(!up);
+    assert_eq!(hits.get(), 1, "级联关闭完成后背景点击恢复");
+    let _ = background;
+}
+
+#[test]
+fn a_stale_focus_owner_is_repaired_when_the_next_tab_runs() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let second = root_button(&mut app, (100.0, 30.0), "second");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let mut spec = base_spec(Anchor::WindowRect(rect(500.0, 400.0, 20.0, 20.0)));
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Previous,
+    };
+    spec.animation = PopupAnimation::None;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let content = popup_node(&app, id);
+    assert_eq!(app.app().focused(window), Some(content));
+    app.app_mut()
+        .window_mut(window)
+        .expect("window")
+        .tree_mut()
+        .remove(content)
+        .expect("remove content node directly");
+    assert_eq!(
+        app.app().focused(window),
+        None,
+        "内容节点消失后 stale owner 让焦点读数为 None"
+    );
+    let next = app.app_mut().focus_next(window);
+    assert_eq!(
+        next,
+        Some(second),
+        "validate_owner 必须清除失效 owner 并让 Tab 继续遍历主树"
+    );
+    assert_eq!(app.app().focused(window), Some(second));
+}
+
+#[test]
+fn removing_a_take_popups_content_node_restores_main_focus_and_tab() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let first = root_button(&mut app, (100.0, 30.0), "first");
+    let second = root_button(&mut app, (100.0, 30.0), "second");
+    frame(&mut app);
+    assert!(app.app_mut().set_focus(window, Some(first)));
+    let mut spec = base_spec(Anchor::WindowRect(rect(500.0, 400.0, 20.0, 20.0)));
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Previous,
+    };
+    spec.animation = PopupAnimation::None;
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let content = popup_node(&app, id);
+    assert_eq!(app.app().focused(window), Some(content));
+    app.app_mut().remove_node(window, content).expect("remove");
+    assert!(
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .is_empty(),
+        "外部删除 content 必须同时修剪 popup 栈条目"
+    );
+    assert_eq!(
+        app.app().focused(window),
+        Some(first),
+        "外部删除 popup content 必须恢复主树焦点"
+    );
+    assert_eq!(
+        app.app_mut().focus_next(window),
+        Some(second),
+        "焦点恢复后 Tab 必须可用"
+    );
+}
+
+#[test]
+fn window_focus_loss_does_not_swallow_the_next_background_click() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let trigger = root_button(&mut app, (100.0, 30.0), "trigger");
+    let background = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        let root = state.tree().root();
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .left(px(300.0))
+                    .top(px(300.0))
+                    .size(px(100.0), px(40.0))
+                    .build(),
+            )
+            .on_click(Action::custom("background"))
+            .build(state.tree_mut(), root)
+            .expect("background")
+    };
+    frame(&mut app);
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let counter = std::rc::Rc::clone(&hits);
+    app.app_mut()
+        .on_action(Action::custom("background"), move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+    let mut spec = base_spec(Anchor::NodeRect {
+        node: trigger,
+        rect: rect(0.0, 0.0, 100.0, 30.0),
+    });
+    spec.opener = Some(trigger);
+    let id = open_sized(&mut app, spec, (120.0, 80.0), None);
+    frame(&mut app);
+    let (_, consumed) = press(&mut app, point(50.0, 15.0));
+    assert!(consumed, "opener Toggle 必须消费按下");
+    assert!(app.app().popup_rect(id).is_none());
+    app.app_mut().window_focus_lost(window);
+    let target = point(350.0, 320.0);
+    let (_, down) = press(&mut app, target);
+    assert!(!down, "失焦后第一次点击不得被 suppress_release 吞掉按下");
+    let (_, up) = release(&mut app, target);
+    assert!(!up);
+    assert_eq!(
+        hits.get(),
+        1,
+        "窗口失焦必须重置 suppress_release，第一次点击即生效"
+    );
+    let _ = background;
+}
+
+#[test]
+fn window_scroll_epoch_advances_only_when_an_offset_changes() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut container_style = StyleBuilder::new()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .size(px(200.0), px(100.0))
+        .build();
+    container_style.clip = Clip::Bounds;
+    let container = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        let root = state.tree().root();
+        NodeBuilder::boxed()
+            .style(container_style)
+            .build(state.tree_mut(), root)
+            .expect("container")
+    };
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            container,
+            ui_core::interaction::ScrollConfig::default(),
+        )
+        .expect("scroll");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(600.0)))
+        .expect("content");
+    frame(&mut app);
+    let epoch = app.app().window_scroll_epoch(window).expect("epoch");
+    app.app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(40.0)))
+        .expect("scroll");
+    frame(&mut app);
+    let moved = app.app().window_scroll_epoch(window).expect("epoch");
+    assert_ne!(moved, epoch, "滚动 offset 变化必须推进 epoch");
+    app.app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(40.0)))
+        .expect("same offset");
+    frame(&mut app);
+    assert_eq!(
+        app.app().window_scroll_epoch(window).expect("epoch"),
+        moved,
+        "未改变 offset 的滚动不得推进 epoch"
+    );
+}
+
+#[test]
+fn popup_anchor_queries_track_scrolling_and_visibility() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut container_style = StyleBuilder::new()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .size(px(200.0), px(100.0))
+        .build();
+    container_style.clip = Clip::Bounds;
+    let container = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        let root = state.tree().root();
+        NodeBuilder::boxed()
+            .style(container_style)
+            .build(state.tree_mut(), root)
+            .expect("container")
+    };
+    let content = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(200.0), px(600.0)).build())
+            .build(state.tree_mut(), container)
+            .expect("content")
+    };
+    let node = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(50.0))
+                    .size(px(80.0), px(30.0))
+                    .build(),
+            )
+            .on_click(Action::custom("anchor"))
+            .build(state.tree_mut(), content)
+            .expect("node")
+    };
+    frame(&mut app);
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            container,
+            ui_core::interaction::ScrollConfig::default(),
+        )
+        .expect("scroll");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(600.0)))
+        .expect("content");
+    frame(&mut app);
+    let mut spec = base_spec(Anchor::Node { node });
+    spec.placement = node_placement(Side::Bottom, Alignment::Start);
+    let id = open_sized(&mut app, spec, (60.0, 30.0), None);
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_anchor_rect(id),
+        Some(rect(10.0, 50.0, 80.0, 30.0)),
+        "Anchor::Node 查询返回节点完整矩形"
+    );
+    assert_eq!(app.app().popup_anchor_visible(id), Some(true));
+    let epoch = app.app().window_scroll_epoch(window).expect("epoch");
+    app.app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(40.0)))
+        .expect("scroll");
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_anchor_rect(id),
+        Some(rect(10.0, 10.0, 80.0, 30.0)),
+        "滚动后锚点矩形必须同帧更新"
+    );
+    assert_eq!(app.app().popup_anchor_visible(id), Some(true));
+    assert_ne!(
+        app.app().window_scroll_epoch(window).expect("epoch"),
+        epoch,
+        "滚动必须推进 epoch 供 kit 检测祖先滚动"
+    );
+    app.app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(500.0)))
+        .expect("scroll out");
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_anchor_visible(id),
+        Some(false),
+        "锚点滚出容器后 visible 必须为 false"
+    );
+    let point_anchor = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (60.0, 30.0),
+        None,
+    );
+    frame(&mut app);
+    assert_eq!(app.app().popup_anchor_visible(point_anchor), Some(true));
+    app.app_mut()
+        .set_popup_anchor(
+            point_anchor,
+            Anchor::WindowRect(rect(2000.0, 2000.0, 20.0, 20.0)),
+        )
+        .expect("anchor");
+    assert_eq!(
+        app.app().popup_anchor_visible(point_anchor),
+        Some(false),
+        "视口外的 WindowRect 锚点不可见"
+    );
+}
+
+#[test]
+fn scrim_paints_the_configured_color_and_density() {
+    let mut app = TestApp::new();
+    let mut spec = base_spec(Anchor::WindowRect(rect(400.0, 300.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    spec.animation = PopupAnimation::None;
+    spec.scrim = Some(ScrimSpec {
+        density: 0.5,
+        color: ui_core::paint::color::Color::srgb(1.0, 0.0, 0.0, 1.0),
+    });
+    let id = open_sized(&mut app, spec, (200.0, 120.0), None);
+    frame(&mut app);
+    let scrim = popup_node(&app, scrim_id(&app));
+    let fill = app
+        .rendered()
+        .expect("rendered")
+        .quads
+        .iter()
+        .find(|quad| quad.node == scrim)
+        .map(|quad| quad.fill)
+        .expect("scrim quad");
+    assert!(
+        (fill.components[3] - 0.5).abs() < 0.02,
+        "scrim alpha 必须是 density：{:?}",
+        fill.components
+    );
+    assert!(
+        fill.components[0] > 0.45 && fill.components[1] < 0.02 && fill.components[2] < 0.02,
+        "scrim 必须使用 spec.color（红色）：{:?}",
+        fill.components
+    );
+    app.app_mut().close_popup(id).expect("close");
+    frame(&mut app);
+    let mut default_spec = base_spec(Anchor::WindowRect(rect(400.0, 300.0, 20.0, 20.0)));
+    default_spec.tier = PopupTier::Modal;
+    default_spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::Container,
+    };
+    default_spec.animation = PopupAnimation::None;
+    default_spec.scrim = Some(ScrimSpec {
+        density: 0.5,
+        ..ScrimSpec::default()
+    });
+    open_sized(&mut app, default_spec, (200.0, 120.0), None);
+    frame(&mut app);
+    let scrim = popup_node(&app, scrim_id(&app));
+    let fill = app
+        .rendered()
+        .expect("rendered")
+        .quads
+        .iter()
+        .find(|quad| quad.node == scrim)
+        .map(|quad| quad.fill)
+        .expect("scrim quad");
+    assert!(
+        fill.components[0].abs() < 0.001
+            && fill.components[1].abs() < 0.001
+            && fill.components[2].abs() < 0.001,
+        "ScrimSpec 默认色必须是黑色：{:?}",
+        fill.components
+    );
+    assert!((fill.components[3] - 0.5).abs() < 0.02);
+}
+
+#[test]
+fn set_popup_initial_focus_moves_the_focus_within_a_trap() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::<NodeId>::new()));
+    let sink = std::rc::Rc::clone(&captured);
+    let mut spec = base_spec(Anchor::WindowRect(rect(400.0, 300.0, 20.0, 20.0)));
+    spec.tier = PopupTier::Modal;
+    spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::FirstFocusable,
+    };
+    spec.animation = PopupAnimation::None;
+    let id = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            move |app, window, content| {
+                let state = app.window_mut(window).expect("window");
+                for action in ["first", "second"] {
+                    let node = NodeBuilder::boxed()
+                        .on_click(Action::custom(action))
+                        .build(state.tree_mut(), content)?;
+                    sink.borrow_mut().push(node);
+                }
+                let plain = NodeBuilder::boxed().build(state.tree_mut(), content)?;
+                sink.borrow_mut().push(plain);
+                Ok(())
+            },
+            None,
+        )
+        .expect("modal");
+    frame(&mut app);
+    let nodes = captured.borrow().clone();
+    let (first, second, plain) = (nodes[0], nodes[1], nodes[2]);
+    assert_eq!(
+        app.app().focused(window),
+        Some(first),
+        "Trap 初始焦点先按策略取第一可聚焦"
+    );
+    assert!(
+        app.app_mut()
+            .set_popup_initial_focus(id, second)
+            .expect("setter"),
+        "Trap 弹层必须接受初始焦点修正"
+    );
+    assert_eq!(app.app().focused(window), Some(second));
+    assert!(
+        !app.app_mut()
+            .set_popup_initial_focus(id, plain)
+            .expect("setter"),
+        "不可聚焦节点必须被拒绝"
+    );
+    assert_eq!(app.app().focused(window), Some(second));
+    app.app_mut().close_popup(id).expect("close");
+    assert!(
+        app.app_mut().set_popup_initial_focus(id, second).is_err(),
+        "已关闭 popup 必须返回强类型错误"
+    );
+}
+
+#[test]
+fn set_popup_initial_focus_rejects_non_trap_popups() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(None::<NodeId>));
+    let sink = std::rc::Rc::clone(&captured);
+    let mut spec = base_spec(Anchor::WindowRect(rect(400.0, 300.0, 20.0, 20.0)));
+    spec.focus = FocusPolicy::Take {
+        restore: RestoreFocus::Opener,
+    };
+    spec.animation = PopupAnimation::None;
+    let id = app
+        .app_mut()
+        .open_popup(
+            window,
+            spec,
+            move |app, window, content| {
+                let state = app.window_mut(window).expect("window");
+                let node = NodeBuilder::boxed()
+                    .on_click(Action::custom("only"))
+                    .build(state.tree_mut(), content)?;
+                *sink.borrow_mut() = Some(node);
+                Ok(())
+            },
+            None,
+        )
+        .expect("popup");
+    frame(&mut app);
+    let node = captured.borrow().expect("content node");
+    assert!(
+        !app.app_mut()
+            .set_popup_initial_focus(id, node)
+            .expect("setter"),
+        "Take 弹层不得接受初始焦点修正"
+    );
+}
+
+#[test]
+fn raising_a_modal_moves_its_scrim_to_the_adjacent_z_slot() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(300.0, 200.0, 20.0, 20.0)), true),
+        (200.0, 120.0),
+        None,
+    );
+    frame(&mut app);
+    app.advance(E01_MODAL_ANIMATION);
+    frame(&mut app);
+    let auto = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (80.0, 40.0),
+        None,
+    );
+    frame(&mut app);
+    let z_of = |app: &TestApp, id: PopupId| {
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .expect("entry")
+            .z
+    };
+    assert!(z_of(&app, auto) > z_of(&app, modal));
+    let scrim = scrim_id(&app);
+    app.app_mut().raise_popup(modal).expect("raise");
+    frame(&mut app);
+    assert!(
+        z_of(&app, scrim) + 1 == z_of(&app, modal),
+        "raise modal 必须把 scrim 移到 modal 正下方（E-16）"
+    );
+    assert!(z_of(&app, modal) > z_of(&app, auto));
+}
+
+#[test]
+fn immediate_modal_close_notifies_owned_descendants_children_first() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let modal = open_sized(
+        &mut app,
+        modal_spec(Anchor::WindowRect(rect(300.0, 200.0, 20.0, 20.0)), false),
+        (300.0, 200.0),
+        None,
+    );
+    frame(&mut app);
+    app.advance(E01_MODAL_ANIMATION);
+    frame(&mut app);
+    let outer_content = popup_node(&app, modal);
+    let first_item = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(30.0)).build())
+            .build(state.tree_mut(), outer_content)
+            .expect("first item")
+    };
+    frame(&mut app);
+    let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PopupId>::new()));
+    let record_b = std::rc::Rc::clone(&order);
+    let mut child_b_spec = base_spec(Anchor::Node { node: first_item });
+    child_b_spec.opener = Some(first_item);
+    let child_b = open_sized(
+        &mut app,
+        child_b_spec,
+        (140.0, 80.0),
+        Some(Box::new(move |_app, dismiss| {
+            record_b.borrow_mut().push(dismiss.id);
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    let child_b_content = popup_node(&app, child_b);
+    let second_item = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(100.0), px(24.0)).build())
+            .build(state.tree_mut(), child_b_content)
+            .expect("second item")
+    };
+    frame(&mut app);
+    let record_c = std::rc::Rc::clone(&order);
+    let mut child_c_spec = base_spec(Anchor::Node { node: second_item });
+    child_c_spec.parent = Some(child_b);
+    child_c_spec.opener = Some(second_item);
+    let child_c = open_sized(
+        &mut app,
+        child_c_spec,
+        (100.0, 60.0),
+        Some(Box::new(move |_app, dismiss| {
+            record_c.borrow_mut().push(dismiss.id);
+            DismissOutcome::Close
+        })),
+    );
+    frame(&mut app);
+    app.app_mut().close_popup(modal).expect("close modal");
+    assert!(
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        order.borrow().as_slice(),
+        &[child_c, child_b],
+        "立即关闭 modal 时 owner_modal 后代必须按深度降序通知（子先于父，E-15）"
+    );
+}
+
+#[test]
+fn a_zero_size_point_anchor_is_visible_inside_the_viewport_and_lost_outside() {
+    let mut app = TestApp::new();
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(200.0, 150.0, 0.0, 0.0))),
+        (120.0, 80.0),
+        None,
+    );
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_anchor_rect(id),
+        Some(rect(200.0, 150.0, 0.0, 0.0)),
+        "零尺寸点锚点矩形必须原样返回"
+    );
+    assert_eq!(
+        app.app().popup_anchor_visible(id),
+        Some(true),
+        "视口内的零尺寸点锚点（ContextMenu）必须可见"
+    );
+    app.app_mut()
+        .set_popup_anchor(id, Anchor::WindowRect(rect(2000.0, 150.0, 0.0, 0.0)))
+        .expect("anchor");
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_anchor_visible(id),
+        Some(false),
+        "移出视口的零尺寸点锚点必须不可见"
+    );
+}
+
+#[test]
+fn a_zero_size_node_rect_anchor_follows_the_node_clip() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let mut container_style = StyleBuilder::new()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .size(px(200.0), px(100.0))
+        .build();
+    container_style.clip = Clip::Bounds;
+    let (container, node) = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        let root = state.tree().root();
+        let container = NodeBuilder::boxed()
+            .style(container_style)
+            .build(state.tree_mut(), root)
+            .expect("container");
+        let content = NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(200.0), px(600.0)).build())
+            .build(state.tree_mut(), container)
+            .expect("content");
+        let node = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .left(px(10.0))
+                    .top(px(50.0))
+                    .size(px(80.0), px(30.0))
+                    .build(),
+            )
+            .build(state.tree_mut(), content)
+            .expect("node");
+        (container, node)
+    };
+    frame(&mut app);
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            container,
+            ui_core::interaction::ScrollConfig::default(),
+        )
+        .expect("scroll");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(600.0)))
+        .expect("content");
+    frame(&mut app);
+    let mut spec = base_spec(Anchor::NodeRect {
+        node,
+        rect: rect(20.0, 10.0, 0.0, 0.0),
+    });
+    spec.placement = node_placement(Side::Bottom, Alignment::Start);
+    let id = open_sized(&mut app, spec, (60.0, 30.0), None);
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_anchor_visible(id),
+        Some(true),
+        "节点可见区内的零尺寸 NodeRect 子锚点必须可见"
+    );
+    app.app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(500.0)))
+        .expect("scroll out");
+    frame(&mut app);
+    assert_eq!(
+        app.app().popup_anchor_visible(id),
+        Some(false),
+        "节点滚出容器后零尺寸 NodeRect 子锚点必须不可见"
+    );
+}
+
+#[test]
+fn popup_internal_scroll_does_not_advance_the_window_scroll_epoch() {
+    let mut app = TestApp::new();
+    let window = win(&app);
+    let id = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(100.0, 100.0, 20.0, 20.0))),
+        (220.0, 160.0),
+        None,
+    );
+    frame(&mut app);
+    let content_node = popup_node(&app, id);
+    let mut container_style = StyleBuilder::new()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .size(px(200.0), px(100.0))
+        .build();
+    container_style.clip = Clip::Bounds;
+    let container = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        let container = NodeBuilder::boxed()
+            .style(container_style)
+            .build(state.tree_mut(), content_node)
+            .expect("container");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(200.0), px(600.0)).build())
+            .build(state.tree_mut(), container)
+            .expect("content");
+        container
+    };
+    frame(&mut app);
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            container,
+            ui_core::interaction::ScrollConfig::default(),
+        )
+        .expect("scroll");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(600.0)))
+        .expect("content");
+    frame(&mut app);
+    let epoch = app.app().window_scroll_epoch(window).expect("epoch");
+    app.app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(40.0)))
+        .expect("scroll");
+    frame(&mut app);
+    assert_eq!(
+        app.app().scroll_state(&handle).expect("state").offset.y,
+        px(40.0),
+        "popup 内部滚动必须生效"
+    );
+    assert_eq!(
+        app.app().window_scroll_epoch(window).expect("epoch"),
+        epoch,
+        "popup 子树内部滚动不得推进 window_scroll_epoch（kit 菜单内部滚动不得被当作祖先滚动）"
+    );
+    let anchor = open_sized(
+        &mut app,
+        base_spec(Anchor::WindowRect(rect(400.0, 300.0, 20.0, 20.0))),
+        (60.0, 30.0),
+        None,
+    );
+    frame(&mut app);
+    let outer_epoch = app.app().window_scroll_epoch(window).expect("epoch");
+    let mut main_style = StyleBuilder::new()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
+        .size(px(120.0), px(60.0))
+        .build();
+    main_style.clip = Clip::Bounds;
+    let main_scroll = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        let root = state.tree().root();
+        let container = NodeBuilder::boxed()
+            .style(main_style)
+            .build(state.tree_mut(), root)
+            .expect("main container");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(400.0)).build())
+            .build(state.tree_mut(), container)
+            .expect("main content");
+        container
+    };
+    frame(&mut app);
+    let handle = app
+        .app_mut()
+        .make_scroll(
+            window,
+            main_scroll,
+            ui_core::interaction::ScrollConfig::default(),
+        )
+        .expect("main scroll");
+    app.app_mut()
+        .set_scroll_content(&handle, LogicalSize::new(px(120.0), px(400.0)))
+        .expect("content");
+    frame(&mut app);
+    app.app_mut()
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(20.0)))
+        .expect("main scroll");
+    frame(&mut app);
+    assert_ne!(
+        app.app().window_scroll_epoch(window).expect("epoch"),
+        outer_epoch,
+        "主内容树滚动必须推进 epoch（ContextMenu 关链依据）"
+    );
+    let _ = (anchor, content_node);
+}
+
+#[test]
+fn raising_a_modal_keeps_its_owner_modal_chain_above_it() {
+    let mut app = TestApp::new();
+    app.enable_a11y_capture();
+    let window = win(&app);
+    let mut a_spec = modal_spec(Anchor::WindowRect(rect(200.0, 120.0, 40.0, 30.0)), true);
+    a_spec.animation = PopupAnimation::None;
+    let a = open_sized(&mut app, a_spec, (300.0, 200.0), None);
+    frame(&mut app);
+    let a_content = popup_node(&app, a);
+    let a_button = {
+        let state = app.app_mut().window_mut(window).expect("window");
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().size(px(120.0), px(30.0)).build())
+            .on_click(Action::custom("inside-a"))
+            .build(state.tree_mut(), a_content)
+            .expect("a button")
+    };
+    frame(&mut app);
+    let mut c_spec = modal_spec(Anchor::WindowRect(rect(600.0, 400.0, 30.0, 30.0)), false);
+    c_spec.animation = PopupAnimation::None;
+    let c = open_sized(&mut app, c_spec, (160.0, 100.0), None);
+    frame(&mut app);
+    let mut p_spec = base_spec(Anchor::NodeRect {
+        node: a_button,
+        rect: rect(0.0, 0.0, 120.0, 30.0),
+    });
+    p_spec.opener = Some(a_button);
+    p_spec.animation = PopupAnimation::None;
+    let p = open_sized(&mut app, p_spec, (140.0, 60.0), None);
+    frame(&mut app);
+    let b_clicked = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let b_counter = std::rc::Rc::clone(&b_clicked);
+    app.app_mut()
+        .on_action(Action::custom("inside-b"), move |_ctx| {
+            b_counter.set(b_counter.get() + 1);
+        });
+    let b_button_slot = std::rc::Rc::new(std::cell::Cell::new(None::<NodeId>));
+    let b_slot = std::rc::Rc::clone(&b_button_slot);
+    let mut b_spec = modal_spec(
+        Anchor::NodeRect {
+            node: a_button,
+            rect: rect(0.0, 0.0, 120.0, 30.0),
+        },
+        true,
+    );
+    b_spec.focus = FocusPolicy::Trap {
+        restore: RestoreFocus::Opener,
+        initial: InitialFocus::FirstFocusable,
+    };
+    b_spec.opener = Some(a_button);
+    b_spec.animation = PopupAnimation::None;
+    let b = app
+        .app_mut()
+        .open_popup(
+            window,
+            b_spec,
+            move |app, window, content| {
+                let state = app.window_mut(window).expect("window");
+                let button = NodeBuilder::boxed()
+                    .style(StyleBuilder::new().size(px(100.0), px(30.0)).build())
+                    .on_click(Action::custom("inside-b"))
+                    .build(state.tree_mut(), content)?;
+                b_slot.set(Some(button));
+                Ok(())
+            },
+            None,
+        )
+        .expect("modal b");
+    frame(&mut app);
+    let b_content = popup_node(&app, b);
+    let b_button = b_button_slot.get().expect("b button");
+    let z_of = |app: &TestApp, id: PopupId| {
+        app.app()
+            .popup_stack(window)
+            .expect("stack")
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map_or_else(|| panic!("entry {id:?} missing"), |entry| entry.z)
+    };
+    let a_scrim = scrim_id(&app);
+    let z = |id: PopupId| z_of(&app, id);
+    assert_eq!(z(a_scrim) + 1, z(a));
+    assert_eq!(z(p), z(a) + 2);
+    assert!(z(b) > z(c));
+    assert_eq!(
+        app.app().modal_scope(window),
+        Some(b_content),
+        "raise 前 topmost modal 必须是内层 B"
+    );
+    assert_eq!(app.app().focused(window), Some(b_button));
+    let center = {
+        let rect = app
+            .app()
+            .window(window)
+            .expect("window")
+            .node_screen_rect(b_button)
+            .expect("b button rect");
+        point(
+            (rect.origin.x + rect.size.width.value() * 0.5).value(),
+            (rect.origin.y + rect.size.height.value() * 0.5).value(),
+        )
+    };
+    let (_, down) = press(&mut app, center);
+    let (_, up) = release(&mut app, center);
+    assert!(!down && !up);
+    assert_eq!(b_clicked.get(), 1, "raise 前 B 内容必须可交互");
+    app.app_mut().raise_popup(a).expect("raise a");
+    frame(&mut app);
+    let z = |id: PopupId| z_of(&app, id);
+    assert_eq!(z(a_scrim) + 1, z(a), "raise 后 scrim 仍紧贴 A");
+    assert!(z(a) < z(p), "A 内已展开的 Auto popup 必须仍在 A 之上");
+    assert!(z(p) < z(b), "Auto popup 必须仍在 B 之下");
+    assert_eq!(z(b), z(a) + 3, "raise 必须整组抬升并保持组内相对顺序");
+    assert!(z(b) > z(c), "raise A 不得让 A 越过内层 modal B");
+    assert_eq!(
+        app.app().modal_scope(window),
+        Some(b_content),
+        "raise A 后 topmost modal 必须仍是 B（E-17）"
+    );
+    assert_eq!(
+        app.app().focused(window),
+        Some(b_button),
+        "raise A 不得夺走 B 的焦点"
+    );
+    assert!(
+        app.probe().hit(center).is_some(),
+        "raise A 后 B 内容区域必须仍可命中"
+    );
+    let (_, down) = press(&mut app, center);
+    let (_, up) = release(&mut app, center);
+    assert!(!down && !up);
+    assert_eq!(
+        b_clicked.get(),
+        2,
+        "raise A 后 B 内容输入不得被 A 的 scrim 阻断"
+    );
+    assert!(
+        app.app().popup_rect(p).is_some(),
+        "raise A 不得关闭 A 内已展开的 Auto popup"
+    );
+    if let Some(snapshot) = app.a11y() {
+        let record = snapshot.node_for(b_button).expect("b button a11y record");
+        assert!(!record.hidden, "raise A 后 B 的 a11y 不得被隐藏");
+    }
+}

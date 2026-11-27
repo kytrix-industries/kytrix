@@ -36,6 +36,8 @@ use network::{
     transport::error::{TransportError, UpgradeFailure},
 };
 use smol_str::{SmolStr, format_smolstr};
+use ui_core::{error::EngineError, popup::PopupError};
+use ui_kit::kit::dialog::DialogError;
 
 use crate::{
     rpc::RpcCallError,
@@ -49,6 +51,37 @@ pub trait TranslatedError {
 impl TranslatedError for Infallible {
     fn translated_message(&self, _translate: &Translate) -> SmolStr {
         match *self {}
+    }
+}
+
+#[must_use]
+pub fn popup_engine_error(error: PopupError) -> EngineError {
+    match error {
+        PopupError::ContentBuild { source, .. } | PopupError::StackSync { source } => source,
+        PopupError::UnknownWindow { window } => EngineError::UnknownWindow { window },
+        PopupError::AnchorNodeMissing { node } => EngineError::StaleNode { node },
+        error @ (PopupError::UnknownPopup { .. }
+        | PopupError::StalePopup { .. }
+        | PopupError::InvalidGeometry { .. }
+        | PopupError::InvalidScrim { .. }
+        | PopupError::InvalidPlacement { .. }
+        | PopupError::Cycle { .. }
+        | PopupError::DepthExceeded { .. }
+        | PopupError::HintBlockedByModal { .. }
+        | PopupError::LimitReached { .. }) => EngineError::FramePipeline {
+            detail: format_smolstr!("popup stack contract failed: {error}"),
+        },
+    }
+}
+
+#[must_use]
+pub fn dialog_engine_error(error: DialogError) -> EngineError {
+    match error {
+        DialogError::Engine(error) => error,
+        DialogError::Popup(error) => popup_engine_error(error),
+        DialogError::NotOpen => EngineError::FramePipeline {
+            detail: SmolStr::new_static("the dialog is not open"),
+        },
     }
 }
 

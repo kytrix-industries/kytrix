@@ -818,10 +818,14 @@ mod tests {
             sidebar < title_bar,
             "the sidebar is painted below the title bar: {after:?}"
         );
+        let popup_root = after
+            .iter()
+            .position(|id| id.as_str() == "popup-root")
+            .expect("the window owns the fixed popup root");
         assert_eq!(
             title_bar,
-            after.len() - 1,
-            "the title bar stays the window's last child: {after:?}"
+            popup_root - 1,
+            "the title bar stays the window's last content child: {after:?}"
         );
     }
 

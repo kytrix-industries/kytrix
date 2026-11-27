@@ -3,10 +3,7 @@ use std::rc::Rc;
 use app_config::settings::Config;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use ui_core::{app::App, window::WindowId};
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
+use ui_kit::theme::handle::ThemeHandle;
 use widget::{frame::FrameRouter, services::WidgetServices};
 
 use crate::{
@@ -87,18 +84,8 @@ impl SettingsHost {
     }
 
     #[must_use]
-    pub fn layer(&self) -> Layer {
-        (*self.services.layer).clone()
-    }
-
-    #[must_use]
     pub fn router(&self) -> Rc<FrameRouter> {
         Rc::clone(&self.services.frame_router)
-    }
-
-    #[must_use]
-    pub fn animation(&self) -> AnimationRouter {
-        (*self.services.animation_router).clone()
     }
 
     pub fn write(

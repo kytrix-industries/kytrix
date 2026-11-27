@@ -20,10 +20,7 @@ use ui_core::{
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
 };
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle},
-};
+use ui_kit::theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle};
 use widget::{frame::FrameRouter, services::WidgetServices};
 
 use crate::{
@@ -84,10 +81,8 @@ impl Harness {
         let window = app.window_id();
         let runtime = app.app().runtime_handle().clone();
         let theme = ThemeHandle::new(app.app_mut(), ThemeAppearance::Light);
-        let layer = Rc::new(Layer::new());
         let router =
             Rc::new(FrameRouter::new(app.app_mut()).expect("the test host owns the frame hook"));
-        let animation = Rc::new(AnimationRouter::new());
         let code = language_code(config.language);
         let services = Rc::new(
             WidgetServices::builder(
@@ -95,9 +90,7 @@ impl Harness {
                 runtime,
                 translate.clone(),
                 theme.clone(),
-                Rc::clone(&layer),
                 Rc::clone(&router),
-                Rc::clone(&animation),
             )
             .language(code)
             .config(config)

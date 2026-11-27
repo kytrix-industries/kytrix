@@ -442,8 +442,6 @@ mod tests {
                 &mut app,
                 ui_kit::theme::appearance::Appearance::Light,
             );
-            let layer = Rc::new(ui_kit::kit::layer::Layer::new());
-            let animation_router = Rc::new(ui_kit::kit::overlay::AnimationRouter::new());
             let router =
                 Rc::new(FrameRouter::new(&mut app).expect("the fixture owns the frame hook slot"));
             let services = Rc::new(
@@ -452,9 +450,7 @@ mod tests {
                     runtime.handle().clone(),
                     crate::test_support::fixture_translate(i18n::language::codes::LanguageCode::En),
                     theme,
-                    layer,
                     router,
-                    animation_router,
                 )
                 .build(),
             );

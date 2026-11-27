@@ -192,8 +192,6 @@ impl ProxyTablePage {
         .build(
             app,
             self.host.theme_handle(),
-            self.host.layer(),
-            self.host.animation(),
             format_smolstr!("{prefix}.delete"),
         );
         match dialog.open(app, window) {

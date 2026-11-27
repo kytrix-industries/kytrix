@@ -30,10 +30,7 @@ use ui_core::{
     },
     window::{FrameIndex, WindowId},
 };
-use ui_kit::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
+use ui_kit::theme::handle::ThemeHandle;
 
 use crate::{
     any::AnyWidget,
@@ -98,9 +95,7 @@ pub struct WidgetTestApp {
     app: TestApp,
     window: WindowId,
     runtime: tokio::runtime::Runtime,
-    layer: Rc<Layer>,
     router: Rc<FrameRouter>,
-    animation: Rc<AnimationRouter>,
     services: Rc<WidgetServices>,
     scope: SignalScope,
     status: WidgetStatus,
@@ -127,8 +122,6 @@ impl WidgetTestApp {
             .enable_all()
             .build()
             .expect("the host's runtime builds");
-        let layer = Rc::new(Layer::new());
-        let animation = Rc::new(AnimationRouter::new());
         let router =
             Rc::new(FrameRouter::new(app.app_mut()).expect("the host owns the frame hook slot"));
         let services = Rc::new(
@@ -137,9 +130,7 @@ impl WidgetTestApp {
                 runtime.handle().clone(),
                 translate,
                 theme,
-                Rc::clone(&layer),
                 Rc::clone(&router),
-                Rc::clone(&animation),
             )
             .build(),
         );
@@ -150,9 +141,7 @@ impl WidgetTestApp {
             app,
             window,
             runtime,
-            layer,
             router,
-            animation,
             services,
             scope,
             status,
@@ -215,18 +204,8 @@ impl WidgetTestApp {
     }
 
     #[must_use]
-    pub fn layer(&self) -> &Layer {
-        &self.layer
-    }
-
-    #[must_use]
     pub fn router(&self) -> &FrameRouter {
         &self.router
-    }
-
-    #[must_use]
-    pub fn animation(&self) -> &AnimationRouter {
-        &self.animation
     }
 
     #[must_use]

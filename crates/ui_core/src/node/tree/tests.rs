@@ -114,6 +114,17 @@ fn remove_clears_the_extent_and_baked_screen_bounds_side_tables() {
     let rect = LogicalRect::new(px(4.0), px(6.0), px(20.0), px(10.0));
     tree.set_painted_extent(node, crate::paint::extent::PaintedExtent::new(rect));
     tree.set_baked_screen_bounds(node, rect);
+    tree.set_popup_transform(
+        node,
+        Some(crate::node::tree::PopupTransform {
+            offset: LogicalPoint::new(px(3.0), px(5.0)),
+            opacity: 0.5,
+            blocked: true,
+        }),
+    );
+    tree.set_popup_pointer_transparent(node, true);
+    assert!(tree.popup_transform(node).is_some());
+    assert!(tree.popup_pointer_transparent(node));
     assert!(tree.painted_extents.get(index).copied().flatten().is_some());
     assert!(
         tree.baked_screen_bounds
@@ -125,6 +136,14 @@ fn remove_clears_the_extent_and_baked_screen_bounds_side_tables() {
 
     tree.remove(node).expect("卸载成功");
 
+    assert!(
+        tree.popup_transform(node).is_none(),
+        "remove 必须清空 popup_transform"
+    );
+    assert!(
+        !tree.popup_pointer_transparent(node),
+        "remove 必须清空 popup_pointer_transparent"
+    );
     assert!(
         tree.painted_extents.get(index).copied().flatten().is_none(),
         "remove 必须清空 painted_extents"
@@ -140,6 +159,14 @@ fn remove_clears_the_extent_and_baked_screen_bounds_side_tables() {
 
     let reused = boxed(&mut tree, root);
     assert_eq!(reused.index(), node.index(), "节点索引必须被复用");
+    assert!(
+        tree.popup_transform(reused).is_none(),
+        "复用槽位不得继承 popup_transform"
+    );
+    assert!(
+        !tree.popup_pointer_transparent(reused),
+        "复用槽位不得继承 popup_pointer_transparent"
+    );
     assert!(tree.painted_extents.get(index).copied().flatten().is_none());
     assert!(
         tree.baked_screen_bounds
@@ -1104,4 +1131,286 @@ fn paint_counters_track_frames_visits_and_order_rebuilds() {
     assert_eq!(counters.full_frames, 1);
     assert_eq!(counters.incremental_frames, 1);
     assert_eq!(counters.order_rebuilds, 1);
+}
+
+fn absolute_child(tree: &mut NodeTree, parent: NodeId, rect: LogicalRect) -> NodeId {
+    NodeBuilder::boxed()
+        .layout_override(rect)
+        .build(tree, parent)
+        .expect("挂载成功")
+}
+
+#[test]
+fn reorder_children_rejects_a_non_permutation() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let parent = boxed(&mut tree, root);
+    let a = boxed(&mut tree, parent);
+    let b = boxed(&mut tree, parent);
+
+    for bad in [vec![a], vec![a, root], vec![a, a], vec![]] {
+        assert!(
+            matches!(
+                tree.reorder_children(parent, &bad),
+                Err(EngineError::NodeSpecInvalid { parent: reported, .. }) if reported == parent
+            ),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(tree.get(parent).expect("parent").children(), &[a, b]);
+}
+
+#[test]
+fn reorder_children_updates_order_without_a_structure_epoch() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let parent = boxed(&mut tree, root);
+    let a = boxed(&mut tree, parent);
+    let b = boxed(&mut tree, parent);
+    let c = boxed(&mut tree, parent);
+    layout_to(&mut tree, 200.0, 200.0);
+    let epoch = tree.structure_epoch;
+
+    tree.reorder_children(parent, &[c, a, b]).expect("reorder");
+
+    assert_eq!(tree.get(parent).expect("parent").children(), &[c, a, b]);
+    assert_eq!(tree.structure_epoch, epoch, "reorder 不触发结构 epoch");
+    assert!(tree.take_order_dirty(), "reorder 必须请求仅顺序重建");
+    assert!(!tree.take_order_dirty(), "顺序重建标志只消费一次");
+    assert!(
+        tree.has_layout_work(),
+        "在流子节点的顺序影响布局，必须请求布局"
+    );
+}
+
+#[test]
+fn reordering_out_of_flow_children_does_not_request_layout() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let parent = boxed(&mut tree, root);
+    let a = absolute_child(
+        &mut tree,
+        parent,
+        LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)),
+    );
+    let b = absolute_child(
+        &mut tree,
+        parent,
+        LogicalRect::new(px(20.0), px(0.0), px(10.0), px(10.0)),
+    );
+    layout_to(&mut tree, 200.0, 200.0);
+
+    tree.reorder_children(parent, &[b, a]).expect("reorder");
+
+    assert!(!tree.has_layout_work(), "绝对定位子节点的重排不触发布局");
+}
+
+#[test]
+fn reorder_children_is_a_no_op_for_the_current_order() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let parent = boxed(&mut tree, root);
+    let a = boxed(&mut tree, parent);
+    let b = boxed(&mut tree, parent);
+    layout_to(&mut tree, 200.0, 200.0);
+    let damage = tree.get(parent).expect("parent").damage();
+
+    tree.reorder_children(parent, &[a, b]).expect("no-op");
+
+    assert_eq!(tree.get(parent).expect("parent").damage(), damage);
+    assert!(!tree.take_order_dirty(), "等序重排不请求顺序重建");
+}
+
+#[test]
+fn reorder_children_damages_the_affected_subtrees() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let parent = boxed(&mut tree, root);
+    let a = absolute_child(
+        &mut tree,
+        parent,
+        LogicalRect::new(px(5.0), px(5.0), px(20.0), px(20.0)),
+    );
+    let b = absolute_child(
+        &mut tree,
+        parent,
+        LogicalRect::new(px(30.0), px(30.0), px(20.0), px(20.0)),
+    );
+    layout_to(&mut tree, 200.0, 200.0);
+
+    tree.reorder_children(parent, &[b, a]).expect("reorder");
+
+    let damage = tree.get(parent).expect("parent").damage();
+    assert!(
+        damage.contains(LogicalPoint::new(px(10.0), px(10.0))),
+        "{damage:?}"
+    );
+    assert!(
+        damage.contains(LogicalPoint::new(px(40.0), px(40.0))),
+        "{damage:?}"
+    );
+    assert!(
+        !tree.has_layout_work(),
+        "绝对定位子节点的并集 damage 不触发布局"
+    );
+}
+
+#[test]
+fn reorder_children_changes_hit_order() {
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let parent = boxed(&mut tree, root);
+    let a = absolute_child(
+        &mut tree,
+        parent,
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)),
+    );
+    let b = absolute_child(
+        &mut tree,
+        parent,
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)),
+    );
+    layout_to(&mut tree, 200.0, 200.0);
+    let point = LogicalPoint::new(px(10.0), px(10.0));
+    assert_eq!(
+        crate::layout::hit_test::hit_test(&tree, point).map(|hit| hit.node),
+        Some(b)
+    );
+
+    tree.reorder_children(parent, &[b, a]).expect("reorder");
+
+    assert_eq!(
+        crate::layout::hit_test::hit_test(&tree, point).map(|hit| hit.node),
+        Some(a)
+    );
+}
+
+#[test]
+fn set_max_size_replaces_both_axes_and_reruns_layout() {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::MaxSize;
+
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let calls = Rc::new(Cell::new(0usize));
+    let counter = Rc::clone(&calls);
+    let mut style = Style::default();
+    style.align_self(taffy::style::AlignSelf::FLEX_START);
+    let node = NodeBuilder::boxed()
+        .style(style)
+        .measure(Box::new(move |_known, _available| {
+            counter.set(counter.get() + 1);
+            crate::math::LogicalSize::new(px(200.0), px(100.0))
+        }))
+        .build(&mut tree, root)
+        .expect("node");
+    layout_to(&mut tree, 400.0, 400.0);
+    assert_eq!(
+        tree.get(node).expect("node").layout().bounds.size,
+        crate::math::LogicalSize::new(px(200.0), px(100.0))
+    );
+    let calls_before = calls.get();
+
+    tree.set_max_size(node, MaxSize::width(px(50.0)))
+        .expect("width limit");
+    layout_to(&mut tree, 400.0, 400.0);
+
+    assert_eq!(
+        tree.get(node).expect("node").layout().bounds.size,
+        crate::math::LogicalSize::new(px(50.0), px(100.0))
+    );
+    assert!(calls.get() > calls_before, "测量必须重跑");
+
+    tree.set_max_size(node, MaxSize::both(px(50.0), px(40.0)))
+        .expect("both limits");
+    layout_to(&mut tree, 400.0, 400.0);
+    assert_eq!(
+        tree.get(node).expect("node").layout().bounds.size,
+        crate::math::LogicalSize::new(px(50.0), px(40.0))
+    );
+
+    tree.set_max_size(node, MaxSize::default())
+        .expect("clear limits");
+    layout_to(&mut tree, 400.0, 400.0);
+    assert_eq!(
+        tree.get(node).expect("node").layout().bounds.size,
+        crate::math::LogicalSize::new(px(200.0), px(100.0))
+    );
+}
+
+#[test]
+fn set_max_size_damages_the_old_bounds_and_rejects_invalid_values() {
+    use super::MaxSize;
+
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let mut style = Style::default();
+    style.align_self(taffy::style::AlignSelf::FLEX_START);
+    let node = NodeBuilder::boxed()
+        .style(style)
+        .measure(Box::new(|_known, _available| {
+            crate::math::LogicalSize::new(px(200.0), px(100.0))
+        }))
+        .build(&mut tree, root)
+        .expect("node");
+    layout_to(&mut tree, 400.0, 400.0);
+
+    tree.set_max_size(node, MaxSize::width(px(50.0)))
+        .expect("width limit");
+
+    let damage = tree.get(node).expect("node").damage();
+    assert!(
+        damage.contains(LogicalPoint::new(px(150.0), px(50.0))),
+        "缩小时必须 damage 旧矩形：{damage:?}"
+    );
+    assert!(tree.has_layout_work(), "运行时 max-size 必须请求布局");
+
+    let error = tree
+        .set_max_size(node, MaxSize::width(px(f32::NAN)))
+        .expect_err("NaN 必须被拒绝");
+    assert!(matches!(
+        error,
+        EngineError::InvalidMaxSize { node: reported, width: Some(width), .. }
+            if reported == node && width.value().is_nan()
+    ));
+    let error = tree
+        .set_max_size(node, MaxSize::height(px(-1.0)))
+        .expect_err("负值必须被拒绝");
+    assert!(matches!(error, EngineError::InvalidMaxSize { .. }));
+
+    let stale = NodeBuilder::boxed()
+        .build(&mut tree, root)
+        .expect("stale candidate");
+    tree.remove(stale).expect("remove");
+    assert!(matches!(
+        tree.set_max_size(stale, MaxSize::width(px(10.0))),
+        Err(EngineError::StaleNode { node: reported }) if reported == stale
+    ));
+}
+
+#[test]
+fn writing_an_equal_runtime_max_size_is_a_no_op() {
+    use super::MaxSize;
+
+    let mut tree = NodeTree::new();
+    let root = tree.root();
+    let mut style = Style::default();
+    style.align_self(taffy::style::AlignSelf::FLEX_START);
+    let node = NodeBuilder::boxed()
+        .style(style)
+        .measure(Box::new(|_known, _available| {
+            crate::math::LogicalSize::new(px(200.0), px(100.0))
+        }))
+        .build(&mut tree, root)
+        .expect("node");
+    layout_to(&mut tree, 400.0, 400.0);
+    tree.set_max_size(node, MaxSize::width(px(50.0)))
+        .expect("width limit");
+    layout_to(&mut tree, 400.0, 400.0);
+
+    tree.set_max_size(node, MaxSize::width(px(50.0)))
+        .expect("same limit");
+
+    assert!(!tree.has_layout_work(), "等值写入不得请求布局");
 }

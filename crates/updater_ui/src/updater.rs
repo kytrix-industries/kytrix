@@ -789,7 +789,7 @@ impl UpdaterCore {
         let mut still_open = false;
         if let Some(dialog) = self.dialog.as_mut() {
             dialog.sync(app, window)?;
-            still_open = dialog.is_open(app) || dialog.is_closing();
+            still_open = dialog.is_open(app) || dialog.is_closing(app);
         }
         if !still_open {
             self.dialog_requested = false;
@@ -912,7 +912,7 @@ pub(crate) trait UpdaterTestExt {
 
     fn test_dialog_open(&self, app: &App) -> bool;
 
-    fn test_dialog_closing(&self) -> bool;
+    fn test_dialog_closing(&self, app: &App) -> bool;
 
     fn test_press(&self, app: &mut App, suffix: &str) -> bool;
 }
@@ -996,12 +996,12 @@ impl UpdaterTestExt for Updater {
             .is_some_and(|dialog| dialog.is_open(app))
     }
 
-    fn test_dialog_closing(&self) -> bool {
+    fn test_dialog_closing(&self, app: &App) -> bool {
         self.core
             .borrow()
             .dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.is_closing())
+            .is_some_and(|dialog| dialog.is_closing(app))
     }
 
     fn test_press(&self, app: &mut App, suffix: &str) -> bool {
