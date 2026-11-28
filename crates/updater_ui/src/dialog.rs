@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
     rc::{Rc, Weak},
-    sync::Arc,
 };
 
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -26,7 +25,7 @@ use ui_kit::{
     kit::{
         button::Button,
         dialog::{Dialog, DialogBuilder},
-        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        markdown::{MarkdownAssets, MarkdownNode},
         progress::Progress,
         scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
         separator::Separator,
@@ -476,8 +475,14 @@ fn build_notes(
     let _handle: ScrollHandle = app.make_scroll(window, viewport, Default::default())?;
 
     let source = plan.notes.clone().unwrap_or_default();
-    let document = parse_document(&source, &ReleaseNotesAssets);
-    let markdown = MarkdownNode::mount(app, window, viewport, theme.clone(), Arc::new(document))?;
+    let markdown = MarkdownNode::mount(
+        app,
+        window,
+        viewport,
+        theme.clone(),
+        &source,
+        ReleaseNotesAssets,
+    )?;
     widgets.markdown = Some(markdown);
 
     let scrollbar_band = build_node(app, window, band, |tree, band| {

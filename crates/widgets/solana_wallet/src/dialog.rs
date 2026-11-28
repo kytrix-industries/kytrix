@@ -35,7 +35,7 @@ use ui_kit::{
         icon::IconKind,
         input::{self, InputNode, InputSpec, InputState},
         list::{List, ListOptions, SelectionMode},
-        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        markdown::{MarkdownAssets, MarkdownNode},
         separator::Separator,
         size::{UnifiedSizable, UnifiedSize},
         spinner::Spinner,
@@ -1529,8 +1529,7 @@ fn mount_markdown_from(
     theme: &ThemeHandle,
     source: &str,
 ) -> Result<MarkdownMessage, EngineError> {
-    let document = parse_document(source, &EmbeddedAssets);
-    let node = MarkdownNode::mount(app, window, parent, theme.clone(), Arc::new(document))?;
+    let node = MarkdownNode::mount(app, window, parent, theme.clone(), source, EmbeddedAssets)?;
     Ok(MarkdownMessage { node })
 }
 

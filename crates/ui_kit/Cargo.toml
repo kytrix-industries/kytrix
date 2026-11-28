@@ -8,15 +8,20 @@ edition.workspace = true
 ahash = { workspace = true }
 bytes = { workspace = true }
 color = { workspace = true }
-comrak = { workspace = true }
 image = { workspace = true }
+pulldown-cmark = { workspace = true }
 smol_str = { workspace = true }
 taffy = { workspace = true }
 ui_core = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 
+[[bench]]
+name = "markdown"
+harness = false
+
 [dev-dependencies]
+criterion = { workspace = true }
 tokio = { workspace = true }
 ui_core = { workspace = true, features = ["test-support", "automation"] }
 

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use ahash::HashMap;
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -19,7 +19,7 @@ use ui_core::{
 use ui_kit::{
     kit::{
         list::SelectionMode,
-        markdown::{parse::parse_document, source::MarkdownAssets},
+        markdown,
         table::{Column, ColumnAlign, Table, TableOptions},
     },
     theme::{handle::ThemeHandle, role::Role},
@@ -564,14 +564,6 @@ fn status_role(row: Option<&Arc<WatchListRow>>) -> Role {
     }
 }
 
-struct TableMarkdownAssets;
-
-impl MarkdownAssets for TableMarkdownAssets {
-    fn load(&self, _path: &str) -> Option<Cow<'static, [u8]>> {
-        None
-    }
-}
-
 fn market_not_loaded_text(
     translate: &Translate,
     venue: market_participants_model::identifier::VenueId,
@@ -582,7 +574,7 @@ fn market_not_loaded_text(
         logo = venue.asset_path(),
         market = venue.display_string(translate)
     );
-    parse_document(&source, &TableMarkdownAssets).plain_text()
+    markdown::plain_text(&source)
 }
 
 pub(super) fn columns(market: WatchListMarket, translate: &Translate) -> Vec<Column> {

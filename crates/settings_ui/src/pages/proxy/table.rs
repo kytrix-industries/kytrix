@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use app_config::{
     network::{ProxyAuthorizationConfig, ProxyConfig},
     settings::Config,
@@ -33,7 +31,7 @@ use ui_kit::{
         dialog::{Dialog, DialogBuilder},
         icon::IconKind,
         list::SelectionMode,
-        markdown::{parse::parse_document, source::MarkdownAssets},
+        markdown,
         table::{Column, ColumnAlign, Table, TableOptions},
     },
     theme::{handle::ThemeHandle, role::Role},
@@ -694,13 +692,5 @@ fn delete_message(translate: &Translate, name: &SmolStr) -> SmolStr {
         name = name.as_str()
     );
 
-    parse_document(rich.as_ref(), &NoMarkdownAssets).plain_text()
-}
-
-struct NoMarkdownAssets;
-
-impl MarkdownAssets for NoMarkdownAssets {
-    fn load(&self, _path: &str) -> Option<Cow<'static, [u8]>> {
-        None
-    }
+    markdown::plain_text(rich.as_ref())
 }

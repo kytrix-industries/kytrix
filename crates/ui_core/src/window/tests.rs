@@ -625,6 +625,7 @@ fn window_frame_reports_skipped_inline_box_images() {
         lines: vec![ShapedTextLine {
             text_range: 0..3,
             baseline: px(12.0),
+            line_top: px(0.0),
             line_height: px(16.0),
             advance: px(20.0),
             items: vec![ShapedTextItem::InlineBox(ShapedInlineBox {
@@ -633,6 +634,7 @@ fn window_frame_reports_skipped_inline_box_images() {
                 baseline: None,
             })],
             decorations: Vec::new(),
+            backgrounds: Vec::new(),
         }],
         width: px(20.0),
         height: px(16.0),

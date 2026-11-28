@@ -77,6 +77,7 @@ mod tests {
             lines: vec![ShapedTextLine {
                 text_range: 0..2,
                 baseline: px(12.0),
+                line_top: px(0.0),
                 line_height: px(16.0),
                 advance: px(20.0),
                 items: vec![ShapedTextItem::GlyphRun(ShapedGlyphRun {
@@ -89,6 +90,7 @@ mod tests {
                     }],
                 })],
                 decorations: Vec::new(),
+                backgrounds: Vec::new(),
             }],
             width: px(20.0),
             height: px(16.0),

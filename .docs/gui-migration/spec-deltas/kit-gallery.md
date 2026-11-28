@@ -24,7 +24,7 @@
 | ⑨ | 树 | `tree::{Tree, TreeItem}`：展开折叠 / 层级 / 方向键 / 单选 |
 | **⑩** | **宽表（新增）** | `Table` 横向滚动 + **内部 sticky 表头**：窄容器 420（出现水平条、可横向滚动/表头跟随）与宽容器 1100（无水平条）对照；三参数列配置；G7–G9 |
 | ⑪ | 输入框 | `input::{InputSpec, InputState, InputNode}`：单行 / 掩码 / 禁用 / 多行 + IME 提示 |
-| ⑫ | markdown | `markdown::{parse::parse_document, view::MarkdownView}`：富文本 / 代码 / 表格 / 引用 / 列表 / 行内图片占位 |
+| ⑫ | markdown | `markdown::{MarkdownAssets, MarkdownNode}`：pulldown-cmark 单遍管线；GFM 表格 / 任务清单 / 删除线、HTML 语义子集（对齐段落 / `<kbd>` / `<br>`）、代码块、引用（含嵌套）、行内图片占位 |
 | ⑬ | 浮层 | `popup_panel::PopupPanel` / `MenuChain`、`tooltip::Tooltip`、`dropdown`、`select`（多选 + 标签）、`menu`、`context_menu` |
 | ⑭ | 对话框 | `dialog::DialogBuilder`（普通对话框 + `alert` 形状 / 确认取消 / on_close / 模态遮罩） |
 | ⑮ | 颜色选择器 | `color_picker::ColorPicker`（触发器 + on_change） |

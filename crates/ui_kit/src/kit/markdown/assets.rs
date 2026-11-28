@@ -1,7 +1,9 @@
-use std::{borrow::Cow, io::Cursor};
+use std::io::Cursor;
 
 use smol_str::SmolStr;
 use ui_core::math::{LogicalSize, px};
+
+use super::MarkdownAssets;
 
 const SCHEME: &str = "file:";
 const SIZE_KEY: &str = "size";
@@ -14,25 +16,21 @@ const MIN_IMAGE_SIZE: f32 = 1.;
 const MAX_IMAGE_SIZE: f32 = 256.;
 const MIN_INTRINSIC_SIZE: f32 = 1.;
 
-pub trait MarkdownAssets {
-    fn load(&self, path: &str) -> Option<Cow<'static, [u8]>>;
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum InlineImageFormat {
+pub(super) enum InlineImageFormat {
     Image,
     Svg,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct InlineImageSource {
-    pub path: SmolStr,
+pub(super) struct InlineImageSource {
     pub format: InlineImageFormat,
+    pub path: SmolStr,
     pub size: Option<LogicalSize>,
 }
 
 impl InlineImageSource {
-    pub fn parse(uri: &str) -> Option<Self> {
+    pub(super) fn parse(uri: &str) -> Option<Self> {
         let reference = uri.strip_prefix(SCHEME)?;
         let reference = reference.strip_prefix("//").unwrap_or(reference);
         let (path, query) = match reference.split_once('?') {
@@ -83,12 +81,12 @@ impl InlineImageSource {
         })
     }
 
-    pub fn resolve(&self, assets: &dyn MarkdownAssets) -> LogicalSize {
+    pub(super) fn resolve(&self, assets: &dyn MarkdownAssets) -> LogicalSize {
         if let Some(size) = self.size {
             return size;
         }
-        let bytes = assets.load(&self.path);
-        let intrinsic = bytes
+        let intrinsic = assets
+            .load(&self.path)
             .as_deref()
             .and_then(intrinsic_size)
             .filter(|size| *size != LogicalSize::ZERO)
@@ -175,7 +173,8 @@ mod tests {
     use smol_str::SmolStr;
     use ui_core::math::{LogicalSize, px};
 
-    use super::{InlineImageFormat, InlineImageSource, MarkdownAssets};
+    use super::{InlineImageFormat, InlineImageSource};
+    use crate::kit::markdown::MarkdownAssets;
 
     struct EmbeddedAssets;
 
@@ -519,6 +518,24 @@ mod tests {
         assert_eq!(
             resolve("file://icons/phosphoricons/graph.svg"),
             LogicalSize::new(px(16.), px(16.))
+        );
+    }
+
+    #[test]
+    fn a_type_override_does_not_change_the_intrinsic_size() {
+        let resolve = |uri: &str| {
+            InlineImageSource::parse(uri)
+                .expect("the fixture URI should be usable")
+                .resolve(&EmbeddedAssets)
+        };
+
+        assert_eq!(
+            resolve("file://brands/Binance/binance.png?type=svg"),
+            LogicalSize::new(px(128.), px(128.))
+        );
+        assert_eq!(
+            resolve("file://brands/Ethereum/colored@72px.png?type=\"svg\""),
+            LogicalSize::new(px(44.), px(72.))
         );
     }
 

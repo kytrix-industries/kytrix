@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
 
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
@@ -15,7 +15,7 @@ use ui_kit::{
     kit::{
         button::Button,
         empty_state::EmptyState,
-        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        markdown::{MarkdownAssets, MarkdownNode},
         spinner::Spinner,
     },
     theme::role::Role,
@@ -85,11 +85,16 @@ impl Placeholder {
     ) -> Result<Self, EngineError> {
         if notice.is_markdown(cx.translate()) {
             let source = notice.resolve(cx.translate());
-            let document = parse_document(source.as_str(), &EmbeddedAssets);
             let window = cx.window();
             let theme = cx.theme().clone();
-            let markdown =
-                MarkdownNode::mount(cx.app_mut(), window, parent, theme, Arc::new(document))?;
+            let markdown = MarkdownNode::mount(
+                cx.app_mut(),
+                window,
+                parent,
+                theme,
+                source.as_str(),
+                EmbeddedAssets,
+            )?;
 
             return Ok(Self {
                 spinner: None,

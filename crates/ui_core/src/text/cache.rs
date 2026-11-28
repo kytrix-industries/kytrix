@@ -261,10 +261,7 @@ mod tests {
 
     #[test]
     fn shape_key_distinguishes_runs() {
-        use crate::{
-            paint::color::Color,
-            text::{TextDecoration, TextRun},
-        };
+        use crate::{paint::color::Color, text::TextRun};
 
         let plain = TextContent::new("abcdef", TextStyle::new(px(16.0)));
         let one = plain.clone().with_runs([TextRun::new(
@@ -288,7 +285,7 @@ mod tests {
         )]);
         let decorated = plain.clone().with_runs([TextRun::new(
             0..3,
-            TextStyle::new(px(16.0)).with_decoration(TextDecoration::underline(px(1.0))),
+            TextStyle::new(px(16.0)).with_underline(px(1.0), None),
         )]);
         let two = plain.clone().with_runs([
             TextRun::new(0..3, TextStyle::new(px(16.0)).with_weight(700)),
@@ -326,6 +323,134 @@ mod tests {
             "空 runs 的快照必须与空 runs 的内容同源"
         );
         assert!(!shaped.same_shaping_inputs(&plain.style, one.runs()));
+    }
+
+    #[test]
+    fn shape_key_distinguishes_decoration_sets_and_backgrounds() {
+        use crate::{
+            paint::color::Color,
+            text::{TextBackground, TextRun},
+        };
+
+        let highlighted = TextBackground {
+            color: Color::WHITE,
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let run = |style: TextStyle| {
+            TextContent::new("abcdef", TextStyle::new(px(16.0)))
+                .with_runs([TextRun::new(0..3, style)])
+        };
+        let underline = run(TextStyle::new(px(16.0)).with_underline(px(1.0), None));
+        let strike = run(TextStyle::new(px(16.0)).with_strikethrough(px(1.0), None));
+        let both = run(TextStyle::new(px(16.0))
+            .with_underline(px(1.0), None)
+            .with_strikethrough(px(1.0), None));
+        let colored_line =
+            run(TextStyle::new(px(16.0)).with_underline(px(1.0), Some(Color::WHITE)));
+        let thicker_line = run(TextStyle::new(px(16.0)).with_underline(px(2.0), None));
+        let background = run(TextStyle::new(px(16.0)).with_background(highlighted));
+        let other_radius = run(TextStyle::new(px(16.0)).with_background(TextBackground {
+            corner_radius: px(4.0),
+            ..highlighted
+        }));
+        let other_padding = run(TextStyle::new(px(16.0)).with_background(TextBackground {
+            padding_x: px(4.0),
+            ..highlighted
+        }));
+        let other_fill = run(TextStyle::new(px(16.0)).with_background(TextBackground {
+            color: Color::BLACK,
+            ..highlighted
+        }));
+
+        let underline_key = ShapeKey::new(&underline, 1);
+        for (name, content) in [
+            ("strike", &strike),
+            ("both", &both),
+            ("line color", &colored_line),
+            ("line thickness", &thicker_line),
+            ("background", &background),
+        ] {
+            assert_ne!(
+                underline_key,
+                ShapeKey::new(content, 1),
+                "{name} 必须参与形状缓存键"
+            );
+        }
+        let background_key = ShapeKey::new(&background, 1);
+        for (name, content) in [
+            ("corner radius", &other_radius),
+            ("padding", &other_padding),
+            ("background fill", &other_fill),
+        ] {
+            assert_ne!(
+                background_key,
+                ShapeKey::new(content, 1),
+                "只改背景{name}也必须换键（漏哈希该字段即红）"
+            );
+        }
+
+        let plain = TextContent::new("abcdef", TextStyle::new(px(16.0)));
+        let highlighted_base = TextContent::new(
+            "abcdef",
+            TextStyle::new(px(16.0)).with_background(highlighted),
+        );
+        assert!(
+            !plain.style.same_shaping_inputs(&highlighted_base.style),
+            "基础样式背景必须让命中判据失配"
+        );
+        assert_ne!(
+            ShapeKey::new(&plain, 1),
+            ShapeKey::new(&highlighted_base, 1)
+        );
+    }
+
+    #[test]
+    fn shape_key_distinguishes_base_style_decorations() {
+        use crate::paint::color::Color;
+
+        let plain = TextContent::new("abcdef", TextStyle::new(px(16.0)));
+        let underline = TextContent::new(
+            "abcdef",
+            TextStyle::new(px(16.0)).with_underline(px(1.0), None),
+        );
+        let strike = TextContent::new(
+            "abcdef",
+            TextStyle::new(px(16.0)).with_strikethrough(px(1.0), None),
+        );
+        let both = TextContent::new(
+            "abcdef",
+            TextStyle::new(px(16.0))
+                .with_underline(px(1.0), None)
+                .with_strikethrough(px(1.0), None),
+        );
+        let colored_line = TextContent::new(
+            "abcdef",
+            TextStyle::new(px(16.0)).with_underline(px(1.0), Some(Color::WHITE)),
+        );
+
+        let plain_key = ShapeKey::new(&plain, 1);
+        for (name, content) in [
+            ("underline", &underline),
+            ("strikethrough", &strike),
+            ("both", &both),
+            ("line color", &colored_line),
+        ] {
+            assert_ne!(
+                plain_key,
+                ShapeKey::new(content, 1),
+                "只有基础样式{name}不同的文本也必须换形状缓存键"
+            );
+            assert!(
+                !plain.style.same_shaping_inputs(&content.style),
+                "基础样式{name}不同必须让命中判据失配"
+            );
+        }
+        assert_ne!(
+            ShapeKey::new(&underline, 1),
+            ShapeKey::new(&both, 1),
+            "基础样式的装饰集合不同也必须换键"
+        );
     }
 
     #[test]

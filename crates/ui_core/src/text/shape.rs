@@ -13,9 +13,10 @@ use smol_str::{SmolStr, format_smolstr};
 use taffy::AvailableSpace;
 
 use super::{
-    InlineBoxSpec, ShapedDecoration, ShapedGlyphRun, ShapedInlineBox, ShapedLine, ShapedTextItem,
-    ShapedTextLine, TextAlign, TextContent, TextDecoration, TextDiagnostic, TextDirection,
-    TextLineBreak, TextLineMetrics, TextOverflow, TextRun, TextSlant, TextStyle, TextWrap,
+    InlineBoxSpec, ShapedGlyphRun, ShapedInlineBox, ShapedLine, ShapedQuad, ShapedTextItem,
+    ShapedTextLine, TextAlign, TextBackground, TextContent, TextDecorationKind, TextDiagnostic,
+    TextDirection, TextLineBreak, TextLineMetrics, TextOverflow, TextRun, TextSlant, TextStyle,
+    TextWrap,
     atlas::{GlyphAtlas, GlyphAtlasStats},
     fast_path::SimpleShaped,
     inline_flow,
@@ -926,6 +927,7 @@ fn parley_line_break(kind: TextLineBreak) -> parley::LineBreak {
 
 const UNDERLINE_OFFSET_EM: f32 = 0.10;
 const STRIKETHROUGH_OFFSET_EM: f32 = 0.30;
+const BACKGROUND_SEAM_EPSILON: LogicalPx = LogicalPx::new(1e-3);
 
 fn line_content_end(text: &str, line_range: &core::ops::Range<usize>) -> usize {
     let bytes = text.as_bytes();
@@ -943,64 +945,173 @@ fn decoration_segments(
     runs: &[TextRun],
     base_style: &TextStyle,
     base_color: Color,
-) -> Vec<ShapedDecoration> {
+) -> Vec<ShapedQuad> {
     let line_range = line.text_range();
     let line_end = line_content_end(text, &line_range);
-    let decorated: Vec<(core::ops::Range<usize>, TextDecoration, LogicalPx, Color)> = runs
-        .iter()
-        .filter_map(|run| {
-            let decoration = run.style.decoration()?;
-            if !decoration.is_visible() {
-                return None;
+    let capacity = (runs.len() + 1) * TextDecorationKind::ALL.len();
+    let mut out = Vec::new();
+    for kind in TextDecorationKind::ALL {
+        let offset_em = match kind {
+            TextDecorationKind::Underline => UNDERLINE_OFFSET_EM,
+            TextDecorationKind::Strikethrough => -STRIKETHROUGH_OFFSET_EM,
+        };
+        let segments = covered_segments(
+            line_range.start,
+            line_end,
+            runs,
+            |style| {
+                style
+                    .decorations()
+                    .get(kind)
+                    .filter(|decoration| decoration.is_visible())
+                    .map(|decoration| (decoration, style.size, style.color))
+            },
+            base_style
+                .decorations()
+                .get(kind)
+                .filter(|decoration| decoration.is_visible())
+                .map(|decoration| (decoration, base_style.size, base_color)),
+        );
+        for (range, (decoration, em, text_color)) in segments {
+            let Some((left, width)) = visual_span(line, text, range) else {
+                continue;
+            };
+            if out.is_empty() {
+                out.reserve(capacity);
             }
-            let start = run.range.start.max(line_range.start);
-            let end = run.range.end.min(line_end);
-            (start < end).then_some((start..end, decoration, run.style.size, run.style.color))
-        })
-        .collect();
-
-    let mut segments: Vec<(core::ops::Range<usize>, TextDecoration, LogicalPx, Color)> = Vec::new();
-    if let Some(decoration) = base_style.decoration()
-        && decoration.is_visible()
-    {
-        let mut cursor = line_range.start;
-        for (range, ..) in &decorated {
-            if range.start > cursor {
-                segments.push((cursor..range.start, decoration, base_style.size, base_color));
-            }
-            cursor = cursor.max(range.end);
-        }
-        if cursor < line_end {
-            segments.push((cursor..line_end, decoration, base_style.size, base_color));
+            let thickness = decoration.thickness;
+            out.push(ShapedQuad {
+                rect: LogicalRect::new(
+                    left,
+                    baseline + em * offset_em - thickness * 0.5,
+                    width,
+                    thickness,
+                ),
+                color: decoration.color.unwrap_or(text_color),
+                corner_radius: LogicalPx::ZERO,
+            });
         }
     }
-    segments.extend(decorated);
+    out
+}
 
-    let mut out = Vec::with_capacity(segments.len());
-    for (range, decoration, em, text_color) in segments {
-        let Some((left, width)) = decoration_span(line, text, range) else {
+fn background_segments(
+    line: &parley::Line<'_, ColorBrush>,
+    line_top: LogicalPx,
+    line_height: LogicalPx,
+    text: &str,
+    runs: &[TextRun],
+    base_style: &TextStyle,
+) -> Vec<ShapedQuad> {
+    let line_range = line.text_range();
+    let line_end = line_content_end(text, &line_range);
+    let segments = covered_segments(
+        line_range.start,
+        line_end,
+        runs,
+        |style| {
+            style
+                .background()
+                .filter(|background| background.is_visible())
+        },
+        base_style
+            .background()
+            .filter(|background| background.is_visible()),
+    );
+    let mut spans = Vec::with_capacity(segments.len());
+    for (range, background) in segments {
+        let Some((left, width)) = visual_span(line, text, range) else {
             continue;
         };
-        let thickness = decoration.thickness();
-        let (top, color) = match decoration {
-            TextDecoration::Underline { color, .. } => (
-                baseline + em * UNDERLINE_OFFSET_EM,
-                color.unwrap_or(text_color),
+        spans.push((left, left + width, background));
+    }
+    spans.sort_by(|a, b| a.0.value().total_cmp(&b.0.value()));
+    let mut merged: Vec<(LogicalPx, LogicalPx, TextBackground)> = Vec::with_capacity(spans.len());
+    for (left, right, background) in spans {
+        if let Some((_, last_right, last_background)) = merged.last_mut()
+            && *last_background == background
+            && left <= *last_right + BACKGROUND_SEAM_EPSILON
+        {
+            *last_right = last_right.max(right);
+            continue;
+        }
+        merged.push((left, right, background));
+    }
+    let mut out = Vec::with_capacity(merged.len());
+    for (index, (left, right, background)) in merged.iter().copied().enumerate() {
+        let previous_right = index.checked_sub(1).map(|previous| merged[previous].1);
+        let next_left = merged.get(index + 1).map(|next| next.0);
+        let left_padding = previous_right.map_or(background.padding_x, |previous| {
+            let gap = left - previous;
+            if gap > BACKGROUND_SEAM_EPSILON {
+                background.padding_x.min(gap * 0.5)
+            } else {
+                LogicalPx::ZERO
+            }
+        });
+        let right_padding = next_left.map_or(background.padding_x, |next| {
+            let gap = next - right;
+            if gap > BACKGROUND_SEAM_EPSILON {
+                background.padding_x.min(gap * 0.5)
+            } else {
+                LogicalPx::ZERO
+            }
+        });
+        out.push(ShapedQuad {
+            rect: LogicalRect::new(
+                left - left_padding,
+                line_top,
+                right - left + left_padding + right_padding,
+                line_height,
             ),
-            TextDecoration::Strikethrough { color, .. } => (
-                baseline - em * STRIKETHROUGH_OFFSET_EM,
-                color.unwrap_or(text_color),
-            ),
-        };
-        out.push(ShapedDecoration {
-            rect: LogicalRect::new(left, top - thickness * 0.5, width, thickness),
-            color,
+            color: background.color,
+            corner_radius: background.corner_radius,
         });
     }
     out
 }
 
-fn decoration_span(
+fn covered_segments<T: Copy>(
+    line_start: usize,
+    line_end: usize,
+    runs: &[TextRun],
+    run_value: impl Fn(&TextStyle) -> Option<T>,
+    base_value: Option<T>,
+) -> Vec<(core::ops::Range<usize>, T)> {
+    let mut run_segments: Vec<(core::ops::Range<usize>, T)> = Vec::new();
+    for run in runs {
+        let Some(value) = run_value(&run.style) else {
+            continue;
+        };
+        let start = run.range.start.max(line_start);
+        let end = run.range.end.min(line_end);
+        if start >= end {
+            continue;
+        }
+        if run_segments.is_empty() {
+            run_segments.reserve(runs.len());
+        }
+        run_segments.push((start..end, value));
+    }
+    let mut segments: Vec<(core::ops::Range<usize>, T)> =
+        Vec::with_capacity(run_segments.len() + usize::from(base_value.is_some()));
+    if let Some(value) = base_value {
+        let mut cursor = line_start;
+        for (range, _) in &run_segments {
+            if range.start > cursor {
+                segments.push((cursor..range.start, value));
+            }
+            cursor = cursor.max(range.end);
+        }
+        if cursor < line_end {
+            segments.push((cursor..line_end, value));
+        }
+    }
+    segments.extend(run_segments);
+    segments
+}
+
+fn visual_span(
     line: &parley::Line<'_, ColorBrush>,
     text: &str,
     range: core::ops::Range<usize>,
@@ -1059,6 +1170,7 @@ fn rasterize_parley(
 ) -> Result<(ShapedLine, Vec<TextDiagnostic>), EngineError> {
     let mut diagnostics: Vec<TextDiagnostic> = inline_diagnostics.to_vec();
     let mut lines = Vec::with_capacity(layout.lines().len());
+    let mut line_top = LogicalPx::ZERO;
     for line in layout.lines() {
         let metrics = line.metrics();
         let mut items = Vec::new();
@@ -1185,14 +1297,19 @@ fn rasterize_parley(
         }
         let decorations =
             decoration_segments(&line, px(metrics.baseline), text, runs, base_style, color);
+        let line_height = px(metrics.line_height);
+        let backgrounds = background_segments(&line, line_top, line_height, text, runs, base_style);
         lines.push(ShapedTextLine {
             text_range: line.text_range(),
             baseline: px(metrics.baseline),
-            line_height: px(metrics.line_height),
+            line_top,
+            line_height,
             advance: px(metrics.advance),
             items,
             decorations,
+            backgrounds,
         });
+        line_top += line_height;
     }
     let shaped = ShapedLine {
         text: text.clone(),
@@ -1284,7 +1401,8 @@ fn apply_overflow(
             line_offset,
         )?;
         if let Some(last) = shaped.lines.last_mut() {
-            clamp_line_decorations(last, line_offset);
+            clamp_line_rects(&mut last.decorations, line_offset, last.advance);
+            truncate_line_rects(&mut last.backgrounds, line_offset, last.advance);
         }
     }
     shaped.width = shaped
@@ -1299,21 +1417,33 @@ fn apply_overflow(
     Ok(())
 }
 
-fn clamp_line_decorations(line: &mut ShapedTextLine, line_offset: LogicalPx) {
+fn clamp_line_rects(rects: &mut Vec<ShapedQuad>, line_offset: LogicalPx, line_advance: LogicalPx) {
     let min = line_offset;
-    let max = line_offset + line.advance;
-    for decoration in &mut line.decorations {
-        let left = decoration.rect.origin.x.max(min);
-        let right = (decoration.rect.origin.x + decoration.rect.size.width).min(max);
+    let max = line_offset + line_advance;
+    for quad in rects.iter_mut() {
+        let left = quad.rect.origin.x.max(min);
+        let right = (quad.rect.origin.x + quad.rect.size.width).min(max);
         if right > left {
-            decoration.rect.origin.x = left;
-            decoration.rect.size.width = right - left;
+            quad.rect.origin.x = left;
+            quad.rect.size.width = right - left;
         } else {
-            decoration.rect.size.width = LogicalPx::ZERO;
+            quad.rect.size.width = LogicalPx::ZERO;
         }
     }
-    line.decorations
-        .retain(|decoration| decoration.rect.size.width > LogicalPx::ZERO);
+    rects.retain(|quad| quad.rect.size.width > LogicalPx::ZERO);
+}
+
+fn truncate_line_rects(
+    rects: &mut Vec<ShapedQuad>,
+    line_offset: LogicalPx,
+    line_advance: LogicalPx,
+) {
+    let max = line_offset + line_advance;
+    for quad in rects.iter_mut() {
+        let right = (quad.rect.origin.x + quad.rect.size.width).min(max);
+        quad.rect.size.width = (right - quad.rect.origin.x).max(LogicalPx::ZERO);
+    }
+    rects.retain(|quad| quad.rect.size.width > LogicalPx::ZERO);
 }
 
 fn max_visible_lines(style: &TextStyle, line_count: usize) -> usize {
@@ -1475,8 +1605,8 @@ mod tests {
     use crate::{
         math::{DevicePixelRatio, LogicalPx, px},
         text::{
-            FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextContent,
-            TextDecoration, TextDiagnostic, TextDirection, TextRun, TextStyle, TextWrap,
+            FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextBackground,
+            TextContent, TextDiagnostic, TextDirection, TextRun, TextStyle, TextWrap,
         },
     };
 
@@ -1631,6 +1761,27 @@ mod tests {
             })
             .flatten()
             .collect()
+    }
+
+    fn glyph_bounds(
+        line: &crate::text::ShapedTextLine,
+        range: core::ops::Range<usize>,
+    ) -> (f32, f32) {
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        for item in &line.items {
+            let ShapedTextItem::GlyphRun(run) = item else {
+                continue;
+            };
+            if run.text_range.start < range.end && range.start < run.text_range.end {
+                for glyph in &run.glyphs {
+                    left = left.min(glyph.position.x.value());
+                    right = right.max((glyph.position.x + glyph.size.width).value());
+                }
+            }
+        }
+        assert!(left.is_finite() && right.is_finite(), "区间必须有字形");
+        (left, right)
     }
 
     fn assert_ellipsis_prefix(
@@ -2330,13 +2481,13 @@ mod tests {
                     0..3,
                     TextStyle::new(px(16.0))
                         .with_color(ink)
-                        .with_decoration(TextDecoration::underline(px(1.0))),
+                        .with_underline(px(1.0), None),
                 ),
                 TextRun::new(
                     3..6,
-                    TextStyle::new(px(16.0)).with_color(ink).with_decoration(
-                        TextDecoration::strikethrough(px(2.0)).with_color(Some(explicit)),
-                    ),
+                    TextStyle::new(px(16.0))
+                        .with_color(ink)
+                        .with_strikethrough(px(2.0), Some(explicit)),
                 ),
             ]);
         let shaped = harness.shape_content(&content);
@@ -2394,16 +2545,11 @@ mod tests {
 
     #[test]
     fn base_style_decoration_covers_uncovered_text_only() {
-        let underline = TextDecoration::underline(px(1.0));
-        let strike = TextDecoration::strikethrough(px(2.0));
         let mut harness = Harness::new();
-        let content = TextContent::new(
-            "abcdef",
-            TextStyle::new(px(16.0)).with_decoration(underline),
-        )
-        .with_runs([TextRun::new(
+        let base = TextStyle::new(px(16.0)).with_underline(px(1.0), None);
+        let content = TextContent::new("abcdef", base.clone()).with_runs([TextRun::new(
             0..3,
-            TextStyle::new(px(16.0)).with_decoration(strike),
+            TextStyle::new(px(16.0)).with_underline(px(2.0), None),
         )]);
         let shaped = harness.shape_content(&content);
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
@@ -2419,21 +2565,60 @@ mod tests {
         assert_eq!(
             decorations.len(),
             2,
-            "删除线 run + 兜底下划线区间：{decorations:?}"
+            "同一种线的兜底区间与 run 区间各一条：{decorations:?}"
         );
-        let base = decorations[0];
+        let fallback = decorations[0];
         let run = decorations[1];
         assert!(
-            base.rect.origin.y > line.lines[0].baseline,
-            "兜底装饰 = 下划线（基线下方）：{base:?}"
+            (run.rect.origin.x).abs() < px(1e-3),
+            "run 覆盖行首：{run:?}"
         );
         assert!(
-            run.rect.origin.y < line.lines[0].baseline,
-            "run 装饰 = 删除线（基线上方）：{run:?}"
+            fallback.rect.origin.x >= run.rect.origin.x + run.rect.size.width - 1e-3,
+            "兜底下划线不得覆盖已由 run 下划线装饰的区间：{decorations:?}"
+        );
+        assert_eq!(fallback.rect.size.height, px(1.0), "兜底用基础样式的厚度");
+        assert_eq!(run.rect.size.height, px(2.0), "run 用自身厚度");
+
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let mixed = TextContent::new("abcdef", base).with_runs([TextRun::new(
+            0..3,
+            TextStyle::new(px(16.0)).with_strikethrough(px(2.0), None),
+        )]);
+        let shaped = harness.shape_content(&mixed);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let decorations = &line.lines[0].decorations;
+        assert_eq!(
+            decorations.len(),
+            2,
+            "基础下划线 + run 删除线必须同时存在：{decorations:?}"
+        );
+        let underline = decorations[0];
+        let strike = decorations[1];
+        assert!(
+            underline.rect.origin.y > line.lines[0].baseline,
+            "基础样式 = 下划线（基线下方）：{underline:?}"
         );
         assert!(
-            base.rect.origin.x >= run.rect.origin.x + run.rect.size.width - 1e-3,
-            "兜底下划线不得覆盖已由 run 装饰的区间：{decorations:?}"
+            strike.rect.origin.y < line.lines[0].baseline,
+            "run 样式 = 删除线（基线上方）：{strike:?}"
+        );
+        assert!(
+            underline.rect.origin.x <= strike.rect.origin.x
+                && underline.rect.origin.x + underline.rect.size.width
+                    >= strike.rect.origin.x + strike.rect.size.width,
+            "不同种类的线互不覆盖：基础下划线与 run 删除线共享同一文本区间：{decorations:?}"
+        );
+        assert!(
+            underline.rect.size.width > strike.rect.size.width,
+            "基础下划线仍覆盖 run 没有下划线的区间：{decorations:?}"
         );
     }
 
@@ -2441,10 +2626,7 @@ mod tests {
     fn cjk_and_emoji_mixed_runs_keep_boundaries() {
         let mut harness = Harness::new();
         let content = TextContent::new("价格🌍ab", TextStyle::new(px(16.0))).with_runs([
-            TextRun::new(
-                0..6,
-                TextStyle::new(px(16.0)).with_decoration(TextDecoration::underline(px(1.0))),
-            ),
+            TextRun::new(0..6, TextStyle::new(px(16.0)).with_underline(px(1.0), None)),
             TextRun::new(6..10, TextStyle::new(px(18.0))),
             TextRun::new(10..12, TextStyle::new(px(16.0)).with_weight(700)),
         ]);
@@ -2481,7 +2663,7 @@ mod tests {
         let mut harness = Harness::new();
         let content = TextContent::new(
             "alpha beta gamma",
-            TextStyle::new(px(16.0)).with_decoration(TextDecoration::underline(px(1.0))),
+            TextStyle::new(px(16.0)).with_underline(px(1.0), None),
         );
         let shaped = harness.shape_content(&content);
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
@@ -2523,7 +2705,7 @@ mod tests {
 
     #[test]
     fn decoration_survives_hard_line_breaks() {
-        let underline = TextDecoration::underline(px(1.0));
+        let underline_thickness = px(1.0);
         let mut harness = Harness::new();
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         for (text, expected) in [
@@ -2532,8 +2714,10 @@ mod tests {
             ("ab\n\ncd", vec![1, 0, 1]),
             ("ab\n", vec![1, 0]),
         ] {
-            let content =
-                TextContent::new(text, TextStyle::new(px(16.0)).with_decoration(underline));
+            let content = TextContent::new(
+                text,
+                TextStyle::new(px(16.0)).with_underline(underline_thickness, None),
+            );
             let shaped = harness.shape_content(&content);
             let (line, _diagnostics, _stats) = rasterize_line(
                 &shaped,
@@ -2594,12 +2778,12 @@ mod tests {
 
     #[test]
     fn run_decoration_clipped_at_hard_line_break() {
-        let underline = TextDecoration::underline(px(1.0));
+        let underline_thickness = px(1.0);
         let mut harness = Harness::new();
         let content =
             TextContent::new("ab\ncd", TextStyle::new(px(16.0))).with_runs([TextRun::new(
                 0..5,
-                TextStyle::new(px(16.0)).with_decoration(underline),
+                TextStyle::new(px(16.0)).with_underline(underline_thickness, None),
             )]);
         let shaped = harness.shape_content(&content);
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
@@ -2633,12 +2817,15 @@ mod tests {
 
     #[test]
     fn rtl_decoration_covers_the_full_visual_span() {
-        let underline = TextDecoration::underline(px(1.0));
+        let underline_thickness = px(1.0);
         let rtl = TextStyle::new(px(16.0)).with_direction(TextDirection::Rtl);
         let mut harness = Harness::new();
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
 
-        let content = TextContent::new("שלום עולם", rtl.clone().with_decoration(underline));
+        let content = TextContent::new(
+            "שלום עולם",
+            rtl.clone().with_underline(underline_thickness, None),
+        );
         let shaped = harness.shape_content(&content);
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
@@ -2669,8 +2856,8 @@ mod tests {
         );
 
         let content = TextContent::new("שלום עולם", rtl.clone()).with_runs([
-            TextRun::new(0..4, rtl.clone().with_decoration(underline)),
-            TextRun::new(4..8, rtl.with_decoration(underline)),
+            TextRun::new(0..4, rtl.clone().with_underline(underline_thickness, None)),
+            TextRun::new(4..8, rtl.with_underline(underline_thickness, None)),
         ]);
         let shaped = harness.shape_content(&content);
         let (line, _diagnostics, _stats) = rasterize_line(
@@ -2718,7 +2905,7 @@ mod tests {
         let content =
             TextContent::new("abc שלום def", TextStyle::new(px(16.0))).with_runs([TextRun::new(
                 4..12,
-                TextStyle::new(px(16.0)).with_decoration(underline),
+                TextStyle::new(px(16.0)).with_underline(underline_thickness, None),
             )]);
         let shaped = harness.shape_content(&content);
         let (line, _diagnostics, _stats) = rasterize_line(
@@ -2759,6 +2946,998 @@ mod tests {
         assert!(
             decoration.rect.origin.x + decoration.rect.size.width >= px(run_right - 1.5),
             "LTR 段落里的 RTL run：装饰右端不得止于 run 内部：{decoration:?} vs run {run_left}..{run_right}"
+        );
+    }
+
+    #[test]
+    fn rtl_background_covers_the_visual_span() {
+        use crate::paint::color::Color;
+
+        let background = TextBackground {
+            color: Color::Srgb {
+                r: 0.8,
+                g: 0.9,
+                b: 1.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(0.0),
+            padding_x: px(0.0),
+        };
+        let rtl = TextStyle::new(px(16.0)).with_direction(TextDirection::Rtl);
+        let mut harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+
+        let content = TextContent::new("שלום עולם", rtl.clone().with_background(background));
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.backgrounds.len(),
+            1,
+            "整段 RTL 背景一条：{:?}",
+            shaped_line.backgrounds
+        );
+        let rect = shaped_line.backgrounds[0].rect;
+        assert!(
+            rect.origin.x <= px(1.0),
+            "RTL 背景必须从行左边缘开始（视觉跨度，不是文本区间线性换算）：{rect:?}"
+        );
+        assert!(
+            (rect.origin.x + rect.size.width - shaped_line.advance).abs() <= px(1.0),
+            "RTL 背景必须覆盖到行推进末端：{rect:?} / advance {}",
+            shaped_line.advance
+        );
+
+        let red = TextBackground {
+            color: Color::Srgb {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(0.0),
+            padding_x: px(0.0),
+        };
+        let blue = TextBackground {
+            color: Color::Srgb {
+                r: 0.0,
+                g: 0.0,
+                b: 1.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(0.0),
+            padding_x: px(0.0),
+        };
+        let content = TextContent::new("שלום עולם", rtl.clone()).with_runs([
+            TextRun::new(0..8, rtl.clone().with_background(red)),
+            TextRun::new(8..17, rtl.clone().with_background(blue)),
+        ]);
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.backgrounds.len(),
+            2,
+            "不同底色的两个 RTL run 各一条：{:?}",
+            shaped_line.backgrounds
+        );
+        let red_rect = shaped_line
+            .backgrounds
+            .iter()
+            .find(|quad| quad.color == red.color)
+            .expect("红色背景")
+            .rect;
+        let blue_rect = shaped_line
+            .backgrounds
+            .iter()
+            .find(|quad| quad.color == blue.color)
+            .expect("蓝色背景")
+            .rect;
+        assert!(
+            red_rect.origin.x > blue_rect.origin.x,
+            "RTL 视觉反转：文本序靠前的 run 必须落在右侧：{red_rect:?} / {blue_rect:?}"
+        );
+        let (red_left, red_right) = glyph_bounds(shaped_line, 0..8);
+        let (blue_left, blue_right) = glyph_bounds(shaped_line, 8..17);
+        assert!(
+            red_rect.origin.x <= px(red_left + 1.5)
+                && red_rect.origin.x + red_rect.size.width >= px(red_right - 1.5),
+            "红色矩形必须覆盖文本序第一个 run 的视觉跨度：{red_rect:?} vs {red_left}..{red_right}"
+        );
+        assert!(
+            blue_rect.origin.x <= px(blue_left + 1.5)
+                && blue_rect.origin.x + blue_rect.size.width >= px(blue_right - 1.5),
+            "蓝色矩形必须覆盖文本序第二个 run 的视觉跨度：{blue_rect:?} vs {blue_left}..{blue_right}"
+        );
+        assert!(
+            (blue_rect.origin.x + blue_rect.size.width - red_rect.origin.x).abs() <= px(1e-3),
+            "视觉相邻的两个 RTL run 背景必须严格相接：{blue_rect:?} / {red_rect:?}"
+        );
+
+        let content = TextContent::new("שלום עולם", rtl.clone()).with_runs([
+            TextRun::new(0..4, rtl.clone().with_background(red)),
+            TextRun::new(4..8, rtl.clone().with_background(blue)),
+            TextRun::new(8..17, rtl.with_background(red)),
+        ]);
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        let mut rects = shaped_line.backgrounds.to_vec();
+        rects.sort_by(|a, b| a.rect.origin.x.value().total_cmp(&b.rect.origin.x.value()));
+        assert_eq!(
+            rects.len(),
+            3,
+            "合并只发生在同色之间：被蓝色隔开的两段红色不得合并：{rects:?}"
+        );
+        assert_eq!(
+            rects.iter().map(|quad| quad.color).collect::<Vec<_>>(),
+            vec![red.color, blue.color, red.color],
+            "视觉序（左→右）是文本序的反序，颜色必须跟随各自 run：{rects:?}"
+        );
+        assert!(
+            (rects[0].rect.origin.x + rects[0].rect.size.width - rects[1].rect.origin.x).abs()
+                <= px(1e-3)
+                && (rects[1].rect.origin.x + rects[1].rect.size.width - rects[2].rect.origin.x)
+                    .abs()
+                    <= px(1e-3),
+            "三条视觉相邻矩形必须严格相接：{rects:?}"
+        );
+
+        let content =
+            TextContent::new("abc שלום def", TextStyle::new(px(16.0))).with_runs([TextRun::new(
+                4..12,
+                TextStyle::new(px(16.0)).with_background(background),
+            )]);
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(shaped_line.backgrounds.len(), 1, "只有 RTL run 有背景");
+        let rect = shaped_line.backgrounds[0].rect;
+        let (run_left, run_right) = shaped_line
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ShapedTextItem::GlyphRun(run) if run.text_range == (4..12) => {
+                    let left = run
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.position.x.value())
+                        .fold(f32::INFINITY, f32::min);
+                    let right = run
+                        .glyphs
+                        .iter()
+                        .map(|glyph| (glyph.position.x + glyph.size.width).value())
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    Some((left, right))
+                }
+                ShapedTextItem::GlyphRun(_) | ShapedTextItem::InlineBox(_) => None,
+            })
+            .expect("RTL run 必须存在");
+        assert!(
+            rect.origin.x <= px(run_left + 1.5),
+            "LTR 段落里的 RTL run：背景左端不得从 run 内部开始：{rect:?} vs run {run_left}..{run_right}"
+        );
+        assert!(
+            rect.origin.x + rect.size.width >= px(run_right - 1.5),
+            "LTR 段落里的 RTL run：背景右端不得止于 run 内部：{rect:?} vs run {run_left}..{run_right}"
+        );
+    }
+
+    #[test]
+    fn one_run_draws_underline_and_strikethrough_together() {
+        use crate::paint::color::Color;
+
+        let ink = Color::Srgb {
+            r: 0.1,
+            g: 0.2,
+            b: 0.3,
+            alpha: 1.0,
+        };
+        let explicit = Color::Srgb {
+            r: 0.9,
+            g: 0.9,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let mut harness = Harness::new();
+        let content = TextContent::new("hello", TextStyle::new(px(16.0)).with_color(ink))
+            .with_runs([TextRun::new(
+                0..5,
+                TextStyle::new(px(16.0))
+                    .with_color(ink)
+                    .with_underline(px(1.0), None)
+                    .with_strikethrough(px(2.0), Some(explicit)),
+            )]);
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.decorations.len(),
+            2,
+            "同一个 run 的下划线与删除线都必须生成矩形：{:?}",
+            shaped_line.decorations
+        );
+        let underline = shaped_line.decorations[0];
+        let strike = shaped_line.decorations[1];
+        assert!(
+            underline.rect.origin.y > shaped_line.baseline,
+            "下划线在基线下方：{underline:?} vs baseline {}",
+            shaped_line.baseline
+        );
+        assert!(
+            strike.rect.origin.y < shaped_line.baseline,
+            "删除线在基线上方：{strike:?} vs baseline {}",
+            shaped_line.baseline
+        );
+        assert!((underline.rect.size.height - 1.0).abs() < px(1e-4));
+        assert!((strike.rect.size.height - 2.0).abs() < px(1e-4));
+        assert_eq!(underline.color, ink, "下划线默认跟随文本色");
+        assert_eq!(strike.color, explicit, "显式线色优先");
+        assert_eq!(
+            underline.rect.origin.x, strike.rect.origin.x,
+            "同一 run 的两条线共享水平跨度：{underline:?} / {strike:?}"
+        );
+        assert_eq!(underline.rect.size.width, strike.rect.size.width);
+    }
+
+    #[test]
+    fn run_background_covers_the_line_box_with_padding_on_every_line() {
+        use crate::paint::color::Color;
+
+        let background = TextBackground {
+            color: Color::Srgb {
+                r: 0.8,
+                g: 0.9,
+                b: 1.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let mut harness = Harness::new();
+        let plain = TextContent::new("alpha beta gamma", TextStyle::new(px(16.0)));
+        let highlighted = plain.clone().with_runs([TextRun::new(
+            0..16,
+            TextStyle::new(px(16.0))
+                .with_background(background)
+                .with_underline(px(1.0), None),
+        )]);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let width = px(40.0);
+        let (plain_line, _, _) = rasterize_line(
+            &harness.shape_content(&plain),
+            width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped = harness.shape_content(&highlighted);
+        let (line, _, _) = rasterize_line(
+            &shaped,
+            width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert!(
+            line.lines.len() > 1,
+            "40 px 内容宽必须换行：{:?}",
+            line.lines
+        );
+        assert!(
+            plain_line
+                .lines
+                .iter()
+                .all(|line| line.backgrounds.is_empty()),
+            "没有背景色就不得生成背景矩形"
+        );
+        assert_eq!(
+            line.lines
+                .iter()
+                .map(|line| line.backgrounds.len())
+                .sum::<usize>(),
+            line.lines.len(),
+            "跨行 run 每行一个背景矩形：{:?}",
+            line.lines
+        );
+        for (index, (plain, highlighted)) in plain_line.lines.iter().zip(&line.lines).enumerate() {
+            assert_eq!(
+                highlighted.text_range, plain.text_range,
+                "背景不得改变断行点"
+            );
+            assert_eq!(highlighted.advance, plain.advance, "背景不得改变推进宽度");
+            assert_eq!(
+                highlighted.line_height, plain.line_height,
+                "背景不得改变行高"
+            );
+            if index == 0 {
+                assert!(
+                    highlighted.line_top.abs() < px(1e-3),
+                    "首行行盒 top 从 0 开始：{}",
+                    highlighted.line_top
+                );
+            } else {
+                let previous = &line.lines[index - 1];
+                assert!(
+                    (highlighted.line_top - (previous.line_top + previous.line_height)).abs()
+                        < px(1e-3),
+                    "行盒 top 必须逐行累加：{} vs {} + {}",
+                    highlighted.line_top,
+                    previous.line_top,
+                    previous.line_height
+                );
+            }
+            let background_quad = highlighted.backgrounds[0];
+            let decoration = highlighted.decorations[0];
+            assert_eq!(background_quad.color, background.color);
+            assert_eq!(background_quad.corner_radius, px(2.0));
+            assert_eq!(
+                background_quad.rect.origin.y, highlighted.line_top,
+                "背景矩形纵向从行盒顶部开始"
+            );
+            assert_eq!(
+                background_quad.rect.size.height, highlighted.line_height,
+                "背景矩形纵向覆盖整个行盒"
+            );
+            assert!(
+                (background_quad.rect.origin.x - (decoration.rect.origin.x - px(2.0))).abs()
+                    < px(1e-3),
+                "左侧 2 px 水平内边距：{background_quad:?} vs {decoration:?}"
+            );
+            assert!(
+                (background_quad.rect.size.width - (decoration.rect.size.width + px(4.0))).abs()
+                    < px(1e-3),
+                "左右各 2 px 水平内边距：{background_quad:?} vs {decoration:?}"
+            );
+        }
+
+        let mut merged_harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let split = highlighted.clone().with_runs([
+            TextRun::new(0..5, TextStyle::new(px(16.0)).with_background(background)),
+            TextRun::new(5..16, TextStyle::new(px(16.0)).with_background(background)),
+        ]);
+        let (split_line, _, _) = rasterize_line(
+            &merged_harness.shape_content(&split),
+            width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert_eq!(
+            split_line.lines.len(),
+            line.lines.len(),
+            "拆成相邻同色 run 不得改变断行"
+        );
+        assert_eq!(
+            split_line
+                .lines
+                .iter()
+                .map(|line| line.backgrounds.len())
+                .sum::<usize>(),
+            split_line.lines.len(),
+            "相邻同色 run 必须合并成每行一个矩形（不得出现接缝）：{:?}",
+            split_line.lines
+        );
+        for (split, whole) in split_line.lines.iter().zip(&line.lines) {
+            let split_quad = split.backgrounds[0];
+            let whole_quad = whole.backgrounds[0];
+            assert!(
+                (split_quad.rect.origin.x - whole_quad.rect.origin.x).abs() < px(1e-3)
+                    && (split_quad.rect.size.width - whole_quad.rect.size.width).abs() < px(1e-3),
+                "合并后的矩形必须与单个 run 的矩形一致：{split_quad:?} vs {whole_quad:?}"
+            );
+            assert_eq!(split_quad.color, whole_quad.color);
+        }
+    }
+
+    #[test]
+    fn fractional_line_height_keeps_background_boxes_touching() {
+        use crate::paint::color::Color;
+
+        let background = TextBackground {
+            color: Color::Srgb {
+                r: 0.8,
+                g: 0.9,
+                b: 1.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let mut harness = Harness::new();
+        let style = TextStyle::new(px(14.0))
+            .with_line_height(1.4)
+            .with_background(background);
+        let shaped = harness.shape("alpha beta gamma delta", style);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            px(40.0),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert!(
+            line.lines.len() > 2,
+            "40 px 内容宽必须折成多行：{:?}",
+            line.lines
+        );
+        let line_height = line.lines[0].line_height.value();
+        assert!(
+            (line_height - 19.6).abs() < 0.05,
+            "前置：14 px × 1.4 = 19.6 才是分数行高（实际 {line_height}）"
+        );
+        assert!(
+            (line_height - line_height.round()).abs() > 1e-3,
+            "前置：行高必须非整数，否则测不出逐行取整误差（实际 {line_height}）"
+        );
+        let mut expected_top = 0.0f32;
+        for shaped_line in &line.lines {
+            assert!(
+                (shaped_line.line_top.value() - expected_top).abs() < 1e-3,
+                "行盒 top 必须按未取整行高累加：{} vs {expected_top}",
+                shaped_line.line_top.value()
+            );
+            assert_eq!(
+                shaped_line.backgrounds.len(),
+                1,
+                "每行一个背景矩形：{shaped_line:?}"
+            );
+            let rect = shaped_line.backgrounds[0].rect;
+            assert!((rect.origin.y.value() - expected_top).abs() < 1e-3);
+            assert!((rect.size.height.value() - shaped_line.line_height.value()).abs() < 1e-3);
+            expected_top += shaped_line.line_height.value();
+        }
+        for pair in line.lines.windows(2) {
+            let upper = pair[0].backgrounds[0].rect;
+            let lower = pair[1].backgrounds[0].rect;
+            assert_eq!(
+                upper.origin.y + upper.size.height,
+                lower.origin.y,
+                "相邻行背景必须严格相接（不得重叠 1 px、也不得留 1 px 缝）：{upper:?} / {lower:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invisible_backgrounds_produce_no_geometry() {
+        use crate::paint::color::Color;
+
+        let mut harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        for background in [
+            TextBackground {
+                color: Color::TRANSPARENT,
+                corner_radius: px(2.0),
+                padding_x: px(2.0),
+            },
+            TextBackground {
+                color: Color::WHITE,
+                corner_radius: px(f32::NAN),
+                padding_x: px(2.0),
+            },
+            TextBackground {
+                color: Color::WHITE,
+                corner_radius: px(2.0),
+                padding_x: px(f32::NAN),
+            },
+            TextBackground {
+                color: Color::WHITE,
+                corner_radius: px(2.0),
+                padding_x: px(-1.0),
+            },
+        ] {
+            let content =
+                TextContent::new("ab", TextStyle::new(px(16.0)).with_background(background));
+            let shaped = harness.shape_content(&content);
+            let (line, _diagnostics, _stats) = rasterize_line(
+                &shaped,
+                shaped.max_content_size().width,
+                DevicePixelRatio::ONE,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+            );
+            assert!(
+                line.lines[0].backgrounds.is_empty(),
+                "不可见背景（透明色/NaN/负值几何）不得产出矩形：{background:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_different_backgrounds_do_not_double_pad_the_seam() {
+        use crate::paint::color::Color;
+
+        let left = TextBackground {
+            color: Color::Srgb {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                alpha: 0.5,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let right = TextBackground {
+            color: Color::Srgb {
+                r: 0.0,
+                g: 0.0,
+                b: 1.0,
+                alpha: 0.5,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let mut harness = Harness::new();
+        let content = TextContent::new("abcd", TextStyle::new(px(16.0))).with_runs([
+            TextRun::new(0..2, TextStyle::new(px(16.0)).with_background(left)),
+            TextRun::new(2..4, TextStyle::new(px(16.0)).with_background(right)),
+        ]);
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.backgrounds.len(),
+            2,
+            "不同底色不得合并：{:?}",
+            shaped_line.backgrounds
+        );
+        let first = shaped_line.backgrounds[0].rect;
+        let second = shaped_line.backgrounds[1].rect;
+        assert!(
+            (first.origin.x + px(2.0)).abs() < px(1e-3),
+            "组最左端必须有 2 px 内边距：{first:?}"
+        );
+        assert!(
+            ((first.origin.x + first.size.width) - second.origin.x).abs() < px(1e-3),
+            "组间接缝不得双绘 4 px：前段右端必须与后段左端严格相接：{first:?} / {second:?}"
+        );
+        assert!(
+            ((second.origin.x + second.size.width) - (shaped_line.advance + px(2.0))).abs()
+                < px(1e-3),
+            "组最右端必须有 2 px 内边距：{second:?} / advance {}",
+            shaped_line.advance
+        );
+        assert_eq!(shaped_line.backgrounds[0].color, left.color);
+        assert_eq!(shaped_line.backgrounds[1].color, right.color);
+    }
+
+    #[test]
+    fn background_survives_hard_line_breaks() {
+        use crate::paint::color::Color;
+
+        let background = TextBackground {
+            color: Color::Srgb {
+                r: 0.8,
+                g: 0.9,
+                b: 1.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let mut harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        for (text, expected) in [
+            ("ab\ncd", vec![1usize, 1]),
+            ("ab\r\ncd", vec![1, 1]),
+            ("ab\n\ncd", vec![1, 0, 1]),
+        ] {
+            let content =
+                TextContent::new(text, TextStyle::new(px(16.0)).with_background(background));
+            let shaped = harness.shape_content(&content);
+            let (line, _diagnostics, _stats) = rasterize_line(
+                &shaped,
+                shaped.max_content_size().width,
+                DevicePixelRatio::ONE,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+            );
+            let counts: Vec<usize> = line
+                .lines
+                .iter()
+                .map(|shaped_line| shaped_line.backgrounds.len())
+                .collect();
+            assert_eq!(
+                counts, expected,
+                "硬换行：每行一个背景矩形、空行没有（{text:?}）"
+            );
+            for shaped_line in &line.lines {
+                for background_quad in &shaped_line.backgrounds {
+                    assert!(
+                        background_quad.rect.size.width > px(0.0),
+                        "背景必须有正宽度：{background_quad:?}"
+                    );
+                    assert_eq!(background_quad.rect.origin.y, shaped_line.line_top);
+                    assert_eq!(background_quad.rect.size.height, shaped_line.line_height);
+                    assert!(
+                        background_quad.rect.origin.x >= px(-2.0 - 1e-3)
+                            && background_quad.rect.origin.x + background_quad.rect.size.width
+                                <= shaped_line.advance + px(2.0 + 1e-3),
+                        "背景不得越过该行盒的左右 padding 范围：{background_quad:?} / advance {}",
+                        shaped_line.advance
+                    );
+                }
+            }
+            let last = line.lines.last().expect("末行");
+            let last_quad = last.backgrounds[0];
+            assert!(
+                (last_quad.rect.size.width - (last.advance + px(4.0))).abs() < px(1e-2),
+                "末行内容不含行尾换行，背景宽度必须 = 行推进 + 左右 padding：{last_quad:?} / advance {}",
+                last.advance
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_whitespace_background_runs_stay_bounded() {
+        use crate::paint::color::Color;
+
+        let background = TextBackground {
+            color: Color::Srgb {
+                r: 0.8,
+                g: 0.9,
+                b: 1.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let mut harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let base = TextStyle::new(px(16.0)).with_background(background);
+
+        let content = TextContent::new("ab\n\ncd", base);
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert_eq!(
+            line.lines
+                .iter()
+                .map(|shaped_line| shaped_line.backgrounds.len())
+                .collect::<Vec<_>>(),
+            vec![1, 0, 1],
+            "纯空白行没有内容，不得产生背景矩形"
+        );
+
+        let empty_run = TextContent::new("ab", TextStyle::new(px(16.0))).with_runs([TextRun::new(
+            1..1,
+            TextStyle::new(px(16.0)).with_background(background),
+        )]);
+        assert_eq!(empty_run.normalized_runs(), 1, "前置：空 run 被规范化丢弃");
+        let shaped = harness.shape_content(&empty_run);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert!(
+            line.lines[0].backgrounds.is_empty(),
+            "零长度 run 不得产生背景矩形：{:?}",
+            line.lines[0].backgrounds
+        );
+
+        let whitespace =
+            TextContent::new("a b", TextStyle::new(px(16.0))).with_runs([TextRun::new(
+                1..2,
+                TextStyle::new(px(16.0)).with_background(background),
+            )]);
+        let shaped = harness.shape_content(&whitespace);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert_eq!(
+            line.lines[0].backgrounds.len(),
+            1,
+            "纯空白 run 仍占推进宽度，必须画出背景：{:?}",
+            line.lines[0].backgrounds
+        );
+        let rect = line.lines[0].backgrounds[0].rect;
+        assert!(
+            rect.size.width > px(4.0),
+            "空格 advance + 左右 padding 必须为正宽：{rect:?}"
+        );
+        assert!(
+            rect.origin.x >= px(-2.0 - 1e-3)
+                && rect.origin.x + rect.size.width <= line.lines[0].advance + px(2.0 + 1e-3),
+            "空白 run 的背景不得越过行推进的 padding 范围：{rect:?} / advance {}",
+            line.lines[0].advance
+        );
+    }
+
+    #[test]
+    fn base_and_run_backgrounds_keep_their_own_spans() {
+        use crate::paint::color::Color;
+
+        let base = TextBackground {
+            color: Color::Srgb {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let run = TextBackground {
+            color: Color::Srgb {
+                r: 0.0,
+                g: 0.0,
+                b: 1.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let mut harness = Harness::new();
+        let content = TextContent::new("abcdef", TextStyle::new(px(16.0)).with_background(base))
+            .with_runs([TextRun::new(
+                0..3,
+                TextStyle::new(px(16.0))
+                    .with_background(run)
+                    .with_weight(700),
+            )]);
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.backgrounds.len(),
+            2,
+            "双色背景必须各占一条（run 覆盖 + 底座兜底）：{:?}",
+            shaped_line.backgrounds
+        );
+        let run_quad = shaped_line.backgrounds[0];
+        let base_quad = shaped_line.backgrounds[1];
+        assert_eq!(run_quad.color, run.color);
+        assert_eq!(base_quad.color, base.color);
+        assert!(
+            (run_quad.rect.origin.x + px(2.0)).abs() < px(1e-3),
+            "run 覆盖最左端 ⇒ 左 padding 有效：{run_quad:?}"
+        );
+        assert!(
+            (run_quad.rect.origin.x + run_quad.rect.size.width - base_quad.rect.origin.x).abs()
+                < px(1e-3),
+            "底座兜底不得覆盖 run 区间，两者必须严格相接：{run_quad:?} / {base_quad:?}"
+        );
+        assert!(
+            ((base_quad.rect.origin.x + base_quad.rect.size.width)
+                - (shaped_line.advance + px(2.0)))
+            .abs()
+                < px(1e-3),
+            "底座兜底覆盖最右端 ⇒ 右 padding 有效：{base_quad:?} / advance {}",
+            shaped_line.advance
+        );
+        let (run_left, run_right) = glyph_bounds(shaped_line, 0..3);
+        let (base_left, base_right) = glyph_bounds(shaped_line, 3..6);
+        assert!(
+            run_quad.rect.origin.x <= px(run_left + 1.5)
+                && run_quad.rect.origin.x + run_quad.rect.size.width >= px(run_right - 1.5),
+            "run 矩形必须覆盖 run 0..3 的字形视觉跨度：{run_quad:?} vs {run_left}..{run_right}"
+        );
+        assert!(
+            base_quad.rect.origin.x <= px(base_left + 1.5)
+                && base_quad.rect.origin.x + base_quad.rect.size.width >= px(base_right - 1.5),
+            "底座兜底矩形必须覆盖 run 3..6 的字形视觉跨度：{base_quad:?} vs {base_left}..{base_right}"
+        );
+        let seam = run_quad.rect.origin.x + run_quad.rect.size.width;
+        assert!(
+            seam >= px(run_right - 1.5) && seam <= px(base_left + 1.5),
+            "内侧接缝必须落在第 3/第 4 字符之间的边界（run 右端与 base 左端都不得多吃字符）：seam {seam} vs glyph {run_right}..{base_left}"
+        );
+    }
+
+    #[test]
+    fn narrow_gap_between_backgrounds_is_split_between_them() {
+        use crate::paint::color::Color;
+
+        let left = TextBackground {
+            color: Color::Srgb {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                alpha: 0.5,
+            },
+            corner_radius: px(0.0),
+            padding_x: px(2.0),
+        };
+        let right = TextBackground {
+            color: Color::Srgb {
+                r: 0.0,
+                g: 0.0,
+                b: 1.0,
+                alpha: 0.5,
+            },
+            corner_radius: px(0.0),
+            padding_x: px(2.0),
+        };
+        let mut harness = Harness::new();
+        let text_style = TextStyle::new(px(10.0));
+        let gap = harness
+            .shape("a b", text_style.clone())
+            .max_content_size()
+            .width
+            - harness
+                .shape("ab", text_style.clone())
+                .max_content_size()
+                .width;
+        assert!(
+            gap > px(0.0) && gap < px(4.0),
+            "前置：空格宽度必须落在 (0, 2×padding) 的窄缝区间（实际 {gap}）"
+        );
+        let content = TextContent::new("a b", text_style.clone()).with_runs([
+            TextRun::new(0..1, text_style.clone().with_background(left)),
+            TextRun::new(2..3, text_style.with_background(right)),
+        ]);
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.backgrounds.len(),
+            2,
+            "两个不同底色必须各一条：{:?}",
+            shaped_line.backgrounds
+        );
+        let first = shaped_line.backgrounds[0].rect;
+        let second = shaped_line.backgrounds[1].rect;
+        assert!(
+            (first.origin.x + px(2.0)).abs() < px(1e-3),
+            "首组外侧仍是完整 padding：{first:?}"
+        );
+        assert!(
+            ((second.origin.x + second.size.width) - (shaped_line.advance + px(2.0))).abs()
+                < px(1e-3),
+            "末组外侧仍是完整 padding：{second:?} / advance {}",
+            shaped_line.advance
+        );
+        assert!(
+            ((first.origin.x + first.size.width) - second.origin.x).abs() < px(1e-3),
+            "窄缝两侧各取 min(padding, gap/2)，矩形必须严格相接、不得双绘：{first:?} / {second:?}"
+        );
+    }
+
+    #[test]
+    fn ellipsis_clamps_background_into_the_kept_line() {
+        use crate::paint::color::Color;
+
+        let background = TextBackground {
+            color: Color::Srgb {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                alpha: 1.0,
+            },
+            corner_radius: px(2.0),
+            padding_x: px(2.0),
+        };
+        let mut harness = Harness::new();
+        let style = TextStyle::new(px(16.0))
+            .with_wrap(TextWrap::NoWrap)
+            .with_overflow(crate::text::TextOverflow::Ellipsis, 0)
+            .with_background(background);
+        let shaped = harness.shape("abcdefghijklmnopqrstuvwxyz", style);
+        let ellipsis = super::measure_ellipsis(
+            &mut harness.font_cx,
+            &mut harness.layout_cx,
+            &harness.family,
+            shaped.style(),
+        )
+        .expect("the host font must provide an ellipsis glyph");
+        let width = shaped.max_content_size().width * 0.5;
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let generation = atlas.generation();
+        let mut ctx = super::RasterCtx {
+            raster: &mut raster,
+            glyph_atlas: &mut glyphs,
+            atlas: &mut atlas,
+            generation,
+            scale: DevicePixelRatio::ONE,
+        };
+        let (line, _diagnostics, _stats) = shaped
+            .rasterize(
+                width,
+                crate::text::TextAlign::Start,
+                Color::BLACK,
+                &mut ctx,
+                Some(&ellipsis),
+            )
+            .expect("ellipsis clipping must not fail");
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.backgrounds.len(),
+            1,
+            "省略号裁剪后背景仍必须保留：{shaped_line:?}"
+        );
+        let background_quad = shaped_line.backgrounds[0];
+        let right = background_quad.rect.origin.x + background_quad.rect.size.width;
+        assert!(
+            (background_quad.rect.origin.x + px(2.0)).abs() < px(1e-3),
+            "判定：截断行左侧保留 padding（下限 line_offset − padding_x），左界不得被钳到 0：{background_quad:?}"
+        );
+        assert_eq!(
+            right, shaped_line.advance,
+            "判定：截断行背景右端严格等于截断后的行推进（右侧必须截断到省略号之前）：{background_quad:?} / advance {}",
+            shaped_line.advance
         );
     }
 
